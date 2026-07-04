@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a GitHub release (otherwise build artifacts only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      publish: ${{ steps.ver.outputs.publish }}
+    steps:
+      - name: Determine version
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            ver="${GITHUB_REF_NAME#v}"; publish=true
+          else
+            publish="${{ inputs.publish }}"
+            latest="$(gh release list -R "$REPO" --limit 1 \
+              --json tagName -q '.[0].tagName' 2>/dev/null || true)"
+            if [ -z "$latest" ]; then
+              ver="1.0.0"
+            else
+              base="${latest#v}"; IFS=. read -r a b c <<< "$base"
+              ver="${a:-1}.${b:-0}.$(( ${c:-0} + 1 ))"
+            fi
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "tag=v$ver" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "Building version $ver (publish=$publish)"
+
+  appimage:
+    needs: version
+    runs-on: ubuntu-latest
+    # Build on Arch so the bundled GTK4 + libadwaita match a normal Arch install
+    # (same look as running from source, and the newest libadwaita).
+    container:
+      image: archlinux:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cpu, cuda, rocm]
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            gtk4 libadwaita gobject-introspection gdk-pixbuf2 librsvg \
+            cairo pango adwaita-icon-theme hicolor-icon-theme shared-mime-info \
+            desktop-file-utils python uv git wget gcc pkgconf meson ninja \
+            libxcrypt libxcrypt-compat openssl libffi bzip2 xz zlib sqlite
+
+      - uses: actions/checkout@v4
+
+      - name: Build AppImage (${{ matrix.variant }})
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          chmod +x packaging/build-appimage.sh
+          ./packaging/build-appimage.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bg-be-gone-${{ matrix.variant }}
+          path: dist/*.AppImage
+
+  release:
+    needs: [version, appimage]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: bg-be-gone ${{ needs.version.outputs.version }}
+          files: dist/*.AppImage
+          generate_release_notes: true

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=bg-be-gone
+GenericName=Background Remover
+Comment=Remove image backgrounds locally
+Exec=bg-be-gone %f
+Icon=io.github.cristeigabriela.BgBeGone
+Terminal=false
+Categories=Graphics;Photography;
+MimeType=image/png;image/jpeg;image/webp;image/bmp;image/tiff;
+Keywords=background;remove;cutout;transparent;rembg;birefnet;
+StartupNotify=true
+StartupWMClass=io.github.cristeigabriela.BgBeGone

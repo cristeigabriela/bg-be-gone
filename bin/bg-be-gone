@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Launcher for a source checkout of bg-be-gone.
+# Runs the GTK UI on the system Python; the UI spawns the venv worker.
+set -euo pipefail
+self="$(readlink -f "$0")"
+root="$(cd "$(dirname "$self")/.." && pwd)"
+data="${XDG_DATA_HOME:-$HOME/.local/share}/bg-be-gone"
+export BGBG_VENV_PYTHON="${BGBG_VENV_PYTHON:-$data/venv/bin/python}"
+export BGBG_WORKER="${BGBG_WORKER:-$root/src/bgbg/worker.py}"
+exec python3 "$root/src/bgbg/app.py" "$@"

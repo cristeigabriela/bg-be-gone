@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Syntax check
+        run: python -m compileall -q src
+
+      - name: Lint (ruff)
+        run: |
+          python -m pip install --quiet ruff
+          ruff check src
+
+      - name: Install validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck desktop-file-utils appstream
+
+      - name: Shell scripts
+        run: shellcheck install.sh uninstall.sh bin/bg-be-gone packaging/build-appimage.sh
+
+      - name: Desktop entry
+        run: desktop-file-validate data/io.github.cristeigabriela.BgBeGone.desktop
+
+      - name: AppStream metadata
+        run: appstreamcli validate --no-net data/io.github.cristeigabriela.BgBeGone.metainfo.xml

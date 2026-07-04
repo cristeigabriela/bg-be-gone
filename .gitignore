@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Build / packaging
+build/
+dist/
+AppDir/
+*.AppImage
+*.AppImage.zsync
+appimagetool*
+linuxdeploy*
+squashfs-root/
+
+# Runtime
+worker.log
+*.log
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

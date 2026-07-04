@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.cristeigabriela.BgBeGone</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>bg-be-gone</name>
+  <summary>Remove image backgrounds locally</summary>
+  <developer id="io.github.cristeigabriela">
+    <name>bg-be-gone contributors</name>
+  </developer>
+  <url type="homepage">https://github.com/cristeigabriela/bg-be-gone</url>
+  <url type="bugtracker">https://github.com/cristeigabriela/bg-be-gone/issues</url>
+  <description>
+    <p>
+      A local image background remover with a GTK interface. It runs BiRefNet and
+      other rembg models through ONNX Runtime, with GPU acceleration on NVIDIA and
+      AMD and a CPU fallback. Images are processed on your machine.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Single-image and batch modes</li>
+      <li>Interactive panels: zoom, pan, rotate, flip</li>
+      <li>Drag and drop</li>
+      <li>Transparent or solid-colour output</li>
+      <li>Subject presets and an advanced model picker</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.cristeigabriela.BgBeGone.desktop</launchable>
+  <categories>
+    <category>Graphics</category>
+    <category>Photography</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="1.0.0" date="2026-07-04">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

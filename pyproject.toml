@@ -1,0 +1,12 @@
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+ignore = [
+    "E402",   # imports after gi.require_version() / runtime lib setup
+    "B008",   # GObject constructors as defaults are fine here
+    "UP031",  # %-formatting is fine and used consistently
+]
