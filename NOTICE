@@ -1,0 +1,40 @@
+bg-be-gone
+Copyright (c) 2026 bg-be-gone contributors
+Licensed under the MIT License (see LICENSE).
+
+This product downloads and uses third-party model weights at runtime. The
+weights are NOT bundled in this repository or in the AppImages; they are fetched
+on first use into the per-user cache directory.
+
+================================================================================
+Segment Anything (SAM) and SAM 2 / SAM 2.1
+================================================================================
+Object segmentation uses ONNX exports of Meta AI's Segment Anything models.
+
+  - SAM 2.1 (Hiera tiny / small / base_plus / large)
+    Copyright (c) Meta Platforms, Inc. and affiliates.
+    Licensed under the Apache License, Version 2.0.
+    https://github.com/facebookresearch/sam2
+    ONNX weights: https://huggingface.co/vietanhdev/segment-anything-2.1-onnx-models
+
+  - MobileSAM (the low-VRAM / CPU rung)
+    Copyright (c) 2023 Chaoning Zhang and contributors.
+    Licensed under the Apache License, Version 2.0.
+    https://github.com/ChaoningZhang/MobileSAM
+    ONNX weights: https://huggingface.co/Acly/MobileSAM
+
+A copy of the Apache License 2.0 is available at:
+  https://www.apache.org/licenses/LICENSE-2.0
+
+================================================================================
+Background removal (rembg / BiRefNet / U^2-Net / IS-Net)
+================================================================================
+Background removal is provided by rembg (MIT) and the ONNX models it downloads
+(BiRefNet, IS-Net, U^2-Net, Silueta), each under their respective licenses.
+  https://github.com/danielgatis/rembg
+
+================================================================================
+Icon
+================================================================================
+The application icon uses the rabbit from Microsoft Fluent Emoji (MIT).
+  https://github.com/microsoft/fluentui-emoji

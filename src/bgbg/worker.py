@@ -1,26 +1,46 @@
 #!/usr/bin/env python3
-"""Background-removal worker for bg-be-gone.
+"""Background-removal + segmentation worker for bg-be-gone.
 
-Runs inside the bundled virtualenv. Speaks line-delimited JSON on
-stdin/stdout so the GTK frontend can keep a model resident on the GPU across
-requests.
+Runs inside the bundled virtualenv. Speaks line-delimited JSON on stdin/stdout
+so the GTK frontend can keep a model resident on the GPU across requests. Heavy
+work runs on a background thread so a ``seg_cancel`` message can interrupt a slow
+"segment everything" pass while it is still running.
+
+Background removal needs ``rembg`` (imported lazily); segmentation needs only
+``onnxruntime`` + ``numpy`` + ``pillow`` (via :mod:`segmentation`). Either half
+can be absent — a segmentation-only install ships without rembg.
 
 Requests (one JSON object per line on stdin):
   {"op":"single","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"id":N}
   {"op":"batch","input_dir":D,"output_dir":D,"model":M,"alpha":bool,"bg":BG,
    "pattern":"{name}_nobg","id":N}
   {"op":"models"}
+  {"op":"seg_load","input":P,"model":"auto|large|base_plus|small|tiny|mobile","id":N}
+  {"op":"seg_everything","points_per_side":int?,"id":N}
+  {"op":"seg_point","points":[[x,y,label],...],"use_prev":bool,"id":N}
+  {"op":"seg_extract","ids":[...]|"mask":P,"bg":BG,"blur":int,"output":P,"id":N}
+  {"op":"seg_cancel"}
   {"op":"shutdown"}
 
-BG is "transparent" or "#rrggbb" to flatten onto.
+BG is "transparent", "blur" or "#rrggbb" to flatten onto.
 
 Responses (one JSON object per line on stdout):
-  {"type":"ready","models":[...],"providers":[...]}
+  {"type":"ready","models":[...],"providers":[...],"seg":bool,"bgremove":bool,
+   "seg_models":[{"rung":R,"label":L}]}
   {"type":"loading","model":M,"id":N}
-  {"type":"device","provider":P,"label":L,"id":N}
+  {"type":"device","provider":P,"label":L,"gpu":bool,"id":N}
   {"type":"progress","done":i,"total":n,"name":str,"id":N}
   {"type":"done_single","output":P,"preview":P,"seconds":f,"id":N}
   {"type":"done_batch","count":n,"seconds":f,"outdir":P,"id":N}
+  {"type":"seg_download","done":i,"total":n,"id":N}
+  {"type":"seg_step","rung":R,"message":str,"id":N}
+  {"type":"seg_ready","rung":R,"model":L,"provider":P,"label":L,"gpu":bool,
+   "mode":auto|manual|fallback,"family":str,"id":N}
+  {"type":"seg_progress","done":i,"total":n,"id":N}
+  {"type":"seg_objects","label_map":P,"count":n,"objects":[...],"id":N}
+  {"type":"seg_mask","mask":P,"score":f,"bbox":[x,y,w,h],"id":N}
+  {"type":"seg_extracted","output":P,"seconds":f,"id":N}
+  {"type":"seg_canceled","id":N}
   {"type":"error","message":str,"id":N}
 """
 import os
@@ -51,14 +71,31 @@ def _ensure_gpu_libs():
 
 _ensure_gpu_libs()
 
+import gc  # noqa: E402
 import json  # noqa: E402
 import time  # noqa: E402
+import queue  # noqa: E402
+import threading  # noqa: E402
 import traceback  # noqa: E402
 
 from PIL import Image, ImageFilter  # noqa: E402
 import onnxruntime as ort  # noqa: E402
-from rembg import new_session, remove  # noqa: E402
-from rembg.sessions import sessions_names  # noqa: E402
+
+# Background removal is optional (a segmentation-only install ships without it).
+try:
+    from rembg import new_session, remove
+    from rembg.sessions import sessions_names
+    _HAVE_REMBG = True
+except Exception:  # noqa: BLE001
+    _HAVE_REMBG = False
+    sessions_names = []
+
+# Segmentation is optional too (needs the extra numpy dependency + weights).
+try:
+    import segmentation as seg
+    _HAVE_SEG = True
+except Exception:  # noqa: BLE001
+    _HAVE_SEG = False
 
 # Preference order; the first one onnxruntime can actually initialise wins.
 _PROVIDER_ORDER = [
@@ -77,6 +114,8 @@ _PROVIDER_LABELS = {
 }
 
 _sessions = {}
+_cpu_sessions = {}          # model -> CPU-only fallback session (low-VRAM path)
+_fallback_notified = set()  # models we've already warned about this session
 
 
 def out(obj):
@@ -132,6 +171,50 @@ def get_session(model, req_id):
     return _sessions[model]
 
 
+def get_cpu_session(model, req_id):
+    """A CPU-only session for `model`, built once and cached. Used to complete a
+    job when the GPU can't (e.g. not enough VRAM)."""
+    if model not in _cpu_sessions:
+        out({"type": "loading", "model": model, "id": req_id})
+        _cpu_sessions[model] = new_session(
+            model, providers=["CPUExecutionProvider"])
+    return _cpu_sessions[model]
+
+
+def _is_ort_runtime_error(e):
+    """True for an onnxruntime run failure — most importantly a GPU out-of-memory,
+    which BiRefNet surfaces as a failed Mul node deep in the ASPP decoder."""
+    if type(e).__module__.startswith("onnxruntime"):
+        return True
+    m = str(e).lower()
+    return ("onnxruntimeerror" in m or "non-zero status" in m
+            or "out of memory" in m or "cuda" in m or "cudnn" in m
+            or "failed to allocate" in m or "hiperroroutofmemory" in m)
+
+
+def _remove_resilient(model, req_id, img, alpha):
+    """Run rembg on the preferred (GPU) session; if it fails with a runtime error
+    — typically low VRAM — retry on CPU so the user still gets a result. The GPU
+    session is kept, so a later run recovers automatically once VRAM frees up."""
+    session = get_session(model, req_id)
+    try:
+        res = remove(img, session=session, alpha_matting=alpha)
+        _fallback_notified.discard(model)      # GPU healthy again
+        return res
+    except Exception as e:
+        if not _is_ort_runtime_error(e):
+            raise
+        if model not in _fallback_notified:
+            _fallback_notified.add(model)
+            out({"type": "notice",
+                 "message": "The GPU couldn't run this (usually low VRAM) — "
+                            "running on the CPU (slower). Close other GPU apps "
+                            "to free memory, then try again.",
+                 "id": req_id})
+        session = get_cpu_session(model, req_id)
+        return remove(img, session=session, alpha_matting=alpha)
+
+
 def _hex_to_rgb(s):
     s = s.lstrip("#")
     return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
@@ -150,9 +233,9 @@ def _checkerboard(size, cell=24):
     return board
 
 
-def process_one(session, src, dst, alpha, bg, blur=20, want_preview=False):
+def process_one(model, req_id, src, dst, alpha, bg, blur=20, want_preview=False):
     img = Image.open(src)
-    res = remove(img, session=session, alpha_matting=alpha).convert("RGBA")
+    res = _remove_resilient(model, req_id, img, alpha).convert("RGBA")
 
     preview_path = None
     if bg == "transparent":
@@ -182,9 +265,9 @@ def process_one(session, src, dst, alpha, bg, blur=20, want_preview=False):
 
 def handle_single(req):
     rid = req.get("id")
-    session = get_session(req["model"], rid)
+    get_session(req["model"], rid)         # load + emit the device message
     t = time.time()
-    preview = process_one(session, req["input"], req["output"],
+    preview = process_one(req["model"], rid, req["input"], req["output"],
                           req.get("alpha", False), req.get("bg", "transparent"),
                           req.get("blur", 20), want_preview=True)
     out({"type": "done_single", "output": req["output"],
@@ -208,7 +291,7 @@ def handle_batch(req):
              "id": rid})
         return
     pattern = req.get("pattern") or "{name}_nobg"
-    session = get_session(req["model"], rid)
+    get_session(req["model"], rid)         # load + emit the device message
     alpha = req.get("alpha", False)
     bg = req.get("bg", "transparent")
     blur = req.get("blur", 20)
@@ -222,16 +305,223 @@ def handle_batch(req):
         dst = os.path.join(outdir, stem + ".png")
         out({"type": "progress", "done": i - 1, "total": total,
              "name": os.path.basename(f), "id": rid})
-        process_one(session, f, dst, alpha, bg, blur, want_preview=False)
+        process_one(req["model"], rid, f, dst, alpha, bg, blur,
+                    want_preview=False)
     out({"type": "progress", "done": total, "total": total, "name": "",
          "id": rid})
     out({"type": "done_batch", "count": total,
          "seconds": round(time.time() - t, 1), "outdir": outdir, "id": rid})
 
 
+# ---------------------------------------------------------------------------
+# Segmentation
+# ---------------------------------------------------------------------------
+_cancel = threading.Event()
+_seg = None  # {session, image, rung, size, maskdir, objects, prev_low}
+
+
+class _Canceled(Exception):
+    pass
+
+
+def _gpu_hint():
+    return any(_name(p) in _GPU_PROVIDERS for p in preferred_providers())
+
+
+def handle_seg_load(req):
+    global _seg
+    rid = req.get("id")
+    path = req["input"]
+    want = req.get("model", "auto")
+    pil = Image.open(path).convert("RGB")
+    maskdir = os.path.join(os.path.dirname(os.path.abspath(path)), "segmasks")
+    os.makedirs(maskdir, exist_ok=True)
+
+    def on_step(rung, exc):
+        out({"type": "seg_step", "rung": rung,
+             "message": str(exc).splitlines()[0][:160], "id": rid})
+
+    def on_progress(done, total):
+        if _cancel.is_set():
+            raise _Canceled()
+        out({"type": "seg_download", "done": done, "total": total, "id": rid})
+
+    try:
+        session, rung, mode = seg.auto_select_session(
+            preferred_providers(), _gpu_hint(), want=want, probe_image=pil,
+            on_step=on_step, on_progress=on_progress)
+    except _Canceled:
+        out({"type": "seg_canceled", "id": rid})
+        return
+    prov = session.provider()
+    _seg = {"session": session, "image": pil, "rung": rung, "size": pil.size,
+            "maskdir": maskdir, "objects": [], "prev_low": None}
+    out({"type": "seg_ready", "rung": rung, "model": seg.MODELS[rung]["label"],
+         "provider": prov, "label": _PROVIDER_LABELS.get(prov, prov),
+         "gpu": prov in _GPU_PROVIDERS, "mode": mode, "family": session.family,
+         "id": rid})
+
+
+def _require_seg(rid):
+    if _seg is None:
+        out({"type": "error", "message": "Load an image to segment first.",
+             "id": rid})
+        return False
+    return True
+
+
+def handle_seg_everything(req):
+    rid = req.get("id")
+    if not _require_seg(rid):
+        return
+    session = _seg["session"]
+    gpu = session.provider() in _GPU_PROVIDERS
+    pps = int(req.get("points_per_side") or (32 if gpu else 16))
+
+    def progress(done, total):
+        out({"type": "seg_progress", "done": done, "total": total, "id": rid})
+
+    t = time.time()
+    masks = session.everything(points_per_side=pps, cancel=_cancel,
+                               progress=progress)
+    if _cancel.is_set():
+        out({"type": "seg_canceled", "id": rid})
+        return
+    maps, objs = seg.save_objects(masks, _seg["size"], _seg["maskdir"], f"e{rid}")
+    _seg["objects"] = objs
+    out({"type": "seg_objects", "label_map": maps["label"],
+         "general_map": maps["general"], "depth_map": maps["depth"],
+         "count": len(objs), "objects": objs,
+         "seconds": round(time.time() - t, 2), "id": rid})
+
+
+def handle_seg_point(req):
+    rid = req.get("id")
+    if not _require_seg(rid):
+        return
+    session = _seg["session"]
+    pts = req.get("points") or []
+    if not pts:
+        out({"type": "error", "message": "No points given.", "id": rid})
+        return
+    points = [(float(p[0]), float(p[1])) for p in pts]
+    labels = [int(p[2]) for p in pts]
+    prev = _seg.get("prev_low") if req.get("use_prev") else None
+    mask, score, low = session.decode_points(points, labels, prev_low=prev)
+    _seg["prev_low"] = low
+    mp = os.path.join(_seg["maskdir"], f"p{rid}.png")
+    bbox = seg.save_mask(mask, mp)
+    out({"type": "seg_mask", "mask": mp, "score": round(score, 3),
+         "bbox": bbox, "contour": seg.contour(mask), "id": rid})
+
+
+def handle_seg_extract(req):
+    rid = req.get("id")
+    if not _require_seg(rid):
+        return
+    dst = req["output"]
+    bg = req.get("bg", "transparent")
+    blur = int(req.get("blur", 20))
+    if req.get("mask"):
+        paths = [req["mask"]]
+    else:
+        ids = set(req.get("ids") or [])
+        paths = [o["mask"] for o in _seg["objects"] if o["id"] in ids]
+    if not paths:
+        out({"type": "error", "message": "Nothing selected to extract.",
+             "id": rid})
+        return
+    t = time.time()
+    alpha = seg.load_union(paths)
+    seg.composite_extract(_seg["image"], alpha, bg, dst, blur=blur)
+    out({"type": "seg_extracted", "output": dst,
+         "seconds": round(time.time() - t, 2), "id": rid})
+
+
+def handle_unload(req):
+    """Release resident models to reclaim memory (RAM/VRAM). Runs on the worker
+    thread, so it only fires when no task is in flight — never freeing a model
+    out from under a running pass. Scope: "bg", "seg", or "all"."""
+    global _seg
+    rid = req.get("id")
+    scope = req.get("scope", "all")
+    freed = []
+    if scope in ("bg", "all") and (_sessions or _cpu_sessions):
+        _sessions.clear()
+        _cpu_sessions.clear()
+        _fallback_notified.clear()
+        freed.append("bg")
+    if scope in ("seg", "all") and _seg is not None:
+        _seg = None
+        freed.append("seg")
+    if freed:
+        gc.collect()
+    out({"type": "unloaded", "scope": freed, "id": rid})
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+_HANDLERS = {
+    "single": handle_single,
+    "batch": handle_batch,
+    "seg_load": handle_seg_load,
+    "seg_everything": handle_seg_everything,
+    "seg_point": handle_seg_point,
+    "seg_extract": handle_seg_extract,
+    "unload": handle_unload,
+}
+_SEG_OPS = {"seg_load", "seg_everything", "seg_point", "seg_extract"}
+_BG_OPS = {"single", "batch"}
+
+
+def _ready():
+    out({"type": "ready",
+         "models": list(sessions_names) if _HAVE_REMBG else [],
+         "providers": provider_names(),
+         "bgremove": _HAVE_REMBG,
+         "seg": _HAVE_SEG,
+         "seg_models": ([{"rung": r, "label": seg.MODELS[r]["label"],
+                          "vram": seg.MODELS[r]["vram_gate"]}
+                         for r in seg.LADDER] if _HAVE_SEG else [])})
+
+
+def _dispatch(req):
+    op = req.get("op")
+    rid = req.get("id")
+    try:
+        if op == "models":
+            _ready()
+            return
+        if op in _BG_OPS and not _HAVE_REMBG:
+            out({"type": "error", "message":
+                 "Background removal is not installed in this build.", "id": rid})
+            return
+        if op in _SEG_OPS and not _HAVE_SEG:
+            out({"type": "error", "message":
+                 "Segmentation is not installed in this build.", "id": rid})
+            return
+        handler = _HANDLERS.get(op)
+        if handler:
+            handler(req)
+    except Exception as e:  # noqa: BLE001
+        out({"type": "error",
+             "message": f"{e}\n{traceback.format_exc()}", "id": rid})
+
+
+def _worker_loop(q):
+    while True:
+        req = q.get()
+        if req is None:
+            return
+        _cancel.clear()
+        _dispatch(req)
+
+
 def main():
-    out({"type": "ready", "models": list(sessions_names),
-         "providers": provider_names()})
+    _ready()
+    q = queue.Queue()
+    threading.Thread(target=_worker_loop, args=(q,), daemon=True).start()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -241,20 +531,14 @@ def main():
         except Exception:
             continue
         op = req.get("op")
-        rid = req.get("id")
-        try:
-            if op == "single":
-                handle_single(req)
-            elif op == "batch":
-                handle_batch(req)
-            elif op == "models":
-                out({"type": "ready", "models": list(sessions_names),
-                     "providers": provider_names(), "id": rid})
-            elif op == "shutdown":
-                break
-        except Exception as e:
-            out({"type": "error",
-                 "message": f"{e}\n{traceback.format_exc()}", "id": rid})
+        if op == "shutdown":
+            break
+        # Cancel is handled on the stdin thread so it can interrupt a running
+        # task (which is checking _cancel between grid points).
+        if op == "seg_cancel":
+            _cancel.set()
+            continue
+        q.put(req)
 
 
 if __name__ == "__main__":

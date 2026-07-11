@@ -27,7 +27,7 @@ VENV_PY = (os.environ.get("BGBG_VENV_PYTHON")
            or os.path.expanduser("~/.local/share/bg-be-gone/venv/bin/python"))
 WORKER = os.environ.get("BGBG_WORKER", os.path.join(APP_DIR, "worker.py"))
 LOG = os.path.join(GLib.get_user_cache_dir(), "bg-be-gone-worker.log")
-APP_VERSION = os.environ.get("BGBG_VERSION", "1.0.0")
+APP_VERSION = os.environ.get("BGBG_VERSION", "1.1.0")
 
 SUBJECTS = [
     ("General (objects, scenes)", "birefnet-general"),
@@ -56,6 +56,24 @@ BGS = [
     ("Green screen", "#00b140"),
     ("Custom…", "custom"),
 ]
+SEG_MODES = [
+    ("Everything — pick layers", "everything"),
+    ("Click to select", "point"),
+]
+# Grid density for "segment everything": label -> points-per-side (0 = auto).
+SEG_DETAIL = [
+    ("Auto", 0),
+    ("Fast", 16),
+    ("Balanced", 24),
+    ("Fine", 32),
+    ("Maximum", 44),
+]
+# Hover-dwell before drilling general -> specific: label -> milliseconds.
+SEG_FOCUS = [
+    ("Quick", 800),
+    ("Normal", 1600),
+    ("Relaxed", 2600),
+]
 IMG_PATTERNS = ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp", "*.tif", "*.tiff"]
 PROVIDER_LABELS = {
     "CUDAExecutionProvider": "NVIDIA (CUDA)",
@@ -65,14 +83,113 @@ PROVIDER_LABELS = {
     "CPUExecutionProvider": "CPU",
 }
 
-CSS = b"""
-.view-frame { background: #1c1c1e; border-radius: 8px; }
-.zoom-badge {
-  background: alpha(black, 0.55); color: white; border-radius: 6px;
-  padding: 2px 8px; margin: 8px; font-size: 0.8em;
+CSS = """
+/* bg-be-gone — playful, Apple-ish polish */
+.view-frame {
+  background: #17171a;
+  border-radius: 16px;
+  box-shadow: 0 10px 30px alpha(black, 0.35);
 }
-.panel-title { font-weight: bold; }
+.zoom-badge {
+  background: alpha(black, 0.5); color: white; border-radius: 999px;
+  padding: 2px 10px; margin: 10px; font-size: 0.78em;
+}
+.cursor-badge {
+  background: alpha(black, 0.72); color: white; border-radius: 999px;
+  padding: 3px 11px; font-size: 0.8em;
+  box-shadow: 0 3px 10px alpha(black, 0.35);
+}
+.panel-title { font-weight: 700; opacity: 0.85; letter-spacing: 0.2px; }
+
+.statusbar { min-height: 26px; font-size: 0.9em; }
+.statusbar .dev-dot { min-width: 10px; min-height: 10px; }
+
+.action-bar {
+  padding: 8px;
+  border-radius: 18px;
+  background: alpha(@window_bg_color, 0.6);
+  box-shadow: 0 1px 2px alpha(black, 0.15), inset 0 1px 0 alpha(white, 0.03);
+}
+.status-label { font-size: 0.92em; }
+
+button.pill {
+  border-radius: 999px;
+  padding: 6px 16px;
+  transition: transform 120ms ease, box-shadow 150ms ease;
+}
+button.pill:hover { box-shadow: 0 3px 10px alpha(black, 0.22); }
+button.pill:active { transform: scale(0.96); }
+button.suggested-action.pill { box-shadow: 0 4px 14px alpha(@accent_bg_color, 0.45); }
+
+.empty-title { font-size: 1.25em; font-weight: 700; }
+.empty-hint { opacity: 0.62; }
+.tip-banner { font-size: 0.94em; }
+
+/* device indicator dot — vendor coloured */
+.dev-dot {
+  min-width: 11px; min-height: 11px; border-radius: 999px;
+  background: #8a8a8a; box-shadow: 0 0 0 2px alpha(black, 0.15);
+}
+.dev-nvidia { background: #76b900; box-shadow: 0 0 8px alpha(#76b900, 0.7); }
+.dev-amd    { background: #ed1c24; box-shadow: 0 0 8px alpha(#ed1c24, 0.6); }
+.dev-dml    { background: #0a84ff; box-shadow: 0 0 8px alpha(#0a84ff, 0.6); }
+.dev-cpu    { background: #9aa0a6; }
 """
+
+
+def primary_button(label, icon=None):
+    """The one bold, rounded call-to-action button (Generate / Segment / Run)."""
+    b = Gtk.Button()
+    if icon:
+        b.set_child(Adw.ButtonContent(icon_name=icon, label=label))
+    else:
+        b.set_label(label)
+    b.add_css_class("suggested-action")
+    b.add_css_class("pill")
+    return b
+
+
+def pill_button(label):
+    b = Gtk.Button(label=label)
+    b.add_css_class("pill")
+    return b
+
+
+def save_button(label="Save…"):
+    """Consistent Save button (icon + label), disabled until there's something."""
+    b = Gtk.Button()
+    b.set_child(Adw.ButtonContent(icon_name="document-save-symbolic", label=label))
+    b.add_css_class("pill")
+    b.set_sensitive(False)
+    return b
+
+
+def action_bar(primary=None, secondary=(), cancel=None, save=None, status_text=""):
+    """Standard action row with fixed slots so Save is always far-right and the
+    layout is identical on every page. Returns (bar, status_label, spinner)."""
+    bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    bar.add_css_class("action-bar")
+    if primary is not None:
+        bar.append(primary)
+    for b in secondary:
+        bar.append(b)
+    spinner = Gtk.Spinner()
+    spinner.set_size_request(18, 18)   # reserve space so start/stop never reflows
+    spinner.set_valign(Gtk.Align.CENTER)
+    bar.append(spinner)
+    status = Gtk.Label(xalign=0, label=status_text)
+    status.add_css_class("dim-label")
+    status.add_css_class("status-label")
+    status.set_hexpand(True)
+    status.set_ellipsize(3)   # PANGO_ELLIPSIZE_END
+    status.set_width_chars(0)
+    status.set_max_width_chars(0)
+    bar.append(status)
+    if cancel is not None:
+        bar.append(cancel)
+    if save is not None:
+        bar.append(save)
+    return bar, status, spinner
 
 
 class Worker:
@@ -134,7 +251,9 @@ class Worker:
 class Panel:
     """Titled interactive image view with per-side transform buttons."""
 
-    def __init__(self, title, on_change=None):
+    def __init__(self, title, on_change=None, transforms=True,
+                 empty_icon="image-x-generic-symbolic",
+                 empty_title="Drop an image here", empty_hint="or click Open"):
         self._ext_change = on_change
         self._last_pct = -1
         self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -145,17 +264,22 @@ class Panel:
         lbl.add_css_class("panel-title")
         header.set_start_widget(lbl)
         tools = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
-        for icon, tip, cb in (
-            ("object-rotate-left-symbolic", "Rotate left",
-             lambda *_: self.view._rotate(-1)),
-            ("object-rotate-right-symbolic", "Rotate right",
-             lambda *_: self.view._rotate(1)),
-            ("object-flip-horizontal-symbolic", "Flip horizontal",
-             lambda *_: self.view._flip(True)),
-            ("object-flip-vertical-symbolic", "Flip vertical",
-             lambda *_: self.view._flip(False)),
-            ("zoom-fit-best-symbolic", "Reset view", self._reset),
-        ):
+        # Rotate/flip re-orient the image; the Segment page hides them because
+        # its overlays register to un-rotated image pixels.
+        buttons = []
+        if transforms:
+            buttons += [
+                ("object-rotate-left-symbolic", "Rotate left",
+                 lambda *_: self.view._rotate(-1)),
+                ("object-rotate-right-symbolic", "Rotate right",
+                 lambda *_: self.view._rotate(1)),
+                ("object-flip-horizontal-symbolic", "Flip horizontal",
+                 lambda *_: self.view._flip(True)),
+                ("object-flip-vertical-symbolic", "Flip vertical",
+                 lambda *_: self.view._flip(False)),
+            ]
+        buttons.append(("zoom-fit-best-symbolic", "Reset view", self._reset))
+        for icon, tip, cb in buttons:
             b = Gtk.Button(icon_name=icon)
             b.set_tooltip_text(tip)
             b.add_css_class("flat")
@@ -183,14 +307,41 @@ class Panel:
         self.zoom_badge.set_visible(False)
         overlay.add_overlay(self.zoom_badge)
 
-        self.placeholder = Gtk.Label()
-        self.placeholder.set_markup(
-            "<span alpha='55%'>Drop an image here\nor click Open</span>")
-        self.placeholder.set_justify(Gtk.Justification.CENTER)
+        self.placeholder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.placeholder.set_halign(Gtk.Align.CENTER)
+        self.placeholder.set_valign(Gtk.Align.CENTER)
         self.placeholder.set_can_target(False)
+        ph_icon = Gtk.Image.new_from_icon_name(empty_icon)
+        ph_icon.set_pixel_size(56)
+        ph_icon.add_css_class("dim-label")
+        ph_title = Gtk.Label(label=empty_title)
+        ph_title.add_css_class("empty-title")
+        ph_hint = Gtk.Label(label=empty_hint)
+        ph_hint.add_css_class("empty-hint")
+        self.placeholder.append(ph_icon)
+        self.placeholder.append(ph_title)
+        self.placeholder.append(ph_hint)
         overlay.add_overlay(self.placeholder)
 
+        # floating badge that trails the cursor over stacked objects (Segment)
+        self.cursor_badge = Gtk.Label(label="")
+        self.cursor_badge.add_css_class("cursor-badge")
+        self.cursor_badge.set_halign(Gtk.Align.START)
+        self.cursor_badge.set_valign(Gtk.Align.START)
+        self.cursor_badge.set_can_target(False)
+        self.cursor_badge.set_visible(False)
+        overlay.add_overlay(self.cursor_badge)
+
         self.box.append(overlay)
+
+    def show_cursor_badge(self, text, wx, wy):
+        self.cursor_badge.set_text(text)
+        self.cursor_badge.set_margin_start(max(4, int(wx) + 14))
+        self.cursor_badge.set_margin_top(max(4, int(wy) + 16))
+        self.cursor_badge.set_visible(True)
+
+    def hide_cursor_badge(self):
+        self.cursor_badge.set_visible(False)
 
     def _reset(self, *_):
         self.view.reset_view()
@@ -228,9 +379,19 @@ class Window(Adw.ApplicationWindow):
         self.busy = False
         self.batch_input = None
         self.batch_output = None
-        self._advanced = False
-        self._syncing = False
         self._gpu_notified = False
+        # segmentation state
+        self._seg_available = False
+        self._seg_models = []          # [{"rung","label"}] from the worker
+        self.seg_loaded_for = None     # source path currently encoded
+        self.seg_pending = None        # callback to run once seg_ready arrives
+        self._seg_load_rid = None      # id of the in-flight seg_load, or None
+        self.seg_busy = False
+        self.seg_objects = []
+        self.seg_points = []           # accumulated [x, y, label] in point mode
+        self.seg_point_mask = None     # last point-mode mask path
+        self.seg_result_output = None
+        self._seg_rows = {}            # object id -> layer-list row widgets
         self.worker = Worker(self._on_worker_message)
 
         self.toasts = Adw.ToastOverlay()
@@ -247,7 +408,12 @@ class Window(Adw.ApplicationWindow):
         open_btn.set_tooltip_text("Open image")
         open_btn.connect("clicked", self._on_open_image)
         header.pack_start(open_btn)
+        help_btn = Gtk.Button(icon_name="help-about-symbolic")
+        help_btn.set_tooltip_text("How to use bg-be-gone")
+        help_btn.connect("clicked", lambda *_: self._on_help())
+        header.pack_end(help_btn)
         menu = Gio.Menu()
+        menu.append("How to use…", "app.help")
         menu.append("About bg-be-gone", "app.about")
         menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic",
                                   menu_model=menu)
@@ -260,18 +426,41 @@ class Window(Adw.ApplicationWindow):
         self.stack.set_hexpand(True)
         body.append(self.stack)
         tv.set_content(body)
+        tv.add_bottom_bar(self._build_statusbar())
+        tv.set_bottom_bar_style(Adw.ToolbarStyle.RAISED_BORDER)
 
-        self.stack.add_titled_with_icon(
+        self.single_page = self.stack.add_titled_with_icon(
             self._build_single(), "single", "Single", "image-x-generic-symbolic")
-        self.stack.add_titled_with_icon(
+        self.batch_page = self.stack.add_titled_with_icon(
             self._build_batch(), "batch", "Batch", "view-grid-symbolic")
+        self.seg_page = self.stack.add_titled_with_icon(
+            self._build_segment(), "segment", "Segment", "edit-select-all-symbolic")
+        self.stack.connect("notify::visible-child-name", self._on_page_changed)
+        # mirror each page's status label into the shared footer
+        self._mirror_status(self.status, "single")
+        self._mirror_status(self.seg_status, "segment")
+        self._mirror_status(self.batch_status, "batch")
         if os.environ.get("BGBG_START_PAGE"):
             self.stack.set_visible_child_name(os.environ["BGBG_START_PAGE"])
+        self._sync_sidebar_page()
+        self._update_footer()
+        self._cur_page = self.stack.get_visible_child_name()
 
         # window-wide drag and drop
         drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
         drop.connect("drop", self._on_drop)
         self.add_controller(drop)
+
+        # keyboard shortcuts (Ctrl+S save, Ctrl+Return primary action)
+        sc = Gtk.ShortcutController()
+        sc.set_scope(Gtk.ShortcutScope.MANAGED)
+        sc.add_shortcut(Gtk.Shortcut.new(
+            Gtk.ShortcutTrigger.parse_string("<Control>s"),
+            Gtk.CallbackAction.new(lambda *_: self._accel_save())))
+        sc.add_shortcut(Gtk.Shortcut.new(
+            Gtk.ShortcutTrigger.parse_string("<Control>Return"),
+            Gtk.CallbackAction.new(lambda *_: self._accel_primary())))
+        self.add_controller(sc)
 
         self.connect("close-request", self._on_close)
         if not self.worker.ok:
@@ -289,21 +478,26 @@ class Window(Adw.ApplicationWindow):
         box.set_margin_end(12)
         scroller.set_child(box)
 
+        # One coherent picker: friendly Subject presets, plus a "Custom model…"
+        # entry that reveals the exact-model list (same pattern as the Background
+        # "Custom…" colour reveal). No hidden mode flag.
         model_grp = Adw.PreferencesGroup(title="Model")
         self.subject_row = Adw.ComboRow(
             title="Subject",
-            model=Gtk.StringList.new([s[0] for s in SUBJECTS]))
+            model=Gtk.StringList.new([s[0] for s in SUBJECTS] + ["Custom model…"]))
         self.subject_row.set_subtitle("What the image mainly contains")
         self.subject_row.connect("notify::selected", self._on_subject_changed)
         model_grp.add(self.subject_row)
 
-        self.adv_row = Adw.ExpanderRow(title="Advanced model")
         self.model_row = Adw.ComboRow(
             title="Model", model=Gtk.StringList.new([m[0] for m in MODELS]))
-        self.model_row.connect("notify::selected", self._on_model_changed)
-        self.adv_row.add_row(self.model_row)
-        model_grp.add(self.adv_row)
+        self.model_row.set_subtitle("Exact rembg model")
+        self.model_row.set_visible(False)
+        self.model_row.connect("notify::selected", lambda *_: self._mark_stale())
+        model_grp.add(self.model_row)
+        self.model_grp = model_grp
         box.append(model_grp)
+        box.append(self._build_seg_group())
 
         out_grp = Adw.PreferencesGroup(title="Output")
         self.bg_row = Adw.ComboRow(
@@ -317,6 +511,7 @@ class Window(Adw.ApplicationWindow):
         rgba = Gdk.RGBA()
         rgba.parse("#00b140")
         self.color_btn.set_rgba(rgba)
+        self.color_btn.connect("notify::rgba", self._seg_bg_changed)
         self.color_btn.set_valign(Gtk.Align.CENTER)
         self.color_row.add_suffix(self.color_btn)
         self.color_row.set_sensitive(False)
@@ -333,48 +528,541 @@ class Window(Adw.ApplicationWindow):
             title="Alpha matting", subtitle="Cleaner edges, a little slower")
         out_grp.add(self.alpha_row)
         box.append(out_grp)
-
-        self.device_lbl = Gtk.Label(xalign=0, label="Device: detecting…")
-        self.device_lbl.add_css_class("dim-label")
-        self.device_lbl.set_wrap(True)
-        box.append(self.device_lbl)
         return scroller
 
-    def _on_subject_changed(self, *_):
-        self._advanced = False
-        target = SUBJECTS[self.subject_row.get_selected()][1]
-        for i, (_, m) in enumerate(MODELS):
-            if m == target:
-                self._syncing = True
-                self.model_row.set_selected(i)
-                self._syncing = False
-                break
-        self._mark_stale()
+    def _build_statusbar(self):
+        """Persistent window footer: device (left), the active page's status/hint
+        (centre), and page context (right). Consolidates what used to be a
+        sidebar device row plus scattered per-page labels."""
+        bar = Gtk.CenterBox()
+        bar.add_css_class("statusbar")
+        bar.set_margin_start(12)
+        bar.set_margin_end(12)
+        bar.set_margin_top(4)
+        bar.set_margin_bottom(4)
 
-    def _on_model_changed(self, *_):
-        if self._syncing:
-            return
-        self._advanced = True
-        self.adv_row.set_expanded(True)
+        dev = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        dev.set_valign(Gtk.Align.CENTER)
+        self.device_dot = Gtk.Box()
+        self.device_dot.add_css_class("dev-dot")
+        self.device_dot.set_valign(Gtk.Align.CENTER)
+        self.device_lbl = Gtk.Label(xalign=0, label="Detecting device…")
+        self.device_lbl.add_css_class("dim-label")
+        dev.append(self.device_dot)
+        dev.append(self.device_lbl)
+        bar.set_start_widget(dev)
+
+        self.footer_status = Gtk.Label(label="")
+        self.footer_status.add_css_class("status-label")
+        self.footer_status.set_ellipsize(3)          # PANGO_ELLIPSIZE_END
+        bar.set_center_widget(self.footer_status)
+
+        self.footer_context = Gtk.Label(label="")
+        self.footer_context.add_css_class("dim-label")
+        self.footer_context.add_css_class("status-label")
+        bar.set_end_widget(self.footer_context)
+        return bar
+
+    def _mirror_status(self, label, page):
+        """Reflect a per-page status label into the footer while its page is
+        active — no call-site changes, just watch the label's text property."""
+        def cb(*_):
+            if self.stack.get_visible_child_name() == page:
+                self.footer_status.set_text(label.get_text())
+        label.connect("notify::label", cb)
+
+    def _update_footer(self):
+        page = self.stack.get_visible_child_name()
+        cur = {"single": getattr(self, "status", None),
+               "segment": getattr(self, "seg_status", None),
+               "batch": getattr(self, "batch_status", None)}.get(page)
+        if cur is not None:
+            self.footer_status.set_text(cur.get_text())
+        try:
+            self.footer_context.set_text(self._footer_context())
+        except Exception:
+            self.footer_context.set_text("")
+
+    def _footer_context(self):
+        page = self.stack.get_visible_child_name()
+        if page == "segment":
+            it = self.seg_model_row.get_selected_item()
+            model = it.get_string() if it is not None else ""
+            mode = "Click" if self._seg_mode() == "point" else "Everything"
+            return "Segment · %s · %s" % (mode, model) if model else "Segment · %s" % mode
+        if page == "batch":
+            return "Batch"
+        i = self.subject_row.get_selected()
+        name = (MODELS[self.model_row.get_selected()][0] if i >= len(SUBJECTS)
+                else SUBJECTS[i][0])
+        return "Single · %s" % name
+
+    def _set_device(self, provider, label):
+        self.device_lbl.set_text(label)
+        cls = {"CUDAExecutionProvider": "dev-nvidia",
+               "ROCMExecutionProvider": "dev-amd",
+               "MIGraphXExecutionProvider": "dev-amd",
+               "DmlExecutionProvider": "dev-dml"}.get(provider, "dev-cpu")
+        for c in ("dev-nvidia", "dev-amd", "dev-dml", "dev-cpu"):
+            self.device_dot.remove_css_class(c)
+        self.device_dot.add_css_class(cls)
+        self.device_dot.set_tooltip_text(label)
+
+    def _on_subject_changed(self, *_):
+        # The exact-model picker only appears for the "Custom model…" entry.
+        custom = self.subject_row.get_selected() >= len(SUBJECTS)
+        self.model_row.set_visible(custom)
         self._mark_stale()
+        if getattr(self, "footer_context", None) is not None:
+            self._update_footer()
 
     def _sync_color(self):
         bg = BGS[self.bg_row.get_selected()][1]
         self.color_row.set_sensitive(bg == "custom")
         self.blur_row.set_visible(bg == "blur")
         self._mark_stale()
+        self._seg_bg_changed()
+
+    def _seg_bg_changed(self, *_):
+        if getattr(self, "seg_panel", None) is not None and \
+                self.stack.get_visible_child_name() == "segment":
+            self._update_seg_preview()
 
     def get_settings(self):
-        if self._advanced:
+        i = self.subject_row.get_selected()
+        if i >= len(SUBJECTS):                      # "Custom model…"
             model = MODELS[self.model_row.get_selected()][1]
         else:
-            model = SUBJECTS[self.subject_row.get_selected()][1]
+            model = SUBJECTS[i][1]
         bg = BGS[self.bg_row.get_selected()][1]
         if bg == "custom":
             c = self.color_btn.get_rgba()
             bg = "#%02x%02x%02x" % (round(c.red * 255), round(c.green * 255),
                                     round(c.blue * 255))
         return model, bg, self.alpha_row.get_active(), int(self.blur_row.get_value())
+
+    # ---------- segmentation sidebar + page ----------
+    def _build_seg_group(self):
+        grp = Adw.PreferencesGroup(title="Segmentation")
+        self.seg_grp = grp
+        # Mode lives on the page as a segmented control (see _build_segment).
+
+        # Focus speed (visible): how long to hover before drilling to the part.
+        self.seg_focus_row = Adw.ComboRow(
+            title="Focus speed",
+            model=Gtk.StringList.new([f[0] for f in SEG_FOCUS]))
+        self.seg_focus_row.set_subtitle("Hover this long to focus a sub-object")
+        self.seg_focus_row.set_selected(1)     # Normal
+        self.seg_focus_row.connect("notify::selected", self._on_seg_focus_changed)
+        grp.add(self.seg_focus_row)
+
+        # Advanced (collapsed by default): model override + detail.
+        # (Device is shown once, in the sidebar footer — not duplicated here.)
+        self.seg_adv = Adw.ExpanderRow(title="Advanced",
+                                       subtitle="Model and detail")
+        self.seg_model_row = Adw.ComboRow(
+            title="Model", model=Gtk.StringList.new(["Auto"]))
+        self.seg_model_row.set_subtitle("Auto — by GPU / VRAM")
+        self.seg_model_row.connect("notify::selected", self._on_seg_model_changed)
+        self.seg_adv.add_row(self.seg_model_row)
+
+        self.seg_detail_row = Adw.ComboRow(
+            title="Detail", model=Gtk.StringList.new([d[0] for d in SEG_DETAIL]))
+        self.seg_detail_row.set_subtitle("Finer finds more, but is slower")
+        self.seg_detail_row.connect("notify::selected", lambda *_: None)
+        self.seg_adv.add_row(self.seg_detail_row)
+        grp.add(self.seg_adv)
+        grp.set_visible(False)
+        return grp
+
+    def _vram_str(self, mb):
+        if not mb:
+            return "CPU · low VRAM"
+        return ("~%.1f GB" % (mb / 1000)).replace(".0", "")
+
+    def _apply_seg_models(self):
+        names = ["Auto — best for your GPU"]
+        for m in self._seg_models:
+            names.append("%s · %s" % (m["label"], self._vram_str(m.get("vram", 0))))
+        self._syncing_seg = True
+        self.seg_model_row.set_model(Gtk.StringList.new(names))
+        self.seg_model_row.set_selected(0)
+        self._syncing_seg = False
+
+    def _seg_model_choice(self):
+        i = self.seg_model_row.get_selected()
+        if i <= 0 or i > len(self._seg_models):
+            return "auto"
+        return self._seg_models[i - 1]["rung"]
+
+    def _seg_detail(self):
+        return SEG_DETAIL[self.seg_detail_row.get_selected()][1] or None
+
+    def _seg_mode(self):
+        return self.seg_mode_toggle.get_active_name() or "everything"
+
+    @staticmethod
+    def _domain(page):
+        # Single and Batch share the background-removal model; Segment is its own.
+        return "seg" if page == "segment" else "bg"
+
+    def _on_page_changed(self, *_):
+        self._sync_sidebar_page()
+        self._update_footer()
+        new = self.stack.get_visible_child_name()
+        old = getattr(self, "_cur_page", None)
+        self._cur_page = new
+        # Free a domain's model when you leave it (keep it resident while you're
+        # on its page, so re-runs stay fast).
+        if old is not None and self._domain(old) != self._domain(new):
+            self._release_domain(self._domain(old))
+
+    def _release_domain(self, domain):
+        if domain == "bg":
+            self._unload("bg")
+            return
+        # Stop any in-flight pass, then unload unconditionally. We can't rely on a
+        # seg_canceled reply — only "segment everything" is cancellable; load /
+        # point / extract finish normally — so unload authoritatively here.
+        if self.seg_busy:
+            self.worker.send({"op": "seg_cancel"})
+        self._unload("seg")
+
+    def _unload(self, scope):
+        """Ask the worker to release a model. For segmentation, also drop the
+        cached encode + overlays and invalidate any in-flight load so a later
+        pass re-encodes cleanly."""
+        if scope == "seg":
+            self.seg_loaded_for = None
+            self.seg_pending = None
+            self._seg_load_rid = None      # ignore a load reply that's now stale
+            if getattr(self, "seg_panel", None) is not None:
+                self._seg_clear_overlays()
+        if self.worker.ok:
+            self.worker.send({"op": "unload", "scope": scope})
+
+    def _sync_sidebar_page(self):
+        seg = self.stack.get_visible_child_name() == "segment"
+        self.model_grp.set_visible(not seg)
+        self.seg_grp.set_visible(seg and self._seg_available)
+        self.alpha_row.set_visible(not seg)
+
+    def _accel_save(self):
+        p = self.stack.get_visible_child_name()
+        if p == "single" and self.save_btn.get_sensitive():
+            self._on_save()
+        elif p == "segment" and self.seg_save_btn.get_sensitive():
+            self._on_seg_save()
+        return True
+
+    def _accel_primary(self):
+        p = self.stack.get_visible_child_name()
+        if p == "single":
+            self._on_generate()
+        elif p == "segment":
+            self._on_seg_everything()
+        elif p == "batch":
+            self._on_run_batch()
+        return True
+
+    def _build_segment(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(page, "set_margin_" + m)(10)
+
+        self.seg_everything_btn = primary_button(
+            "Segment everything", icon="edit-select-all-symbolic")
+        self.seg_everything_btn.set_tooltip_text("Find every object in the image")
+        self.seg_everything_btn.connect(
+            "clicked", lambda *_: self._on_seg_everything())
+        self.seg_selall_btn = pill_button("Select all")
+        self.seg_selall_btn.connect("clicked", lambda *_: self._on_seg_select_all())
+        self.seg_clear_btn = pill_button("Clear")
+        self.seg_clear_btn.connect("clicked", lambda *_: self._seg_clear_overlays())
+        self.seg_cancel_btn = pill_button("Cancel")
+        self.seg_cancel_btn.set_sensitive(False)
+        self.seg_cancel_btn.connect("clicked", lambda *_: self._on_seg_cancel())
+        self.seg_save_btn = save_button("Save selection…")
+        self.seg_save_btn.set_tooltip_text("Export the picked objects (Ctrl+S)")
+        self.seg_save_btn.connect("clicked", lambda *_: self._on_seg_save())
+        bar, self.seg_status, self.seg_spinner = action_bar(
+            primary=self.seg_everything_btn,
+            secondary=(self.seg_selall_btn, self.seg_clear_btn),
+            cancel=self.seg_cancel_btn, save=self.seg_save_btn,
+            status_text="Open an image, then Segment.")
+        self.seg_banner = Adw.Banner(
+            title="Tip: hold Space to pan · click to keep objects · Ctrl-click removes")
+        self.seg_banner.set_button_label("Got it")
+        self.seg_banner.connect(
+            "button-clicked", lambda *_: self.seg_banner.set_revealed(False))
+        self.seg_banner.set_revealed(True)
+        page.append(self.seg_banner)
+        page.append(bar)
+
+        # Segmented Mode control (Apple-style), centered under the action bar.
+        self.seg_mode_toggle = Adw.ToggleGroup()
+        self.seg_mode_toggle.add(Adw.Toggle(name="everything", label="Everything"))
+        self.seg_mode_toggle.add(Adw.Toggle(name="point", label="Click to select"))
+        self.seg_mode_toggle.set_active_name("everything")
+        self.seg_mode_toggle.set_halign(Gtk.Align.CENTER)
+        self.seg_mode_toggle.connect("notify::active-name", self._on_seg_mode_changed)
+        page.append(self.seg_mode_toggle)
+
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, wide_handle=True)
+        paned.set_vexpand(True)
+        self.seg_panel = Panel(
+            "Source — click objects", transforms=False,
+            empty_title="Drop an image here",
+            empty_hint="then Segment everything, or click to select")
+        self.seg_panel.view.on_seg_click = self._on_seg_click
+        self.seg_panel.view.on_seg_hover = self._on_seg_hover
+        self.seg_panel.view.set_seg_mode("everything")
+        self.seg_res_panel = Panel(
+            "Result", empty_icon="emblem-photos-symbolic",
+            empty_title="Your selection appears here",
+            empty_hint="Pick objects, then Save")
+        paned.set_start_child(self.seg_panel.box)
+        paned.set_end_child(self.seg_res_panel.box)
+        paned.set_resize_start_child(True)
+        paned.set_resize_end_child(True)
+        paned.connect("notify::max-position", self._center_seg_paned)
+        page.append(paned)
+        return page
+
+    def _center_seg_paned(self, paned, *_):
+        if not getattr(self, "_seg_paned_centered", False):
+            mx = paned.get_property("max-position")
+            if mx > 0:
+                paned.set_position(mx // 2)
+                self._seg_paned_centered = True
+
+    # ---------- segmentation actions ----------
+    def _seg_set_busy(self, busy, cancel=False):
+        self.seg_busy = busy
+        self.seg_everything_btn.set_sensitive(not busy)
+        self.seg_selall_btn.set_sensitive(not busy)
+        self.seg_cancel_btn.set_sensitive(busy and cancel)
+        (self.seg_spinner.start if busy else self.seg_spinner.stop)()
+        if not busy:                        # any terminal state stops the shimmer
+            self.seg_panel.view.set_scanning(False)
+
+    def _extract_bg(self):
+        bg = BGS[self.bg_row.get_selected()][1]
+        if bg == "custom":
+            c = self.color_btn.get_rgba()
+            bg = "#%02x%02x%02x" % (round(c.red * 255), round(c.green * 255),
+                                    round(c.blue * 255))
+        return bg, int(self.blur_row.get_value())
+
+    def _ensure_seg_loaded(self, cb):
+        if not self.source_path:
+            self._toast("Open an image first.")
+            return
+        if self.seg_loaded_for == self.source_path:
+            cb()
+            return
+        if self.seg_busy:
+            return
+        inp = os.path.join(self.tmpdir, "seg_input.png")
+        try:
+            self.seg_panel.view.export_pixbuf().savev(inp, "png", [], [])
+        except Exception as e:
+            self._toast("Could not prepare image: %s" % e)
+            return
+        self.seg_pending = cb
+        self._seg_set_busy(True, cancel=True)
+        self.seg_status.set_text("Preparing segmentation model…")
+        # Track this load so a reply that lands after we've left/unloaded (below)
+        # can be ignored instead of wrongly re-marking the model as resident.
+        self._seg_load_rid = self.worker.send({"op": "seg_load", "input": inp,
+                                               "model": self._seg_model_choice()})
+
+    def _on_seg_everything(self):
+        if self.seg_busy:
+            return
+        self._ensure_seg_loaded(self._do_seg_everything)
+
+    def _do_seg_everything(self):
+        self._seg_clear_overlays()
+        self._seg_set_busy(True, cancel=True)
+        self.seg_panel.view.set_scanning(True)
+        self.seg_status.set_text("Finding objects…")
+        req = {"op": "seg_everything"}
+        detail = self._seg_detail()
+        if detail:
+            req["points_per_side"] = detail
+        self.worker.send(req)
+
+    def _on_seg_click(self, ix, iy, value, kind):
+        if kind == "toggle":
+            self._update_seg_selection_ui()
+        else:  # point mode
+            if self.seg_busy:
+                return
+            self.seg_points.append([ix, iy, value])
+            self._ensure_seg_loaded(self._do_seg_point)
+
+    def _do_seg_point(self):
+        self._seg_set_busy(True)
+        self.seg_status.set_text("Refining selection…")
+        self.worker.send({"op": "seg_point", "points": self.seg_points,
+                          "use_prev": len(self.seg_points) > 1})
+
+    def _on_seg_select_all(self):
+        self.seg_panel.view.set_seg_selection([o["id"] for o in self.seg_objects])
+        self._update_seg_selection_ui()
+
+    def _seg_clear_overlays(self):
+        self.seg_panel.view.clear_seg(keep_mode=True)
+        self.seg_objects = []
+        self.seg_points = []
+        self.seg_point_mask = None
+        self.seg_result_output = None
+        self.seg_res_panel.view.clear()
+        self.seg_save_btn.set_sensitive(False)
+        if not self.seg_busy:
+            self.seg_status.set_text("Cleared.")
+
+    def _update_seg_selection_ui(self):
+        self._update_seg_preview()
+        n = len(self.seg_panel.view.get_seg_selection())
+        if not self.seg_busy:
+            self._seg_base_status = (
+                "%d selected — Save selection." % n if n
+                else "Click objects to keep them (they light up on hover).")
+            self.seg_status.set_text(self._seg_base_status)
+
+    def _on_seg_hover(self, depth, drilled, wx=0.0, wy=0.0):
+        # Hint that overlapping objects are stacked, and how to reach the part.
+        if self.seg_busy:
+            self.seg_panel.hide_cursor_badge()
+            return
+        # A floating badge trails the cursor only when objects are stacked here.
+        if depth >= 2:
+            self.seg_panel.show_cursor_badge(
+                "%d objects · focused the part" % depth if drilled
+                else "%d objects here · hold to focus the part" % depth, wx, wy)
+        else:
+            self.seg_panel.hide_cursor_badge()
+        # Only rewrite the status (which mirrors to the footer) when the hint
+        # actually changes — not on every pointer-motion frame.
+        key = (depth, bool(drilled))
+        if key == getattr(self, "_last_hover_key", None):
+            return
+        self._last_hover_key = key
+        if depth <= 0:
+            self.seg_status.set_text(
+                getattr(self, "_seg_base_status", "")
+                or "Hover to highlight, click to keep.")
+        elif depth >= 2 and drilled:
+            self.seg_status.set_text(
+                "%d objects here · focused the part — click to keep." % depth)
+        elif depth >= 2:
+            self.seg_status.set_text(
+                "%d objects here · showing the whole — hold still to focus a part."
+                % depth)
+        else:
+            self.seg_status.set_text("Click to keep this object.")
+
+    def _seg_has_selection(self):
+        if self._seg_mode() == "point":
+            return self.seg_point_mask is not None
+        return bool(self.seg_panel.view.get_seg_selection())
+
+    def _seg_extract_req(self, outp):
+        bg, blur = self._extract_bg()
+        req = {"op": "seg_extract", "bg": bg, "blur": blur, "output": outp}
+        if self._seg_mode() == "point":
+            req["mask"] = self.seg_point_mask
+        else:
+            req["ids"] = list(self.seg_panel.view.get_seg_selection())
+        return req
+
+    def _update_seg_preview(self):
+        """Debounced worker prerender: the right panel shows the real output —
+        all selected objects composited over the chosen background — exactly like
+        the Single result, and as a normal image you can flip/rotate/zoom."""
+        if not self._seg_has_selection():
+            if getattr(self, "_seg_preview_timer", None):
+                GLib.source_remove(self._seg_preview_timer)
+                self._seg_preview_timer = None
+            self.seg_res_panel.view.clear()
+            self.seg_result_output = None
+            self.seg_save_btn.set_sensitive(False)
+            return
+        if getattr(self, "_seg_preview_timer", None):
+            GLib.source_remove(self._seg_preview_timer)
+        self._seg_preview_timer = GLib.timeout_add(150, self._do_seg_prerender)
+
+    def _do_seg_prerender(self):
+        self._seg_preview_timer = None
+        if self._seg_has_selection():
+            self._seg_preview_rid = self.worker.send(self._seg_extract_req(
+                os.path.join(self.tmpdir, "seg_preview.png")))
+        return False
+
+    def _on_seg_save(self):
+        """Render the final PNG in the worker, then offer a save dialog."""
+        if self.seg_busy:
+            return
+        if not self._seg_has_selection():
+            self._toast("Pick at least one object first.")
+            return
+        self._seg_set_busy(True)
+        self.seg_status.set_text("Preparing export…")
+        self.worker.send(self._seg_extract_req(
+            os.path.join(self.tmpdir, "seg_result.png")))
+
+    def _seg_save_file(self, src):
+        dlg = Gtk.FileDialog(title="Save result")
+        base = os.path.splitext(os.path.basename(self.source_path or "image"))[0]
+        dlg.set_initial_name(base + "_object.png")
+
+        def done(d, res):
+            try:
+                f = d.save_finish(res)
+            except GLib.Error:
+                return
+            path = f.get_path()
+            if not path.lower().endswith(".png"):
+                path += ".png"
+            try:
+                shutil.copyfile(src, path)
+                self._toast("Saved " + os.path.basename(path))
+            except Exception as e:
+                self._toast("Save failed: %s" % e)
+        dlg.save(self, None, done)
+
+    def _on_seg_cancel(self):
+        self.worker.send({"op": "seg_cancel"})
+        self._unload("seg")            # free the SAM model even if it isn't cancellable
+        self.seg_status.set_text("Cancelling…")
+
+    def _on_seg_mode_changed(self, *_):
+        mode = self._seg_mode()
+        self.seg_panel.view.set_seg_mode(mode)
+        self._seg_clear_overlays()
+        self.seg_everything_btn.set_visible(mode == "everything")
+        self.seg_selall_btn.set_visible(mode == "everything")
+        if mode == "point":
+            self.seg_status.set_text(
+                "Click an object (Ctrl-click or right-click removes).")
+        else:
+            self.seg_status.set_text(
+                "Click Segment everything, then pick the objects to keep.")
+        self._update_footer()
+
+    def _on_seg_model_changed(self, *_):
+        if getattr(self, "_syncing_seg", False):
+            return
+        self.seg_loaded_for = None  # force re-encode with the new model
+        self.seg_adv.set_subtitle("Reloads on next segment")
+        self._update_footer()
+
+    def _on_seg_focus_changed(self, *_):
+        if getattr(self, "seg_panel", None) is None:
+            return
+        self.seg_panel.view.set_dwell_ms(SEG_FOCUS[self.seg_focus_row.get_selected()][1])
 
     # ---------- single page ----------
     def _build_single(self):
@@ -384,30 +1072,25 @@ class Window(Adw.ApplicationWindow):
         page.set_margin_start(10)
         page.set_margin_end(10)
 
-        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.gen_btn = Gtk.Button(label="Generate")
-        self.gen_btn.add_css_class("suggested-action")
+        self.gen_btn = primary_button("Generate", icon="image-x-generic-symbolic")
         self.gen_btn.set_sensitive(False)
+        self.gen_btn.set_tooltip_text("Remove the background (Ctrl+Return)")
         self.gen_btn.connect("clicked", lambda *_: self._on_generate())
-        self.save_btn = Gtk.Button(label="Save result…")
-        self.save_btn.set_sensitive(False)
+        self.save_btn = save_button("Save result…")
+        self.save_btn.set_tooltip_text("Save the cut-out (Ctrl+S)")
         self.save_btn.connect("clicked", lambda *_: self._on_save())
-        self.spinner = Gtk.Spinner()
-        bar.append(self.gen_btn)
-        bar.append(self.save_btn)
-        bar.append(self.spinner)
-        self.status = Gtk.Label(xalign=0, label="Open or drop an image to begin.")
-        self.status.add_css_class("dim-label")
-        self.status.set_hexpand(True)
-        self.status.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
-        bar.append(self.status)
+        bar, self.status, self.spinner = action_bar(
+            primary=self.gen_btn, save=self.save_btn,
+            status_text="Open or drop an image to begin.")
         page.append(bar)
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL,
                           wide_handle=True)
         paned.set_vexpand(True)
         self.src_panel = Panel("Source", on_change=self._on_source_change)
-        self.res_panel = Panel("Result")
+        self.res_panel = Panel(
+            "Result", empty_icon="emblem-photos-symbolic",
+            empty_title="Your cut-out appears here", empty_hint="Press Generate")
         paned.set_start_child(self.src_panel.box)
         paned.set_end_child(self.res_panel.box)
         paned.set_resize_start_child(True)
@@ -463,9 +1146,7 @@ class Window(Adw.ApplicationWindow):
             "<tt>{n}</tt> index. Output is PNG in the output folder.</small>")
         box.append(hint)
 
-        self.run_btn = Gtk.Button(label="Run batch")
-        self.run_btn.add_css_class("suggested-action")
-        self.run_btn.add_css_class("pill")
+        self.run_btn = primary_button("Run batch", icon="view-grid-symbolic")
         self.run_btn.set_halign(Gtk.Align.START)
         self.run_btn.set_sensitive(False)
         self.run_btn.connect("clicked", lambda *_: self._on_run_batch())
@@ -523,6 +1204,15 @@ class Window(Adw.ApplicationWindow):
         self.save_btn.set_sensitive(False)
         self.gen_btn.set_sensitive(True)
         self.status.set_text(os.path.basename(path) + " — press Generate.")
+        # Mirror into the Segment page and reset its state for the new image.
+        if getattr(self, "seg_panel", None) is not None:
+            self.seg_panel.view.load_file(path)
+            self.seg_res_panel.view.clear()
+            self._seg_clear_overlays()
+            self.seg_loaded_for = None
+            self.seg_result_output = None
+            self.seg_save_btn.set_sensitive(False)
+            self.seg_status.set_text(os.path.basename(path) + " — Segment.")
 
     def _on_save(self):
         pb = self.res_panel.view.export_pixbuf()
@@ -584,6 +1274,8 @@ class Window(Adw.ApplicationWindow):
         self._sync_batch()
         if spin:
             (self.spinner.start if busy else self.spinner.stop)()
+        if not busy:
+            self.src_panel.view.set_scanning(False)   # end the scan shimmer
 
     def _on_source_change(self):
         if self.src_panel.view.has_image() and self.result_output:
@@ -605,6 +1297,7 @@ class Window(Adw.ApplicationWindow):
             return
         out = os.path.join(self.tmpdir, "result.png")
         self._set_busy(True)
+        self.src_panel.view.set_scanning(True)      # scan shimmer over the source
         self.status.set_text("Generating…")
         self.worker.send({"op": "single", "input": inp, "output": out,
                           "model": model, "alpha": alpha, "bg": bg, "blur": blur})
@@ -629,14 +1322,27 @@ class Window(Adw.ApplicationWindow):
         if t == "ready":
             provs = msg.get("providers") or []
             if provs:
-                self.device_lbl.set_text(
-                    "Device: " + PROVIDER_LABELS.get(provs[0], provs[0]))
+                self._set_device(provs[0],
+                                 PROVIDER_LABELS.get(provs[0], provs[0]))
+            self._seg_available = bool(msg.get("seg"))
+            self._seg_models = msg.get("seg_models") or []
+            self._apply_seg_models()
+            self.seg_page.set_property("visible", self._seg_available)
+            if not msg.get("bgremove", True):
+                # Segmentation-only build: focus the Segment page.
+                self.single_page.set_property("visible", False)
+                self.batch_page.set_property("visible", False)
+                if self._seg_available:
+                    self.stack.set_visible_child_name("segment")
+            self._sync_sidebar_page()
         elif t == "loading":
             self.status.set_text(
                 "Loading %s… (the first run is slower)" % msg["model"])
             self.batch_status.set_text("Loading model %s…" % msg["model"])
+        elif t == "notice":
+            self._toast(msg["message"])
         elif t == "device":
-            self.device_lbl.set_text("Device: " + msg["label"])
+            self._set_device(msg["provider"], msg["label"])
             if msg.get("gpu") and not self._gpu_notified:
                 self._gpu_notified = True
                 self._toast("%s ready — the first run optimises GPU kernels and "
@@ -661,14 +1367,131 @@ class Window(Adw.ApplicationWindow):
                 (msg["count"], msg["seconds"], msg["outdir"]))
             self._set_busy(False, spin=False)
             self._toast("Batch finished: %d images" % msg["count"])
+        elif t == "seg_ready":
+            self._seg_set_busy(False)
+            if msg.get("id") != getattr(self, "_seg_load_rid", None):
+                return False           # left/unloaded before this load finished
+            self.seg_loaded_for = self.source_path
+            note = {"auto": " · auto", "fallback": " · fallback"}.get(
+                msg.get("mode"), "")
+            self.seg_model_row.set_subtitle(msg["model"] + note)
+            # When on "Auto", tell the user which model that resolved to.
+            if self.seg_model_row.get_selected() <= 0:
+                self.seg_model_row.set_tooltip_text(
+                    "Auto selected: %s on %s" % (msg["model"], msg["label"]))
+            self._set_device(msg["provider"], msg["label"])
+            cb, self.seg_pending = self.seg_pending, None
+            if cb:
+                cb()
+            else:
+                self.seg_status.set_text("Ready: %s on %s." %
+                                         (msg["model"], msg["label"]))
+        elif t == "seg_download":
+            total = max(msg.get("total", 0), 1)
+            self.seg_status.set_text("Downloading model… %d%%" %
+                                     (100 * msg["done"] // total))
+        elif t == "seg_step":
+            self.seg_status.set_text(
+                "%s unavailable — trying a lighter model…" % msg["rung"])
+        elif t == "seg_progress":
+            # The scan shimmer conveys activity; keep a calm static label rather
+            # than a jittery running count.
+            self.seg_status.set_text("Finding objects…")
+        elif t == "seg_objects":
+            self._seg_set_busy(False)
+            self.seg_objects = msg["objects"]
+            self.seg_panel.view.set_seg_layers(
+                msg["objects"], msg["label_map"],
+                msg.get("general_map"), msg.get("depth_map"))
+            self._update_seg_preview()
+            self._seg_base_status = (
+                "%d objects — hover to highlight, click to keep." % msg["count"])
+            self.seg_status.set_text(self._seg_base_status)
+        elif t == "seg_mask":
+            self._seg_set_busy(False)
+            self.seg_point_mask = msg["mask"]
+            self.seg_panel.view.set_point_mask(msg["mask"], msg.get("contour"))
+            self._update_seg_preview()
+            self.seg_status.set_text(
+                "Object selected (%.2f) — Save, or click to refine." %
+                msg["score"])
+        elif t == "seg_extracted":
+            out = msg["output"]
+            if out.endswith("seg_preview.png"):     # live prerender → right panel
+                # Ignore a stale reply: a prerender sent for an earlier selection
+                # can land during response lag, after we've cleared the panel.
+                if (msg.get("id") != getattr(self, "_seg_preview_rid", None)
+                        or not self._seg_has_selection()):
+                    return False
+                self.seg_res_panel.view.load_file(out, keep_transform=True)
+                self.seg_result_output = out
+                self.seg_save_btn.set_sensitive(True)
+            else:                                    # explicit Save → file dialog
+                self._seg_set_busy(False)
+                self.seg_status.set_text("Ready — choose where to save.")
+                self._seg_save_file(out)
+        elif t == "seg_canceled":
+            self._seg_set_busy(False)
+            self._unload("seg")            # free the SAM model + cached encode
+            self.seg_status.set_text("Cancelled.")
         elif t == "error":
             first = msg["message"].splitlines()[0]
             self.status.set_text("Error: " + first)
             self.batch_status.set_text("Error: " + first)
+            if getattr(self, "seg_busy", False):
+                self._seg_set_busy(False)
+                self.seg_status.set_text("Error: " + first)
             self._toast("Error: " + first)
             self._set_busy(False)
             self._set_busy(False, spin=False)
         return False
+
+    def _on_help(self, *_):
+        dlg = Adw.Dialog()
+        dlg.set_title("How to use bg-be-gone")
+        dlg.set_content_width(560)
+        dlg.set_content_height(640)
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(Adw.HeaderBar())
+        page = Adw.PreferencesPage()
+
+        def group(title, description, rows):
+            g = Adw.PreferencesGroup(title=title, description=description)
+            for icon, t, s in rows:
+                r = Adw.ActionRow(title=t, subtitle=s)
+                r.add_prefix(Gtk.Image.new_from_icon_name(icon))
+                g.add(r)
+            page.add(g)
+
+        group("Remove a background", "Single &amp; Batch tabs", [
+            ("document-open-symbolic", "Open or drop an image",
+             "Drag a file in, or click Open in the header."),
+            ("applications-graphics-symbolic", "Pick a subject or model",
+             "General, portrait, anime — or an exact model under Advanced."),
+            ("image-x-generic-symbolic", "Generate, then Save",
+             "Output transparent, blurred, or a solid colour."),
+            ("view-grid-symbolic", "Batch a whole folder",
+             "Choose input/output folders and Run batch."),
+        ])
+        group("Segment objects", "The Segment tab", [
+            ("edit-select-all-symbolic", "Everything → pick layers",
+             "Segment everything, then click the objects to keep — the rest dim."),
+            ("edit-find-symbolic", "Click to select",
+             "Click one object; Ctrl-click or right-click removes; click to refine."),
+            ("input-mouse-symbolic", "Hold Space to pan",
+             "Space + drag moves the image without selecting. Scroll to zoom."),
+            ("document-save-symbolic", "Save selection",
+             "Your picks composite live on the right; Save exports a PNG."),
+        ])
+        group("Keyboard &amp; mouse", None, [
+            ("input-keyboard-symbolic", "Space", "Hold to pan the canvas."),
+            ("input-mouse-symbolic", "Scroll · drag · double-click",
+             "Zoom · pan · fit/100%."),
+            ("help-about-symbolic", "F1", "Open this help."),
+        ])
+        tv.set_content(page)
+        dlg.set_child(tv)
+        dlg.present(self)
 
     def _toast(self, text):
         self.toasts.add_toast(Adw.Toast(title=text, timeout=3))
@@ -688,13 +1511,22 @@ class App(Adw.Application):
     def do_startup(self):
         Adw.Application.do_startup(self)
         provider = Gtk.CssProvider()
-        provider.load_from_data(CSS)
+        provider.load_from_string(CSS)
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         about = Gio.SimpleAction.new("about", None)
         about.connect("activate", self._on_about)
         self.add_action(about)
+        help_act = Gio.SimpleAction.new("help", None)
+        help_act.connect("activate", self._on_help)
+        self.add_action(help_act)
+        self.set_accels_for_action("app.help", ["F1"])
+
+    def _on_help(self, *_):
+        win = self.get_active_window()
+        if win is not None and hasattr(win, "_on_help"):
+            win._on_help()
 
     def do_activate(self):
         win = Window(self)
@@ -717,7 +1549,8 @@ class App(Adw.Application):
             application_icon="io.github.cristeigabriela.BgBeGone",
             developer_name="bg-be-gone",
             version=APP_VERSION,
-            comments="Local image background remover (BiRefNet / rembg).",
+            comments="Local image background remover (BiRefNet / rembg) and "
+                     "object segmentation (Segment Anything / SAM 2.1).",
             license_type=Gtk.License.MIT_X11,
             website="https://github.com/cristeigabriela/bg-be-gone")
         about.set_transient_for(self.get_active_window())

@@ -12,8 +12,8 @@ ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 WORK="${WORK:-$ROOT/build}"
 APPDIR="$WORK/AppDir"
 ARCH="$(uname -m)"
-VERSION="${VERSION:-1.0.0}"; export VERSION
-VARIANT="${VARIANT:-cpu}"   # cpu | cuda | rocm
+VERSION="${VERSION:-1.1.0}"; export VERSION
+VARIANT="${VARIANT:-cpu}"   # cpu | cuda | rocm | seg | seg-cuda | seg-rocm
 ID=io.github.cristeigabriela.BgBeGone
 export APPIMAGE_EXTRACT_AND_RUN=1   # so the tool AppImages run without FUSE
 
@@ -100,6 +100,10 @@ ADW_LIB="$(find /usr/lib -maxdepth 1 -name 'libadwaita-1.so.0' | head -1)"
 # --- add rembg + onnxruntime (variant) after GTK is bundled --------------
 # Install with the 3.12 venv python for wheel tags, into the bundled
 # site-packages, so linuxdeploy never sees these self-contained wheels.
+# seg* variants ship the lean Segment Anything stack (onnxruntime + numpy +
+# pillow) with no rembg/BiRefNet — a much smaller AppImage. SAM weights are not
+# bundled (downloaded on first use), keeping the image small and the Apache
+# weights out of the MIT artifact.
 case "$VARIANT" in
   cuda)
     uv pip install --python "$VPY" --target "$SITE_DST" --quiet "rembg[gpu]" \
@@ -110,6 +114,14 @@ case "$VARIANT" in
       "numba>=0.60" "llvmlite>=0.43"
     rm -rf "$SITE_DST/onnxruntime" "$SITE_DST"/onnxruntime-[0-9]*.dist-info
     uv pip install --python "$VPY" --target "$SITE_DST" --quiet onnxruntime-rocm ;;
+  seg-cuda)
+    uv pip install --python "$VPY" --target "$SITE_DST" --quiet \
+      onnxruntime-gpu numpy pillow nvidia-cuda-runtime nvidia-cublas \
+      nvidia-cufft nvidia-curand nvidia-cudnn-cu13 ;;
+  seg-rocm)
+    uv pip install --python "$VPY" --target "$SITE_DST" --quiet numpy pillow onnxruntime-rocm ;;
+  seg)
+    uv pip install --python "$VPY" --target "$SITE_DST" --quiet onnxruntime numpy pillow ;;
   *)
     uv pip install --python "$VPY" --target "$SITE_DST" --quiet "rembg[cpu]" \
       "numba>=0.60" "llvmlite>=0.43" ;;

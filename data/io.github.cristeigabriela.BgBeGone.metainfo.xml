@@ -4,7 +4,7 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
   <name>bg-be-gone</name>
-  <summary>Remove image backgrounds locally</summary>
+  <summary>Remove image backgrounds and segment objects locally</summary>
   <developer id="io.github.cristeigabriela">
     <name>bg-be-gone contributors</name>
   </developer>
@@ -16,9 +16,17 @@
       other rembg models through ONNX Runtime, with GPU acceleration on NVIDIA and
       AMD and a CPU fallback. Images are processed on your machine.
     </p>
+    <p>
+      It also segments individual objects with Meta's Segment Anything (SAM 2.1),
+      running as a separate pass through ONNX Runtime. The right model is picked
+      automatically from your GPU and VRAM, stepping down on failure, and can run
+      without the background-removal dependency.
+    </p>
     <p>Features:</p>
     <ul>
-      <li>Single-image and batch modes</li>
+      <li>Single-image and batch background removal</li>
+      <li>Object segmentation: segment everything into pickable layers, or click to select</li>
+      <li>Automatic SAM model selection by GPU/VRAM, with a cancel/break control</li>
       <li>Interactive panels: zoom, pan, rotate, flip</li>
       <li>Drag and drop</li>
       <li>Transparent or solid-colour output</li>
@@ -32,6 +40,13 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1.0" date="2026-07-10">
+      <description>
+        <p>Adds object segmentation with Segment Anything (SAM 2.1), a new
+           interactive Segment page, VRAM-aware model selection, and an optional
+           segmentation-only build.</p>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-07-04">
       <description>
         <p>First release.</p>
