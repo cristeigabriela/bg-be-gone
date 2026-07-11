@@ -34,7 +34,7 @@ jobs:
             latest="$(gh release list -R "$REPO" --limit 1 \
               --json tagName -q '.[0].tagName' 2>/dev/null || true)"
             if [ -z "$latest" ]; then
-              ver="1.0.0"
+              ver="1.1.0"
             else
               base="${latest#v}"; IFS=. read -r a b c <<< "$base"
               ver="${a:-1}.${b:-0}.$(( ${c:-0} + 1 ))"
@@ -55,7 +55,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [cpu, cuda, rocm]
+        variant: [cpu, cuda, rocm, seg]
     steps:
       - name: Install build dependencies
         run: |

@@ -1,3 +1,24 @@
+[project]
+name = "bg-be-gone"
+version = "1.1.0"
+description = "Local image background remover and object segmentation (GTK4)"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+# The GTK frontend runs on the system Python (PyGObject); the worker venv holds
+# the ML stack. install.sh drives pip directly, so these extras are primarily
+# documentation + a future `pip install .[seg]`.
+dependencies = []
+
+[project.optional-dependencies]
+# Background removal (BiRefNet / rembg). rembg already pulls onnxruntime, numpy
+# and pillow, so this also satisfies segmentation.
+bgremove = ["rembg", "onnxruntime", "numba>=0.60", "llvmlite>=0.43"]
+# Segmentation only (Segment Anything via ONNX) — no rembg, no torch.
+seg = ["onnxruntime", "numpy", "pillow"]
+full = ["bg-be-gone[bgremove]"]
+# Swap the CPU onnxruntime for the CUDA build.
+gpu = ["onnxruntime-gpu"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py39"
