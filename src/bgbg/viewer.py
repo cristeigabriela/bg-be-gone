@@ -14,8 +14,16 @@ gi.require_version("Graphene", "1.0")
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gtk, Gdk, Gsk, Graphene, GdkPixbuf, Gio, GLib  # noqa: E402
 
-MIN_ZOOM = 0.05
-MAX_ZOOM = 40.0
+from engine.pane import Pane  # noqa: E402
+from engine.geometry import (  # noqa: E402
+    MIN_ZOOM, MAX_ZOOM,
+    polygon_area_abs as _polygon_area_abs,
+    resample_closed as _resample_closed,
+    align_ring as _align_ring,
+    ease_out as _ease_out,
+    ease_out_back as _ease_out_back,
+)
+
 _CELL = 16
 _REVEAL_MS = 300.0
 _POP_MS = 300.0
@@ -30,80 +38,10 @@ _MORPH_MS = 240.0       # outline tween when the focused object changes
 _MORPH_N = 64           # resampled outline vertices (correspondence for the lerp)
 
 
-def _polygon_area_abs(poly):
-    """Absolute shoelace area of a closed polygon (list of (x, y))."""
-    n = len(poly)
-    if n < 3:
-        return 0.0
-    s = 0.0
-    for i in range(n):
-        x0, y0 = poly[i]
-        x1, y1 = poly[(i + 1) % n]
-        s += x0 * y1 - x1 * y0
-    return abs(s) * 0.5
-
-
-def _resample_closed(poly, n):
-    """Resample a closed polygon to `n` points spaced uniformly by arc length."""
-    m = len(poly)
-    if m == 0:
-        return [(0.0, 0.0)] * n
-    pts = [(float(x), float(y)) for x, y in poly]
-    if m < 2:
-        return [pts[0]] * n
-    seglen = []
-    total = 0.0
-    for i in range(m):
-        x0, y0 = pts[i]
-        x1, y1 = pts[(i + 1) % m]
-        d = math.hypot(x1 - x0, y1 - y0)
-        seglen.append(d)
-        total += d
-    if total <= 0.0:
-        return [pts[0]] * n
-    out = []
-    step = total / n
-    i = 0
-    acc = 0.0
-    for k in range(n):
-        target = k * step
-        while i < m and acc + seglen[i] < target:
-            acc += seglen[i]
-            i += 1
-        if i >= m:
-            out.append(pts[0])
-            continue
-        x0, y0 = pts[i]
-        x1, y1 = pts[(i + 1) % m]
-        f = (target - acc) / seglen[i] if seglen[i] > 0 else 0.0
-        out.append((x0 + (x1 - x0) * f, y0 + (y1 - y0) * f))
-    return out
-
-
-def _align_ring(ring):
-    """Rotate the ring so index 0 is the topmost-then-leftmost point — a stable
-    starting correspondence so two rings tween without gratuitous twisting."""
-    if not ring:
-        return ring
-    best = min(range(len(ring)), key=lambda i: (ring[i][1], ring[i][0]))
-    return ring[best:] + ring[:best]
-
-
 def _rgba(r, g, b):
     c = Gdk.RGBA()
     c.red, c.green, c.blue, c.alpha = r, g, b, 1.0
     return c
-
-
-def _ease_out(p):
-    return 1.0 - (1.0 - p) ** 3
-
-
-def _ease_out_back(p):
-    """Ease-out with a slight overshoot past 1.0 near the end (iOS spring feel)."""
-    c = 1.70158
-    p -= 1.0
-    return 1.0 + (c + 1.0) * p ** 3 + c * p ** 2
 
 
 class ImageView(Gtk.Widget):
@@ -119,12 +57,11 @@ class ImageView(Gtk.Widget):
         self._anim = None        # GdkPixbuf.PixbufAnimation for animated GIFs
         self._anim_iter = None
         self._anim_timer = 0     # GLib timeout id driving frame advance
-        self.zoom = 1.0          # 1.0 == fit to widget
-        self.ox = 0.0            # pan offset from centre, in widget px
-        self.oy = 0.0
-        self.rot = 0             # 0..3, each +90deg clockwise
-        self.fh = False
-        self.fv = False
+        # All view state (zoom / pan / rotate / flip) and the coordinate maths
+        # live in the engine; the widget just feeds it sizes and events.
+        # zoom/ox/oy/rot/fh/fv stay readable+writable as attributes (properties
+        # below) so existing call sites are untouched.
+        self.pane = Pane()
         self._px = 0.0
         self._py = 0.0
         self._ox0 = 0.0
@@ -246,6 +183,25 @@ class ImageView(Gtk.Widget):
 
         self._build_menu()
 
+    # ---------- view state (delegated to the engine's Pane) ----------
+    def _sync_pane(self):
+        """Feed the engine the sizes only the widget knows."""
+        if self.pixbuf is not None:
+            self.pane.set_image_size(self.pixbuf.get_width(),
+                                     self.pixbuf.get_height())
+        else:
+            self.pane.set_image_size(0, 0)
+        self.pane.set_view_size(self.get_width(), self.get_height())
+        return self.pane
+
+    zoom = property(lambda s: s.pane.zoom,
+                    lambda s, v: setattr(s.pane, "zoom", v))
+    ox = property(lambda s: s.pane.ox, lambda s, v: setattr(s.pane, "ox", v))
+    oy = property(lambda s: s.pane.oy, lambda s, v: setattr(s.pane, "oy", v))
+    rot = property(lambda s: s.pane.rot, lambda s, v: setattr(s.pane, "rot", v))
+    fh = property(lambda s: s.pane.fh, lambda s, v: setattr(s.pane, "fh", v))
+    fv = property(lambda s: s.pane.fv, lambda s, v: setattr(s.pane, "fv", v))
+
     # ---------- public API ----------
     def load_file(self, path, keep_transform=False):
         self._stop_animation()
@@ -341,9 +297,7 @@ class ImageView(Gtk.Widget):
         return self.pixbuf is not None
 
     def reset_view(self, *_):
-        self.zoom = 1.0
-        self.ox = 0.0
-        self.oy = 0.0
+        self.pane.reset_view()
         self.queue_draw()
 
     def export_pixbuf(self):
@@ -615,26 +569,12 @@ class ImageView(Gtk.Widget):
         return 1.0 + 0.09 * math.sin(p * math.pi) * (1.0 - p)
 
     def widget_to_image(self, px, py):
-        """Invert do_snapshot's transform: widget px -> image px (or None)."""
-        if self.pixbuf is None:
-            return None
-        w, h = self.get_width(), self.get_height()
-        iw, ih = self.pixbuf.get_width(), self.pixbuf.get_height()
-        ew, eh = self._effective_size()
-        if not ew or not eh or not w or not h:
-            return None                  # not laid out yet
-        scale = min(w / ew, h / eh) * self.zoom
-        if scale == 0:
-            return None
-        ux = (px - (w / 2 + self.ox)) / scale
-        uy = (py - (h / 2 + self.oy)) / scale
-        for _ in range(self.rot % 4):        # undo each +90deg clockwise step
-            ux, uy = uy, -ux
-        if self.fh:
-            ux = -ux
-        if self.fv:
-            uy = -uy
-        return ux + iw / 2, uy + ih / 2
+        """Widget px -> image px (or None). See engine.pane.Pane."""
+        return self._sync_pane().view_to_image(px, py)
+
+    def image_to_widget(self, ix, iy):
+        """Image px -> widget px (or None). The exact inverse."""
+        return self._sync_pane().image_to_view(ix, iy)
 
     def _id_at(self, pixels, rs, nc, ix, iy):
         if pixels is None or not (0 <= ix < self._lm_w and 0 <= iy < self._lm_h):
@@ -789,8 +729,8 @@ class ImageView(Gtk.Widget):
         # can't desync (the Segment page hides these buttons anyway).
         if self.has_seg():
             self.clear_seg(keep_mode=True)
-        self.rot = (self.rot + delta) % 4
-        self.reset_view()
+        self.pane.rotate(delta)      # also resets zoom/pan
+        self.queue_draw()
         self._changed()
 
     def _flip(self, horizontal):
@@ -798,24 +738,14 @@ class ImageView(Gtk.Widget):
             return
         if self.has_seg():
             self.clear_seg(keep_mode=True)
-        if self.rot % 2 == 1:
-            horizontal = not horizontal
-        if horizontal:
-            self.fh = not self.fh
-        else:
-            self.fv = not self.fv
+        self.pane.flip(horizontal)
         self.queue_draw()
         self._changed()
 
     def _actual_size(self, *_):
         if self.pixbuf is None:
             return
-        w, h = self.get_width(), self.get_height()
-        iw, ih = self._effective_size()
-        if iw and ih:
-            fit = min(w / iw, h / ih)
-            self.zoom = 1.0 / fit if fit else 1.0
-        self.ox = self.oy = 0.0
+        self._sync_pane().actual_size()
         self.queue_draw()
 
     # ---------- pointer / gestures ----------
@@ -874,14 +804,7 @@ class ImageView(Gtk.Widget):
         return True
 
     def _zoom_at(self, factor, cx, cy):
-        w, h = self.get_width(), self.get_height()
-        new = max(MIN_ZOOM, min(MAX_ZOOM, self.zoom * factor))
-        f = new / self.zoom
-        centre_x = w / 2 + self.ox
-        centre_y = h / 2 + self.oy
-        self.ox = (cx + f * (centre_x - cx)) - w / 2
-        self.oy = (cy + f * (centre_y - cy)) - h / 2
-        self.zoom = new
+        self._sync_pane().zoom_at(factor, cx, cy)
         self.queue_draw()
 
     def _on_drag_begin(self, gesture, x, y):
@@ -894,10 +817,7 @@ class ImageView(Gtk.Widget):
 
     # ---------- rendering ----------
     def _effective_size(self):
-        if self.pixbuf is None:
-            return 0, 0
-        iw, ih = self.pixbuf.get_width(), self.pixbuf.get_height()
-        return (ih, iw) if self.rot % 2 == 1 else (iw, ih)
+        return self._sync_pane().effective_size()
 
     def _get_texture(self):
         if self._texture is None and self.pixbuf is not None:
