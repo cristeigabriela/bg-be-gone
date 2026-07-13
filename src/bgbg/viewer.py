@@ -18,6 +18,9 @@ from engine.pane import Pane  # noqa: E402
 from engine.hittest import PixelMap, HitMaps  # noqa: E402
 from engine import anim as anim_mod  # noqa: E402
 from engine.anim import AnimState  # noqa: E402
+from engine.render.scene import Scene, Morph, POINT_COLOR  # noqa: E402
+from engine.render.builder import build as build_display_list  # noqa: E402
+from gsk_renderer import render as gsk_render  # noqa: E402
 from engine.geometry import (  # noqa: E402
     MIN_ZOOM, MAX_ZOOM,
     polygon_area_abs as _polygon_area_abs,
@@ -31,10 +34,11 @@ _CELL = 16
 _MORPH_N = anim_mod.MORPH_N
 
 
-def _rgba(r, g, b):
+def _rgba_tuple(spec):
+    """Parse a colour into the engine's (r, g, b, a) tuple."""
     c = Gdk.RGBA()
-    c.red, c.green, c.blue, c.alpha = r, g, b, 1.0
-    return c
+    c.parse(spec)
+    return (c.red, c.green, c.blue, c.alpha)
 
 
 class ImageView(Gtk.Widget):
@@ -62,24 +66,20 @@ class ImageView(Gtk.Widget):
         self._on_change = on_change
         self.on_paint = None     # optional callback(zoom_percent:int)
 
-        self._c_light = _rgba(0.20, 0.20, 0.22)
-        self._c_dark = _rgba(0.15, 0.15, 0.17)
 
         # ---- segmentation overlay state ----
         self._seg_mode = None            # None | "everything" | "point"
         self._seg_masks = {}             # id -> Gdk.Texture (per-object mask)
-        self._seg_colors = {}            # id -> Gdk.RGBA (tint)
+        self._seg_colors = {}            # id -> (r,g,b,a) tint
         self._seg_selected = set()       # ids kept for output
         self._seg_hover_id = 0           # object under the cursor (glow)
         self._seg_point_tex = None       # Gdk.Texture (point-mode object)
-        self._seg_point_color = _rgba(0.20, 0.52, 0.90)
-        self._dim = _rgba(0.0, 0.0, 0.0)
         self.maps = HitMaps()            # specific / general / depth lookup maps
         # composite/clip mode (result panel): show the source clipped to a union
         # of masks over the checkerboard — a live cutout preview.
         self._clip_active = False
         self._clip_masks = []            # list of Gdk.Texture (selected objects)
-        self._clip_bg = None             # Gdk.RGBA solid background, or None
+        self._clip_bg = None             # (r,g,b,a) solid background, or None
         # fired on a click while a seg mode is active:
         #   everything: (ix, iy, object_id, "toggle")
         #   point:      (ix, iy, label 1/0, "point")
@@ -99,22 +99,15 @@ class ImageView(Gtk.Widget):
         self._grab_cursor = Gdk.Cursor.new_from_name("grabbing", None)
 
         # ---- animation state (tick-driven; see _on_tick / _snapshot_seg) ----
-        self._seg_paths = {}             # id -> Gsk.Path (marching-ants outline)
+        self._seg_polys = {}             # id -> [poly]  (all contours)
         self._seg_centroids = {}         # id -> (cx, cy) image px, for "pop"
         self._seg_radius = {}            # id -> ripple reach (image px)
         self._seg_morph = {}             # id -> [N (x,y)] canonical outline ring
-        self._seg_sec_paths = {}         # id -> Gsk.Path of secondary polys, or None
-        self._point_path = None          # Gsk.Path for point-mode object
+        self._seg_sec_polys = {}         # id -> [poly]  (non-largest contours)
+        self._point_polys = ()           # point-mode object contours
         # outline morph between focused objects (hover switch / dwell drill).
         # The engine owns the *clock*; these are the rings/colours it tweens.
-        self._morph_from = None          # ring or None (None = entering)
-        self._morph_to = None            # ring or None (None = leaving)
-        self._morph_cf = None            # from colour
-        self._morph_ct = None            # to colour
-        self._morph_sec_from = None      # secondary polys of the old object
-        self._morph_sec_to = None        # secondary polys of the new object
-        self._morph_cen_from = None      # (cx, cy) to bloom the old ring toward
-        self._morph_cen_to = None
+        self._morph = None               # engine.render.scene.Morph, or None
         self._anim_tick = None           # add_tick_callback handle
 
         # Every clock (breathing glow, marching ants, shimmer, reveal, pop,
@@ -358,11 +351,9 @@ class ImageView(Gtk.Widget):
             except GLib.Error:
                 continue
             self._seg_masks[oid] = tex
-            c = Gdk.RGBA()
-            c.parse(o["color"])
-            self._seg_colors[oid] = c
-            contours = o.get("contour") or []
-            self._seg_paths[oid] = self._path_from_contours(contours)
+            self._seg_colors[oid] = _rgba_tuple(o["color"])
+            contours = [[tuple(p) for p in poly] for poly in (o.get("contour") or [])]
+            self._seg_polys[oid] = contours
             bx, by, bw, bh = o.get("bbox", (0, 0, 0, 0))
             self._seg_centroids[oid] = (bx + bw / 2.0, by + bh / 2.0)
             self._seg_radius[oid] = 0.6 * max(bw, bh, 8)
@@ -372,9 +363,7 @@ class ImageView(Gtk.Widget):
                 largest = max(contours, key=_polygon_area_abs)
                 self._seg_morph[oid] = _align_ring(
                     _resample_closed(largest, _MORPH_N))
-                rest = [poly for poly in contours if poly is not largest]
-                self._seg_sec_paths[oid] = (
-                    self._path_from_contours(rest) if rest else None)
+                self._seg_sec_polys[oid] = [p for p in contours if p is not largest]
         self.maps = HitMaps(label=self._load_map(labelmap_path),
                             general=self._load_map(general_path),
                             depth=self._load_map(depth_path))
@@ -403,7 +392,8 @@ class ImageView(Gtk.Widget):
             self._seg_point_tex = Gdk.Texture.new_from_filename(mask_path)
         except GLib.Error:
             self._seg_point_tex = None
-        self._point_path = self._path_from_contours(contour)
+        self._point_polys = [[tuple(p) for p in poly]
+                             for poly in (contour or [])]
         self._begin_reveal()
         self._start_anim()
         self.queue_draw()
@@ -436,14 +426,14 @@ class ImageView(Gtk.Widget):
         self._seg_selected = set()
         self._seg_hover_id = 0
         self._seg_point_tex = None
-        self._seg_paths = {}
+        self._seg_polys = {}
         self._seg_centroids = {}
         self._seg_radius = {}
         self._seg_morph = {}
-        self._seg_sec_paths = {}
-        self._morph_from = self._morph_to = None
+        self._seg_sec_polys = {}
+        self._morph = None
         self._morph_t0 = None
-        self._point_path = None
+        self._point_polys = ()
         self._pop = {}
         self._reveal = 1.0
         self._reveal_t0 = None
@@ -488,21 +478,6 @@ class ImageView(Gtk.Widget):
         """
         fc = self.get_frame_clock()
         return fc.get_frame_time() if fc is not None else GLib.get_monotonic_time()
-
-    def _path_from_contours(self, contours):
-        if not contours:
-            return None
-        pb = Gsk.PathBuilder()
-        added = False
-        for poly in contours:
-            if len(poly) < 2:
-                continue
-            pb.move_to(poly[0][0], poly[0][1])
-            for x, y in poly[1:]:
-                pb.line_to(x, y)
-            pb.close()
-            added = True
-        return pb.to_path() if added else None
 
     def _begin_reveal(self):
         self.anim.begin_reveal(self._now())
@@ -795,6 +770,9 @@ class ImageView(Gtk.Widget):
         self.queue_draw()
 
     # ---------- rendering ----------
+    # The widget no longer draws anything by hand. The engine builds a display
+    # list (what to draw); gsk_renderer replays it (how). The same list is what a
+    # Canvas2D backend in the browser will consume.
     def _effective_size(self):
         return self._sync_pane().effective_size()
 
@@ -803,115 +781,53 @@ class ImageView(Gtk.Widget):
             self._texture = Gdk.Texture.new_for_pixbuf(self.pixbuf)
         return self._texture
 
-    def _snapshot_checker(self, snapshot, w, h):
-        snapshot.append_color(self._c_light, Graphene.Rect().init(0, 0, w, h))
-        cols = int(w // _CELL) + 1
-        rows = int(h // _CELL) + 1
-        for j in range(rows):
-            for i in range(cols):
-                if (i + j) & 1:
-                    snapshot.append_color(
-                        self._c_dark,
-                        Graphene.Rect().init(i * _CELL, j * _CELL, _CELL, _CELL))
+    def _resolve(self, handle):
+        """Display-list image handle -> Gdk.Texture. The engine only ever passes
+        handles; the shell owns the textures."""
+        if handle == "src":
+            return self._get_texture()
+        if handle == "point":
+            return self._seg_point_tex
+        if isinstance(handle, tuple) and handle[0] == "clip":
+            i = handle[1]
+            return self._clip_masks[i] if i < len(self._clip_masks) else None
+        return self._seg_masks.get(handle)
+
+    def _scene(self):
+        """Snapshot the widget's state as plain data for the engine."""
+        sc = Scene()
+        if self.pixbuf is not None:
+            sc.image = "src"
+            sc.image_size = (self.pixbuf.get_width(), self.pixbuf.get_height())
+        sc.seg_mode = self._seg_mode
+        sc.masks = {oid: oid for oid in self._seg_masks}   # handle == object id
+        sc.colors = self._seg_colors
+        sc.polys = self._seg_polys
+        sc.sec_polys = self._seg_sec_polys
+        sc.centroids = self._seg_centroids
+        sc.radius = self._seg_radius
+        sc.selected = frozenset(self._seg_selected)
+        sc.hover_id = self._seg_hover_id
+        sc.hover_gen = self._hover_gen
+        sc.hover_spec = self._hover_spec
+        sc.hover_depth = self._hover_depth
+        if self._seg_point_tex is not None:
+            sc.point_mask = "point"
+            sc.point_polys = self._point_polys
+        sc.morph = self._morph
+        sc.clip_active = self._clip_active
+        sc.clip_masks = tuple(("clip", i) for i in range(len(self._clip_masks)))
+        sc.clip_bg = self._clip_bg
+        return sc
 
     def do_snapshot(self, snapshot):
-        w, h = self.get_width(), self.get_height()
-        self._snapshot_checker(snapshot, w, h)
+        pane = self._sync_pane()
+        dl = build_display_list(self._scene(), pane, self.anim, self._now())
+        gsk_render(snapshot, dl, self._resolve)
+        if self.on_paint and len(dl.ops) > 1:      # >1 == the image was drawn
+            self.on_paint(int(round(dl.scale * 100)))
 
-        tex = self._get_texture()
-        if tex is None:
-            return
-        iw, ih = self.pixbuf.get_width(), self.pixbuf.get_height()
-        ew, eh = self._effective_size()
-        if ew == 0 or eh == 0 or w <= 0 or h <= 0:
-            return                       # unallocated: scale would be 0 (stroke /0)
-        fit = min(w / ew, h / eh)
-        scale = fit * self.zoom
 
-        snapshot.save()
-        snapshot.translate(Graphene.Point().init(w / 2 + self.ox,
-                                                 h / 2 + self.oy))
-        snapshot.scale(scale, scale)
-        if self.rot:
-            snapshot.rotate(self.rot * 90)
-        snapshot.scale(-1 if self.fh else 1, -1 if self.fv else 1)
-        snapshot.translate(Graphene.Point().init(-iw / 2, -ih / 2))
-        rect = Graphene.Rect().init(0, 0, iw, ih)
-        if self._clip_active:
-            self._snapshot_composite(snapshot, tex, rect)
-        else:
-            snapshot.append_scaled_texture(tex, Gsk.ScalingFilter.TRILINEAR, rect)
-            if self._scanning:
-                self._snapshot_shimmer(snapshot, rect, iw, ih)
-            if self._seg_mode:
-                if self._reveal < 1.0:      # fade + gentle scale-in of overlays
-                    snapshot.push_opacity(max(0.0, self._reveal))
-                    s = 0.97 + 0.03 * self._reveal
-                    snapshot.translate(Graphene.Point().init(iw / 2, ih / 2))
-                    snapshot.scale(s, s)
-                    snapshot.translate(Graphene.Point().init(-iw / 2, -ih / 2))
-                    self._snapshot_seg(snapshot, rect, scale)
-                    snapshot.pop()
-                else:
-                    self._snapshot_seg(snapshot, rect, scale)
-        snapshot.restore()
-
-        if self.on_paint:
-            self.on_paint(int(round(scale * 100)))
-
-    def _snapshot_shimmer(self, snapshot, rect, iw, ih):
-        """A soft diagonal highlight band sweeping over the image on a loop — the
-        "scanning" cue. A moving bright stop in an otherwise-transparent linear
-        gradient (top-left -> bottom-right), clipped to the image bounds."""
-        # p sweeps from before the top-left to past the bottom-right so the band
-        # enters and leaves rather than wrapping abruptly.
-        p = -0.20 + 1.40 * self._scan_phase
-        band = 0.13
-
-        def stop(off, a):
-            s = Gsk.ColorStop()
-            c = Gdk.RGBA()
-            c.red = c.green = c.blue = 1.0
-            c.alpha = a
-            s.offset = min(1.0, max(0.0, off))
-            s.color = c
-            return s
-
-        stops = [stop(0.0, 0.0), stop(p - band, 0.0), stop(p, 0.18),
-                 stop(p + band, 0.0), stop(1.0, 0.0)]
-        snapshot.push_opacity(0.9)
-        snapshot.append_linear_gradient(
-            rect, Graphene.Point().init(0, 0),
-            Graphene.Point().init(iw, ih), stops)
-        snapshot.pop()
-
-    def _tint(self, snapshot, tex, col, alpha, rect):
-        """Draw `col` at `alpha` wherever `tex`'s luminance is set."""
-        snapshot.push_mask(Gsk.MaskMode.LUMINANCE)
-        snapshot.append_texture(tex, rect)              # mask (first)
-        snapshot.pop()
-        snapshot.push_opacity(alpha)
-        snapshot.append_color(col, rect)                # content
-        snapshot.pop()
-        snapshot.pop()
-
-    def _glow(self, snapshot, tex, col, alpha, radius, rect):
-        """Soft blurred halo of `col` around the masked shape."""
-        snapshot.push_blur(radius)
-        self._tint(snapshot, tex, col, alpha, rect)
-        snapshot.pop()
-
-    def _ants(self, snapshot, path, col, scale):
-        """Animated marching-ants stroke along `path` (image-px coords). Dash and
-        width are divided by `scale` so they stay screen-constant under zoom."""
-        if path is None:
-            return
-        st = Gsk.Stroke.new(max(0.6, 1.6 / scale))
-        st.set_dash([6.0 / scale, 4.5 / scale])
-        st.set_dash_offset(-self._ant / scale)
-        snapshot.append_stroke(path, st, col)
-
-    # ---------- outline morph (focus change) ----------
     def _focus(self, oid):
         """Move the hover focus to `oid`, tweening the outline from the old one."""
         if oid == self._seg_hover_id:
@@ -924,230 +840,21 @@ class ImageView(Gtk.Widget):
         fr = self._seg_morph.get(old)
         to = self._seg_morph.get(new)
         if fr is None and to is None:
-            self._morph_t0 = None
+            self.anim.clear_morph()
+            self._morph = None
             return
-        self._morph_from, self._morph_to = fr, to
-        self._morph_cf = (self._seg_colors.get(old) or self._seg_colors.get(new)
-                          or self._seg_point_color)
-        self._morph_ct = (self._seg_colors.get(new) or self._seg_colors.get(old)
-                          or self._seg_point_color)
-        self._morph_sec_from = self._seg_sec_paths.get(old)
-        self._morph_sec_to = self._seg_sec_paths.get(new)
-        self._morph_cen_from = self._seg_centroids.get(old)
-        self._morph_cen_to = self._seg_centroids.get(new)
-        self._morph_t0 = self._now()
+        self._morph = Morph(
+            from_ring=fr, to_ring=to,
+            cf=(self._seg_colors.get(old) or self._seg_colors.get(new)
+                or POINT_COLOR),
+            ct=(self._seg_colors.get(new) or self._seg_colors.get(old)
+                or POINT_COLOR),
+            sec_from=self._seg_sec_polys.get(old),
+            sec_to=self._seg_sec_polys.get(new),
+            cen_from=self._seg_centroids.get(old),
+            cen_to=self._seg_centroids.get(new))
+        self.anim.begin_morph(self._now())
         self._start_anim()
-
-    @staticmethod
-    def _blend(a, b, e):
-        c = Gdk.RGBA()
-        c.red = a.red + (b.red - a.red) * e
-        c.green = a.green + (b.green - a.green) * e
-        c.blue = a.blue + (b.blue - a.blue) * e
-        c.alpha = a.alpha + (b.alpha - a.alpha) * e
-        return c
-
-    @staticmethod
-    def _alpha(col, a):
-        c = Gdk.RGBA()
-        c.red, c.green, c.blue = col.red, col.green, col.blue
-        c.alpha = col.alpha * max(0.0, min(1.0, a))
-        return c
-
-    def _ring_path(self, ring):
-        pb = Gsk.PathBuilder()
-        pb.move_to(ring[0][0], ring[0][1])
-        for x, y in ring[1:]:
-            pb.line_to(x, y)
-        pb.close()
-        return pb.to_path()
-
-    def _snapshot_focus_outline(self, snapshot, hover, sel, scale):
-        """The hovered object's marching-ants outline. While the focus is
-        changing, tween the largest ring old->new and crossfade the rest."""
-        e = self.anim.morph_progress(self._now())    # eased 0..1, or None when idle
-        if e is not None:
-            self._draw_morph(snapshot, e, scale)
-            return
-        if hover and hover in self._seg_masks and hover not in sel:
-            col = self._seg_colors.get(hover, self._seg_point_color)
-            self._ants(snapshot, self._seg_paths.get(hover), col, scale)
-
-    def _draw_morph(self, snapshot, e, scale):
-        a, b = self._morph_from, self._morph_to
-        if a is not None and b is not None:              # switch: lerp ring
-            ring = [(pa[0] + (pb[0] - pa[0]) * e, pa[1] + (pb[1] - pa[1]) * e)
-                    for pa, pb in zip(a, b)]
-            col, env = self._blend(self._morph_cf, self._morph_ct, e), 1.0
-        elif b is not None:                              # enter: bloom from centroid
-            cx, cy = self._morph_cen_to or b[0]
-            ring = [(cx + (pb[0] - cx) * e, cy + (pb[1] - cy) * e) for pb in b]
-            col, env = self._morph_ct, e
-        elif a is not None:                              # leave: collapse to centroid
-            cx, cy = self._morph_cen_from or a[0]
-            ring = [(pa[0] + (cx - pa[0]) * e, pa[1] + (cy - pa[1]) * e) for pa in a]
-            col, env = self._morph_cf, 1.0 - e
-        else:
-            return
-        self._ants(snapshot, self._ring_path(ring), self._alpha(col, env), scale)
-        if self._morph_sec_from is not None:
-            self._ants(snapshot, self._morph_sec_from,
-                       self._alpha(self._morph_cf, 1.0 - e), scale)
-        if self._morph_sec_to is not None:
-            self._ants(snapshot, self._morph_sec_to,
-                       self._alpha(self._morph_ct, e), scale)
-
-    def _snapshot_seg(self, snapshot, rect, scale):
-        """Faintly tint clickable objects; glow + march ants on the hovered and
-        selected ones; dim everything outside the selection. GPU-side (mask
-        textures as luminance masks; a Gsk.Path stroke for the ants)."""
-        sel, hover = self._seg_selected, self._seg_hover_id
-        gen, spec = self._hover_gen, self._hover_spec
-        # over a stack, light up the whole (general) and the part (specific) as
-        # distinct colour layers rather than one flat highlight.
-        layered = (self._hover_depth >= 2 and gen and spec and gen != spec
-                   and gen in self._seg_masks and spec in self._seg_masks
-                   and gen not in sel and spec not in sel)
-        pulse = 0.35 + 0.65 * self._pulse
-        skip = {gen, spec} if layered else {hover}
-        # 1. faint tint on every non-selected, non-focused object.
-        for oid, tex in self._seg_masks.items():
-            if oid in sel or oid in skip:
-                continue
-            col = self._seg_colors.get(oid)
-            if col is not None:
-                self._tint(snapshot, tex, col, 0.12, rect)
-        # 2. dim everything outside the selection so kept objects stand out.
-        if self._seg_masks and sel:
-            snapshot.push_mask(Gsk.MaskMode.INVERTED_LUMINANCE)
-            for oid in sel:
-                snapshot.append_texture(self._seg_masks[oid], rect)
-            snapshot.pop()
-            snapshot.push_opacity(0.55)
-            snapshot.append_color(self._dim, rect)
-            snapshot.pop()
-            snapshot.pop()
-        # 3. selected objects — glow + fill + ants, with a "pop" scale.
-        for oid in sel:
-            tex = self._seg_masks.get(oid)
-            col = self._seg_colors.get(oid)
-            if tex is None or col is None:
-                continue
-            pop = self._pop_scale(oid)
-            snapshot.save()
-            if pop != 1.0:
-                cx, cy = self._seg_centroids.get(oid) or (
-                    self.pixbuf.get_width() / 2, self.pixbuf.get_height() / 2)
-                snapshot.translate(Graphene.Point().init(cx, cy))
-                snapshot.scale(pop, pop)
-                snapshot.translate(Graphene.Point().init(-cx, -cy))
-            self._glow(snapshot, tex, col, 0.22 + 0.20 * self._pulse, 22.0, rect)
-            self._tint(snapshot, tex, col, 0.42, rect)
-            self._ants(snapshot, self._seg_paths.get(oid), col, scale)
-            snapshot.restore()
-        # 4. hovered (not selected). Over a stack, dim outside the whole and show
-        #    whole + part as distinct layers; otherwise the single hovered object.
-        #    The marching-ants outline morphs on top (see _snapshot_focus_outline).
-        if layered:
-            gtex, gcol = self._seg_masks[gen], self._seg_colors[gen]
-            stex, scol = self._seg_masks[spec], self._seg_colors[spec]
-            snapshot.push_mask(Gsk.MaskMode.INVERTED_LUMINANCE)
-            snapshot.append_texture(gtex, rect)
-            snapshot.pop()
-            snapshot.push_opacity(0.5)
-            snapshot.append_color(self._dim, rect)
-            snapshot.pop()
-            snapshot.pop()
-            self._glow(snapshot, gtex, gcol, 0.14 * pulse, 22.0, rect)
-            self._tint(snapshot, gtex, gcol, 0.18, rect)     # whole, beneath
-            self._glow(snapshot, stex, scol, 0.26 * pulse, 18.0, rect)
-            self._tint(snapshot, stex, scol, 0.40, rect)     # part, on top
-        elif hover and hover in self._seg_masks and hover not in sel:
-            col = self._seg_colors.get(hover, self._seg_point_color)
-            self._glow(snapshot, self._seg_masks[hover], col, 0.28 * pulse, 20.0, rect)
-            self._tint(snapshot, self._seg_masks[hover], col, 0.34, rect)
-        self._snapshot_focus_outline(snapshot, hover, sel, scale)
-
-        # Point mode — dim outside the object, glow + tint + ants.
-        if self._seg_point_tex is not None:
-            snapshot.push_mask(Gsk.MaskMode.INVERTED_LUMINANCE)
-            snapshot.append_texture(self._seg_point_tex, rect)
-            snapshot.pop()
-            snapshot.push_opacity(0.55)
-            snapshot.append_color(self._dim, rect)
-            snapshot.pop()
-            snapshot.pop()
-            col = self._seg_point_color
-            self._glow(snapshot, self._seg_point_tex, col, 0.20 + 0.18 * self._pulse,
-                       20.0, rect)
-            self._tint(snapshot, self._seg_point_tex, col, 0.30, rect)
-            self._ants(snapshot, self._point_path, col, scale)
-
-        # Press-and-hold "swizzle": ripple inside the object + strong glow outline.
-        if self._press_obj in self._seg_masks and self._press_pt:
-            self._snapshot_press(snapshot, rect, scale)
-
-    def _snapshot_press(self, snapshot, rect, scale):
-        """The press "swizzle": a slight press-scale, an intensified glow that
-        decays after release, and expanding waves clipped to the object. Waves
-        spawn every _PRESS_SPAWN_MS while held; each lives _PRESS_WAVE_MS — so a
-        quick tap still plays one full wave that outlives the click."""
-        oid = self._press_obj
-        tex = self._seg_masks[oid]
-        col = self._seg_colors.get(oid, self._seg_point_color)
-        now = self._now()
-        p = self.anim.press(now)           # engine owns the envelope maths
-        if p is None:
-            return
-        iw, ih = self.pixbuf.get_width(), self.pixbuf.get_height()
-        cx, cy = self._seg_centroids.get(oid) or (iw / 2, ih / 2)
-        snapshot.save()
-        if abs(p.scale - 1.0) > 1e-4:
-            snapshot.translate(Graphene.Point().init(cx, cy))
-            snapshot.scale(p.scale, p.scale)
-            snapshot.translate(Graphene.Point().init(-cx, -cy))
-        # intensified glow + bright fill + ants (all decay after release)
-        self._glow(snapshot, tex, col, p.glow, 26.0, rect)
-        self._tint(snapshot, tex, col, p.tint, rect)
-        ant_col = col
-        if not p.held and p.fade < 1.0:                 # fade the outline out too
-            ant_col = self._alpha(col, p.fade)
-        self._ants(snapshot, self._seg_paths.get(oid), ant_col, scale)
-        # expanding waves from the press point, clipped to the object
-        px, py = self._press_pt
-        maxr = self._seg_radius.get(oid, 160.0)
-        snapshot.push_mask(Gsk.MaskMode.LUMINANCE)
-        snapshot.append_texture(tex, rect)              # clip content to object
-        snapshot.pop()
-        for ph, a in self.anim.waves(now):              # engine schedules the waves
-            r = 8.0 + _ease_out(ph) * maxr
-            ring = Gsk.PathBuilder()
-            ring.add_circle(Graphene.Point().init(px, py), r)
-            st = Gsk.Stroke.new(max(1.0, 3.0 / scale))
-            rc = Gdk.RGBA()
-            rc.red, rc.green, rc.blue, rc.alpha = 1.0, 1.0, 1.0, a
-            snapshot.append_stroke(ring.to_path(), st, rc)
-        snapshot.pop()
-        snapshot.restore()
-
-    def _snapshot_composite(self, snapshot, tex, rect):
-        """Result-panel preview: the source clipped to the union of selected
-        object masks (over the checkerboard), optionally on a solid background."""
-        if not self._clip_masks:
-            return
-        if self._clip_bg is not None:
-            snapshot.push_mask(Gsk.MaskMode.LUMINANCE)
-            for m in self._clip_masks:
-                snapshot.append_texture(m, rect)
-            snapshot.pop()
-            snapshot.append_color(self._clip_bg, rect)
-            snapshot.pop()
-        snapshot.push_mask(Gsk.MaskMode.LUMINANCE)
-        for m in self._clip_masks:
-            snapshot.append_texture(m, rect)            # union mask
-        snapshot.pop()
-        snapshot.append_scaled_texture(tex, Gsk.ScalingFilter.TRILINEAR, rect)
-        snapshot.pop()
 
     def _changed(self):
         if self._on_change:

@@ -13,7 +13,21 @@ refactor can be proven not to have changed a single pixel.
 | `assets/scene/` | the generated scene (committed): source + 3 object masks + label/general/depth maps + `meta.json` |
 | `fixtures/*.json` | 22 render fixtures: pane state × animation state × segmentation state |
 | `tools/rasterize.py` | deterministic offscreen render of `ImageView` at a fixed state and time |
-| `goldens/render/*.png` | frozen output of the **current** renderer — the regression gate |
+| `tools/displaylist.py` | freeze/check the **display lists** the engine builds for those fixtures |
+| `goldens/render/*.png` | frozen output of the renderer — the pixel regression gate |
+| `goldens/display_list/*.json` | frozen output of the engine — the **cross-core** gate |
+
+## Two gates, and why both
+
+`goldens/render/*.png` prove the *pixels*. `goldens/display_list/*.json` prove the
+*decisions* — the eased curves, dash offsets, pulse phase, morph lerp, wave schedule —
+as structured JSON, before any backend touches them.
+
+That second one is what makes the TypeScript core a mechanical port rather than an
+archaeological dig: it must emit byte-identical JSON for the same fixture, and a
+disagreement points at the exact op that drifted instead of at a blurry pixel diff.
+Every display list is also round-tripped through the JSON codec, so a lossy wire
+format can never be frozen.
 
 ## The scene
 
