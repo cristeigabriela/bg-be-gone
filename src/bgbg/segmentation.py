@@ -361,9 +361,14 @@ class SamSession:
             inp = np.ascontiguousarray(buf.transpose(2, 0, 1)[None])
             he0, he1, emb = self.encoder.run(None, {"image": inp})
             self._emb = (emb, he0, he1)
-        else:  # sam1 / mobile — encoder takes the raw HWC image
+        else:  # sam1 / mobile — encoder takes an HWC 0-255 image and does its own
+            # normalise + pad-to-1024, but it does NOT resize: the longest side
+            # must already be 1024 or the content lands in the corner of the
+            # padded canvas at the wrong scale (and >1024 images get cropped,
+            # since the pad amount goes negative).
+            small = pil.resize((self._nw, self._nh), Image.BILINEAR)
             emb = self.encoder.run(
-                None, {self._enc_input: np.asarray(pil, np.float32)})[0]
+                None, {self._enc_input: np.asarray(small, np.float32)})[0]
             self._emb = (emb,)
         # A broken/unsupported GPU kernel (e.g. very new arch) silently emits
         # NaN instead of erroring. Treat that as a compute failure so the ladder
