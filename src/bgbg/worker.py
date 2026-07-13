@@ -14,6 +14,9 @@ Requests (one JSON object per line on stdin):
   {"op":"single","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"id":N}
   {"op":"batch","input_dir":D,"output_dir":D,"model":M,"alpha":bool,"bg":BG,
    "pattern":"{name}_nobg","id":N}
+  {"op":"gif","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":int,
+   "rot":0..3,"fh":bool,"fv":bool,"id":N}   # per-frame background removal
+  {"op":"cancel"}                            # stop single/batch/gif in progress
   {"op":"models"}
   {"op":"seg_load","input":P,"model":"auto|large|base_plus|small|tiny|mobile","id":N}
   {"op":"seg_everything","points_per_side":int?,"id":N}
@@ -32,6 +35,9 @@ Responses (one JSON object per line on stdout):
   {"type":"progress","done":i,"total":n,"name":str,"id":N}
   {"type":"done_single","output":P,"preview":P,"seconds":f,"id":N}
   {"type":"done_batch","count":n,"seconds":f,"outdir":P,"id":N}
+  {"type":"gif_progress","done":i,"total":n,"id":N}
+  {"type":"gif_done","output":P,"frames":n,"seconds":f,"id":N}
+  {"type":"canceled","scope":"single|batch|gif","id":N}
   {"type":"seg_download","done":i,"total":n,"id":N}
   {"type":"seg_step","rung":R,"message":str,"id":N}
   {"type":"seg_ready","rung":R,"model":L,"provider":P,"label":L,"gpu":bool,
@@ -75,6 +81,8 @@ import gc  # noqa: E402
 import json  # noqa: E402
 import time  # noqa: E402
 import queue  # noqa: E402
+import shutil  # noqa: E402
+import tempfile  # noqa: E402
 import threading  # noqa: E402
 import traceback  # noqa: E402
 
@@ -270,6 +278,9 @@ def handle_single(req):
     preview = process_one(req["model"], rid, req["input"], req["output"],
                           req.get("alpha", False), req.get("bg", "transparent"),
                           req.get("blur", 20), want_preview=True)
+    if _cancel.is_set():                    # a single inference can't be stopped
+        out({"type": "canceled", "scope": "single", "id": rid})   # mid-run; drop it
+        return
     out({"type": "done_single", "output": req["output"],
          "preview": preview or req["output"],
          "seconds": round(time.time() - t, 2), "id": rid})
@@ -297,6 +308,10 @@ def handle_batch(req):
     blur = req.get("blur", 20)
     t = time.time()
     for i, f in enumerate(files, 1):
+        if _cancel.is_set():               # stop before starting the next file
+            out({"type": "canceled", "scope": "batch", "done": i - 1,
+                 "total": total, "id": rid})
+            return
         name = os.path.splitext(os.path.basename(f))[0]
         try:
             stem = pattern.format(name=name, n=i)
@@ -311,6 +326,108 @@ def handle_batch(req):
          "id": rid})
     out({"type": "done_batch", "count": total,
          "seconds": round(time.time() - t, 1), "outdir": outdir, "id": rid})
+
+
+def _apply_transform(im, rot, fh, fv):
+    """Bake the view's rotate/flip into a frame, matching ImageView.export_pixbuf
+    (flip horizontal, flip vertical, then rotate clockwise) — so a rotated GIF
+    comes out exactly like a rotated still would."""
+    if fh:
+        im = im.transpose(Image.FLIP_LEFT_RIGHT)
+    if fv:
+        im = im.transpose(Image.FLIP_TOP_BOTTOM)
+    rot %= 4
+    if rot == 1:
+        im = im.transpose(Image.ROTATE_270)    # 90 clockwise
+    elif rot == 2:
+        im = im.transpose(Image.ROTATE_180)
+    elif rot == 3:
+        im = im.transpose(Image.ROTATE_90)     # 90 counter-clockwise
+    return im
+
+
+def _compose_frame(orig_rgba, cut_rgba, bg, blur):
+    """Apply the chosen background to one processed frame; returns RGBA."""
+    if bg == "transparent":
+        return cut_rgba
+    if bg == "blur":
+        base = orig_rgba.convert("RGB").filter(
+            ImageFilter.GaussianBlur(max(1, blur))).convert("RGBA")
+    else:
+        base = Image.new("RGBA", cut_rgba.size, _hex_to_rgb(bg) + (255,))
+    base.alpha_composite(cut_rgba)
+    return base
+
+
+def _gif_palette_frame(path, transparent):
+    """Load one processed frame from disk as a GIF-ready palette image. GIF only
+    supports 1-bit alpha, so for a transparent background we reserve a palette
+    index for the cut-out pixels (hard edges are inherent to the format)."""
+    fr = Image.open(path)
+    if not transparent:
+        return fr.convert("RGB")
+    p = fr.convert("RGB").quantize(colors=255)         # leave index 255 free
+    mask = fr.getchannel("A").point(lambda a: 255 if a < 128 else 0)
+    p.paste(255, mask)
+    return p
+
+
+def _frames_to_gif(paths, dst, durations, loop, transparent):
+    """Assemble frame PNGs into an animated GIF, loading them one at a time
+    (streamed via a generator) so the rebuild stays memory-bounded."""
+    first = _gif_palette_frame(paths[0], transparent)
+    rest = (_gif_palette_frame(p, transparent) for p in paths[1:])
+    kw = dict(save_all=True, append_images=rest, duration=durations,
+              loop=loop, optimize=False)
+    if transparent:
+        kw.update(transparency=255, disposal=2)
+    first.save(dst, **kw)
+
+
+def handle_gif(req):
+    """Split an animated GIF into frames, remove each frame's background, and
+    reassemble. The model is loaded once and reused for every frame. Each
+    finished frame is written to disk (not held in RAM) so a long GIF stays
+    memory-bounded during the slow per-frame inference. Progress is per frame;
+    cancellable between frames."""
+    rid = req.get("id")
+    src, dst, model = req["input"], req["output"], req["model"]
+    alpha = req.get("alpha", False)
+    bg = req.get("bg", "transparent")
+    blur = int(req.get("blur", 20))
+    rot = int(req.get("rot", 0))
+    fh, fv = bool(req.get("fh")), bool(req.get("fv"))
+    im = Image.open(src)
+    n = getattr(im, "n_frames", 1)
+    loop = im.info.get("loop", 0)
+    # Report 0/N up front so the progress bar appears immediately — the model
+    # load + first-frame warmup (slow on BiRefNet) happen before frame 1 lands.
+    out({"type": "gif_progress", "done": 0, "total": n, "id": rid})
+    get_session(model, rid)                # load once; reused for every frame
+    framedir = tempfile.mkdtemp(prefix="gifframes-", dir=os.path.dirname(dst) or None)
+    paths, durations = [], []
+    t = time.time()
+    try:
+        for i in range(n):
+            if _cancel.is_set():
+                out({"type": "canceled", "scope": "gif", "id": rid})
+                return
+            im.seek(i)
+            durations.append(im.info.get("duration", 100))
+            frame = _apply_transform(im.convert("RGBA"), rot, fh, fv)
+            cut = _remove_resilient(model, rid, frame, alpha).convert("RGBA")
+            fp = os.path.join(framedir, "f%05d.png" % i)
+            _compose_frame(frame, cut, bg, blur).save(fp)
+            paths.append(fp)
+            out({"type": "gif_progress", "done": i + 1, "total": n, "id": rid})
+        if _cancel.is_set():
+            out({"type": "canceled", "scope": "gif", "id": rid})
+            return
+        _frames_to_gif(paths, dst, durations, loop, bg == "transparent")
+        out({"type": "gif_done", "output": dst, "frames": n,
+             "seconds": round(time.time() - t, 2), "id": rid})
+    finally:
+        shutil.rmtree(framedir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +582,7 @@ def handle_unload(req):
 _HANDLERS = {
     "single": handle_single,
     "batch": handle_batch,
+    "gif": handle_gif,
     "seg_load": handle_seg_load,
     "seg_everything": handle_seg_everything,
     "seg_point": handle_seg_point,
@@ -472,7 +590,7 @@ _HANDLERS = {
     "unload": handle_unload,
 }
 _SEG_OPS = {"seg_load", "seg_everything", "seg_point", "seg_extract"}
-_BG_OPS = {"single", "batch"}
+_BG_OPS = {"single", "batch", "gif"}
 
 
 def _ready():
@@ -534,8 +652,9 @@ def main():
         if op == "shutdown":
             break
         # Cancel is handled on the stdin thread so it can interrupt a running
-        # task (which is checking _cancel between grid points).
-        if op == "seg_cancel":
+        # task (segmentation checks _cancel between grid points; gif between
+        # frames). "seg_cancel" is kept for back-compat.
+        if op in ("cancel", "seg_cancel"):
             _cancel.set()
             continue
         q.put(req)
