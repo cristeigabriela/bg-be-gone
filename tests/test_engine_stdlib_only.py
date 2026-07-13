@@ -53,6 +53,8 @@ def main():
         assert engine.polygon_area_abs([(0, 0), (2, 0), (2, 2), (0, 2)]) == 4.0
         assert abs(engine.ease_out(1.0) - 1.0) < 1e-12
         assert len(engine.resample_closed([(0, 0), (4, 0), (4, 4), (0, 4)], 16)) == 16
+        m = engine.PixelMap(bytes([1, 1, 0]), 3, 3, 1, 1)   # id = 1 + 1*256
+        assert engine.HitMaps(label=m).specific_at(0, 0) == 257
         assert engine.PROTOCOL_VERSION >= 1
     finally:
         sys.meta_path.pop(0)

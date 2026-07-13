@@ -15,6 +15,7 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gtk, Gdk, Gsk, Graphene, GdkPixbuf, Gio, GLib  # noqa: E402
 
 from engine.pane import Pane  # noqa: E402
+from engine.hittest import PixelMap, HitMaps  # noqa: E402
 from engine.geometry import (  # noqa: E402
     MIN_ZOOM, MAX_ZOOM,
     polygon_area_abs as _polygon_area_abs,
@@ -81,13 +82,7 @@ class ImageView(Gtk.Widget):
         self._seg_point_tex = None       # Gdk.Texture (point-mode object)
         self._seg_point_color = _rgba(0.20, 0.52, 0.90)
         self._dim = _rgba(0.0, 0.0, 0.0)
-        self._lm_pixels = None           # specific id per pixel (smallest on top)
-        self._lm_rs = self._lm_nc = 0
-        self._lm_w = self._lm_h = 0
-        self._lmg_pixels = None          # general id per pixel (largest on top)
-        self._lmg_rs = self._lmg_nc = 0
-        self._depth_pixels = None        # overlap count per pixel (L)
-        self._depth_rs = self._depth_nc = 0
+        self.maps = HitMaps()            # specific / general / depth lookup maps
         # composite/clip mode (result panel): show the source clipped to a union
         # of masks over the checkerboard — a live cutout preview.
         self._clip_active = False
@@ -334,14 +329,19 @@ class ImageView(Gtk.Widget):
 
     @staticmethod
     def _load_map(path):
+        """Decode a lookup map into a raw buffer the engine can index.
+
+        Decoding is the shell's job (GdkPixbuf here, an ImageBitmap on the web);
+        the engine only indexes the bytes.
+        """
         if not path:
-            return (None, 0, 0, 0, 0)
+            return None
         try:
             pb = GdkPixbuf.Pixbuf.new_from_file(path)
         except GLib.Error:
-            return (None, 0, 0, 0, 0)
-        return (pb.get_pixels(), pb.get_rowstride(), pb.get_n_channels(),
-                pb.get_width(), pb.get_height())
+            return None
+        return PixelMap(pb.get_pixels(), pb.get_rowstride(), pb.get_n_channels(),
+                        pb.get_width(), pb.get_height())
 
     def set_seg_layers(self, objects, labelmap_path, general_path=None,
                        depth_path=None):
@@ -372,12 +372,9 @@ class ImageView(Gtk.Widget):
                 rest = [poly for poly in contours if poly is not largest]
                 self._seg_sec_paths[oid] = (
                     self._path_from_contours(rest) if rest else None)
-        (self._lm_pixels, self._lm_rs, self._lm_nc,
-         self._lm_w, self._lm_h) = self._load_map(labelmap_path)
-        self._lmg_pixels, self._lmg_rs, self._lmg_nc, _, _ = \
-            self._load_map(general_path)
-        self._depth_pixels, self._depth_rs, self._depth_nc, _, _ = \
-            self._load_map(depth_path)
+        self.maps = HitMaps(label=self._load_map(labelmap_path),
+                            general=self._load_map(general_path),
+                            depth=self._load_map(depth_path))
         self._begin_reveal()
         self._start_anim()
         self.queue_draw()
@@ -447,7 +444,7 @@ class ImageView(Gtk.Widget):
         self._pop = {}
         self._reveal = 1.0
         self._reveal_t0 = None
-        self._lm_pixels = self._lmg_pixels = self._depth_pixels = None
+        self.maps.clear()
         self._hover_gen = self._hover_spec = 0
         self._hover_dwell_t0 = None
         self._hover_drilled = False
@@ -576,26 +573,21 @@ class ImageView(Gtk.Widget):
         """Image px -> widget px (or None). The exact inverse."""
         return self._sync_pane().image_to_view(ix, iy)
 
-    def _id_at(self, pixels, rs, nc, ix, iy):
-        if pixels is None or not (0 <= ix < self._lm_w and 0 <= iy < self._lm_h):
-            return 0
-        i = iy * rs + ix * nc
-        return pixels[i] + ((pixels[i + 1] << 8) if nc >= 2 else 0)
-
     def hit_test(self, ix, iy):
         """Most specific object id at (ix, iy) (smallest on top), else 0."""
-        return self._id_at(self._lm_pixels, self._lm_rs, self._lm_nc, ix, iy)
+        return self.maps.specific_at(ix, iy)
 
     def hit_test_general(self, ix, iy):
         """Most general object id at (ix, iy) (largest on top), else 0."""
-        return self._id_at(self._lmg_pixels, self._lmg_rs, self._lmg_nc, ix, iy)
+        return self.maps.general_at(ix, iy)
 
     def depth_at(self, ix, iy):
         """How many objects overlap at (ix, iy)."""
-        if (self._depth_pixels is None
-                or not (0 <= ix < self._lm_w and 0 <= iy < self._lm_h)):
-            return 0
-        return self._depth_pixels[iy * self._depth_rs + ix * self._depth_nc]
+        return self.maps.depth_at(ix, iy)
+
+    def hit_at(self, ix, iy):
+        """Specific + general + depth in one shot (engine.hittest.Hit)."""
+        return self.maps.hit(ix, iy)
 
     # ---------- context menu ----------
     def _build_menu(self):

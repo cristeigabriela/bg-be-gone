@@ -12,6 +12,7 @@ from .geometry import (          # noqa: F401
     MIN_ZOOM, MAX_ZOOM, clamp, lerp, ease_out, ease_out_back,
     polygon_area_abs, resample_closed, align_ring,
 )
-from .pane import Pane           # noqa: F401
+from .pane import Pane                            # noqa: F401
+from .hittest import PixelMap, HitMaps, Hit       # noqa: F401
 
 PROTOCOL_VERSION = 1
