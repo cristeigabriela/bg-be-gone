@@ -116,6 +116,9 @@ class ImageView(Gtk.Widget):
 
         self.pixbuf = None
         self._texture = None
+        self._anim = None        # GdkPixbuf.PixbufAnimation for animated GIFs
+        self._anim_iter = None
+        self._anim_timer = 0     # GLib timeout id driving frame advance
         self.zoom = 1.0          # 1.0 == fit to widget
         self.ox = 0.0            # pan offset from centre, in widget px
         self.oy = 0.0
@@ -237,14 +240,25 @@ class ImageView(Gtk.Widget):
         pclick.connect("released", self._on_primary_released)
         self.add_controller(pclick)
 
+        # pause GIF playback while this panel is off-screen (page switch / close)
+        self.connect("map", self._resume_animation)
+        self.connect("unmap", lambda *_: self._pause_animation())
+
         self._build_menu()
 
     # ---------- public API ----------
     def load_file(self, path, keep_transform=False):
-        try:
-            self.pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
-        except GLib.Error:
-            return False
+        self._stop_animation()
+        anim = self._open_animation(path)
+        if anim is not None:               # animated GIF: play it back
+            self._anim = anim
+            self._anim_iter = anim.get_iter(None)
+            self.pixbuf = self._anim_iter.get_pixbuf()
+        else:
+            try:
+                self.pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+            except GLib.Error:
+                return False
         self._texture = None
         self._clip_active = False
         if keep_transform:                 # keep the user's flip/zoom on reload
@@ -254,9 +268,59 @@ class ImageView(Gtk.Widget):
             self.fh = self.fv = False
             self.reset_view()
         self._changed()
+        if self._anim is not None:
+            self._schedule_frame()
         return True
 
+    def _open_animation(self, path):
+        """Return a PixbufAnimation if `path` is an animated GIF we should play
+        (not on the Segment view, which needs a stable frame), else None."""
+        if self._seg_mode is not None or not path.lower().endswith(".gif"):
+            return None
+        try:
+            anim = GdkPixbuf.PixbufAnimation.new_from_file(path)
+        except GLib.Error:
+            return None
+        return None if anim.is_static_image() else anim
+
+    def _stop_animation(self):
+        self._pause_animation()
+        self._anim = None
+        self._anim_iter = None
+
+    def _pause_animation(self):
+        if self._anim_timer:
+            GLib.source_remove(self._anim_timer)
+            self._anim_timer = 0
+
+    def _resume_animation(self, *_):
+        if self._anim is not None and not self._anim_timer:
+            self._schedule_frame()
+
+    def _schedule_frame(self):
+        # Only run while visible — a hidden page (or a closed window) shouldn't
+        # keep waking to swap frames.
+        if self._anim_iter is None or self._anim_timer or not self.get_mapped():
+            return
+        delay = self._anim_iter.get_delay_time()   # ms for the current frame
+        self._anim_timer = GLib.timeout_add(max(20, delay if delay > 0 else 100),
+                                            self._advance_frame)
+
+    def _advance_frame(self):
+        self._anim_timer = 0
+        if self._anim_iter is None:
+            return False
+        self._anim_iter.advance(None)              # advance to the current time
+        pb = self._anim_iter.get_pixbuf()
+        if pb is not None:
+            self.pixbuf = pb
+            self._texture = None
+            self.queue_draw()
+        self._schedule_frame()
+        return False                               # one-shot; _schedule re-arms
+
     def set_pixbuf(self, pixbuf):
+        self._stop_animation()
         self.pixbuf = pixbuf
         self._texture = None
         self.rot = 0
@@ -265,6 +329,7 @@ class ImageView(Gtk.Widget):
         self._changed()
 
     def clear(self):
+        self._stop_animation()
         self.pixbuf = None
         self._texture = None
         self._clip_active = False
@@ -397,6 +462,7 @@ class ImageView(Gtk.Widget):
 
     # composite/clip preview (result panel): source clipped to `masks`
     def set_composite(self, pixbuf, masks, bg=None):
+        self._stop_animation()
         self.pixbuf = pixbuf
         self._texture = None
         self._clip_active = True

@@ -16,8 +16,9 @@ import subprocess
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
+gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("Adw", "1")
-from gi.repository import Gtk, Gdk, Gio, GLib, Adw  # noqa: E402
+from gi.repository import Gtk, Gdk, GdkPixbuf, Gio, GLib, Adw  # noqa: E402
 
 from viewer import ImageView  # noqa: E402
 
@@ -74,7 +75,8 @@ SEG_FOCUS = [
     ("Normal", 1600),
     ("Relaxed", 2600),
 ]
-IMG_PATTERNS = ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp", "*.tif", "*.tiff"]
+IMG_PATTERNS = ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp", "*.tif", "*.tiff",
+                "*.gif"]
 PROVIDER_LABELS = {
     "CUDAExecutionProvider": "NVIDIA (CUDA)",
     "ROCMExecutionProvider": "AMD (ROCm)",
@@ -166,7 +168,12 @@ def save_button(label="Save…"):
 
 def action_bar(primary=None, secondary=(), cancel=None, save=None, status_text=""):
     """Standard action row with fixed slots so Save is always far-right and the
-    layout is identical on every page. Returns (bar, status_label, spinner)."""
+    layout is identical on every page. Returns (bar, status_label, spinner).
+
+    The status label is intentionally NOT shown here — status text lives only in
+    the window footer (statusbar) to avoid showing the same message twice. The
+    label object is still returned so callers `set_text` on it and the footer
+    mirror picks it up."""
     bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     bar.add_css_class("action-bar")
     if primary is not None:
@@ -177,14 +184,10 @@ def action_bar(primary=None, secondary=(), cancel=None, save=None, status_text="
     spinner.set_size_request(18, 18)   # reserve space so start/stop never reflows
     spinner.set_valign(Gtk.Align.CENTER)
     bar.append(spinner)
-    status = Gtk.Label(xalign=0, label=status_text)
-    status.add_css_class("dim-label")
-    status.add_css_class("status-label")
-    status.set_hexpand(True)
-    status.set_ellipsize(3)   # PANGO_ELLIPSIZE_END
-    status.set_width_chars(0)
-    status.set_max_width_chars(0)
-    bar.append(status)
+    status = Gtk.Label(xalign=0, label=status_text)   # detached: footer shows it
+    spacer = Gtk.Box()
+    spacer.set_hexpand(True)           # keep Save pinned far-right
+    bar.append(spacer)
     if cancel is not None:
         bar.append(cancel)
     if save is not None:
@@ -375,6 +378,7 @@ class Window(Adw.ApplicationWindow):
             prefix="bg-be-gone-")
         os.makedirs(self.tmpdir, exist_ok=True)
         self.source_path = None
+        self._source_is_gif = False
         self.result_output = None
         self.busy = False
         self.batch_input = None
@@ -552,16 +556,39 @@ class Window(Adw.ApplicationWindow):
         dev.append(self.device_lbl)
         bar.set_start_widget(dev)
 
+        centre = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        centre.set_valign(Gtk.Align.CENTER)
         self.footer_status = Gtk.Label(label="")
         self.footer_status.add_css_class("status-label")
         self.footer_status.set_ellipsize(3)          # PANGO_ELLIPSIZE_END
-        bar.set_center_widget(self.footer_status)
+        centre.append(self.footer_status)
+        # Shared progress bar: long, frame-wise or step-wise work (GIF removal,
+        # "segment everything") reports here so it's always visible in the footer.
+        self.footer_progress = Gtk.ProgressBar()
+        self.footer_progress.add_css_class("footer-progress")
+        self.footer_progress.set_valign(Gtk.Align.CENTER)
+        self.footer_progress.set_size_request(150, -1)
+        self.footer_progress.set_show_text(True)
+        self.footer_progress.set_visible(False)
+        centre.append(self.footer_progress)
+        bar.set_center_widget(centre)
 
         self.footer_context = Gtk.Label(label="")
         self.footer_context.add_css_class("dim-label")
         self.footer_context.add_css_class("status-label")
         bar.set_end_widget(self.footer_context)
         return bar
+
+    def _footer_progress(self, done, total):
+        """Show frame/step progress in the shared footer bar (GIF + segmentation)."""
+        total = max(int(total), 1)
+        self.footer_progress.set_fraction(min(1.0, done / total))
+        self.footer_progress.set_text("%d / %d" % (done, total))
+        self.footer_progress.set_visible(True)
+
+    def _hide_footer_progress(self):
+        if getattr(self, "footer_progress", None) is not None:
+            self.footer_progress.set_visible(False)
 
     def _mirror_status(self, label, page):
         """Reflect a per-page status label into the footer while its page is
@@ -845,6 +872,7 @@ class Window(Adw.ApplicationWindow):
         (self.seg_spinner.start if busy else self.seg_spinner.stop)()
         if not busy:                        # any terminal state stops the shimmer
             self.seg_panel.view.set_scanning(False)
+            self._hide_footer_progress()
 
     def _extract_bg(self):
         bg = BGS[self.bg_row.get_selected()][1]
@@ -1079,8 +1107,11 @@ class Window(Adw.ApplicationWindow):
         self.save_btn = save_button("Save result…")
         self.save_btn.set_tooltip_text("Save the cut-out (Ctrl+S)")
         self.save_btn.connect("clicked", lambda *_: self._on_save())
+        self.gen_cancel_btn = pill_button("Cancel")
+        self.gen_cancel_btn.set_sensitive(False)      # enabled while a pass runs
+        self.gen_cancel_btn.connect("clicked", lambda *_: self._on_bg_cancel())
         bar, self.status, self.spinner = action_bar(
-            primary=self.gen_btn, save=self.save_btn,
+            primary=self.gen_btn, cancel=self.gen_cancel_btn, save=self.save_btn,
             status_text="Open or drop an image to begin.")
         page.append(bar)
 
@@ -1146,18 +1177,23 @@ class Window(Adw.ApplicationWindow):
             "<tt>{n}</tt> index. Output is PNG in the output folder.</small>")
         box.append(hint)
 
+        run_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        run_row.set_halign(Gtk.Align.START)
         self.run_btn = primary_button("Run batch", icon="view-grid-symbolic")
-        self.run_btn.set_halign(Gtk.Align.START)
         self.run_btn.set_sensitive(False)
         self.run_btn.connect("clicked", lambda *_: self._on_run_batch())
-        box.append(self.run_btn)
+        run_row.append(self.run_btn)
+        self.batch_cancel_btn = pill_button("Cancel")
+        self.batch_cancel_btn.set_sensitive(False)
+        self.batch_cancel_btn.connect("clicked", lambda *_: self._on_bg_cancel())
+        run_row.append(self.batch_cancel_btn)
+        box.append(run_row)
 
+        # Progress + status are shown in the window footer (statusbar), not on the
+        # page — kept as detached objects so existing set_fraction/set_text calls
+        # (and the footer mirror) keep working.
         self.progress = Gtk.ProgressBar(show_text=True)
-        box.append(self.progress)
         self.batch_status = Gtk.Label(xalign=0, label="")
-        self.batch_status.add_css_class("dim-label")
-        self.batch_status.set_wrap(True)
-        box.append(self.batch_status)
         return outer
 
     # ---------- file dialogs ----------
@@ -1192,6 +1228,15 @@ class Window(Adw.ApplicationWindow):
             return True
         return False
 
+    def _is_animated_gif(self, path):
+        if not path.lower().endswith(".gif"):
+            return False
+        try:
+            anim = GdkPixbuf.PixbufAnimation.new_from_file(path)
+        except GLib.Error:
+            return False
+        return not anim.is_static_image()
+
     def _load_source(self, path):
         if not path:
             return
@@ -1199,11 +1244,14 @@ class Window(Adw.ApplicationWindow):
             self._toast("Could not open that image.")
             return
         self.source_path = path
+        self._source_is_gif = self._is_animated_gif(path)
         self.res_panel.view.clear()
         self.result_output = None
         self.save_btn.set_sensitive(False)
         self.gen_btn.set_sensitive(True)
-        self.status.set_text(os.path.basename(path) + " — press Generate.")
+        tail = " — animated GIF, press Generate." if self._source_is_gif \
+            else " — press Generate."
+        self.status.set_text(os.path.basename(path) + tail)
         # Mirror into the Segment page and reset its state for the new image.
         if getattr(self, "seg_panel", None) is not None:
             self.seg_panel.view.load_file(path)
@@ -1215,12 +1263,17 @@ class Window(Adw.ApplicationWindow):
             self.seg_status.set_text(os.path.basename(path) + " — Segment.")
 
     def _on_save(self):
-        pb = self.res_panel.view.export_pixbuf()
-        if pb is None:
+        # A GIF result is the animated file itself (all frames); a still result
+        # is the current pixbuf.
+        is_gif = bool(self.result_output
+                      and self.result_output.lower().endswith(".gif"))
+        pb = None if is_gif else self.res_panel.view.export_pixbuf()
+        if not is_gif and pb is None:
             return
+        ext = ".gif" if is_gif else ".png"
         dlg = Gtk.FileDialog(title="Save result")
         base = os.path.splitext(os.path.basename(self.source_path or "image"))[0]
-        dlg.set_initial_name(base + "_nobg.png")
+        dlg.set_initial_name(base + "_nobg" + ext)
 
         def done(d, res):
             try:
@@ -1228,10 +1281,13 @@ class Window(Adw.ApplicationWindow):
             except GLib.Error:
                 return
             path = f.get_path()
-            if not path.lower().endswith(".png"):
-                path += ".png"
+            if not path.lower().endswith(ext):
+                path += ext
             try:
-                pb.savev(path, "png", [], [])
+                if is_gif:
+                    shutil.copyfile(self.result_output, path)
+                else:
+                    pb.savev(path, "png", [], [])
                 self._toast("Saved " + os.path.basename(path))
             except Exception as e:
                 self._toast("Save failed: %s" % e)
@@ -1268,14 +1324,17 @@ class Window(Adw.ApplicationWindow):
             bool(self.batch_input and self.batch_output) and not self.busy)
 
     # ---------- actions ----------
-    def _set_busy(self, busy, spin=True):
+    def _set_busy(self, busy, spin=True, cancel=False):
         self.busy = busy
         self.gen_btn.set_sensitive(not busy and self.src_panel.view.has_image())
+        self.gen_cancel_btn.set_sensitive(busy and cancel)
+        self.batch_cancel_btn.set_sensitive(busy and cancel)
         self._sync_batch()
         if spin:
             (self.spinner.start if busy else self.spinner.stop)()
         if not busy:
             self.src_panel.view.set_scanning(False)   # end the scan shimmer
+            self._hide_footer_progress()
 
     def _on_source_change(self):
         if self.src_panel.view.has_image() and self.result_output:
@@ -1289,6 +1348,9 @@ class Window(Adw.ApplicationWindow):
         if self.busy or not self.src_panel.view.has_image():
             return
         model, bg, alpha, blur = self.get_settings()
+        if self._source_is_gif:
+            self._generate_gif(model, bg, alpha, blur)
+            return
         inp = os.path.join(self.tmpdir, "input.png")
         try:
             self.src_panel.view.export_pixbuf().savev(inp, "png", [], [])
@@ -1296,18 +1358,41 @@ class Window(Adw.ApplicationWindow):
             self._toast("Could not prepare image: %s" % e)
             return
         out = os.path.join(self.tmpdir, "result.png")
-        self._set_busy(True)
+        self._set_busy(True, cancel=True)
         self.src_panel.view.set_scanning(True)      # scan shimmer over the source
         self.status.set_text("Generating…")
         self.worker.send({"op": "single", "input": inp, "output": out,
                           "model": model, "alpha": alpha, "bg": bg, "blur": blur})
+
+    def _generate_gif(self, model, bg, alpha, blur):
+        # Same options as a still; the worker processes each frame and reports
+        # per-frame progress. Pass the current rotate/flip so it bakes in like a
+        # still would; process the original file (all frames) not the preview.
+        out = os.path.join(self.tmpdir, "result.gif")
+        v = self.src_panel.view
+        self._set_busy(True, cancel=True)
+        self.src_panel.view.set_scanning(True)
+        self.status.set_text("Removing background from GIF…")
+        self.worker.send({"op": "gif", "input": self.source_path, "output": out,
+                          "model": model, "alpha": alpha, "bg": bg, "blur": blur,
+                          "rot": v.rot, "fh": v.fh, "fv": v.fv})
+
+    def _on_bg_cancel(self):
+        if not self.busy:
+            return
+        self.worker.send({"op": "cancel"})
+        self.gen_cancel_btn.set_sensitive(False)
+        self.batch_cancel_btn.set_sensitive(False)
+        self.status.set_text("Cancelling…")
+        if self.stack.get_visible_child_name() == "batch":
+            self.batch_status.set_text("Cancelling…")
 
     def _on_run_batch(self):
         if self.busy or not (self.batch_input and self.batch_output):
             return
         model, bg, alpha, blur = self.get_settings()
         pattern = self.pattern_row.get_text().strip() or "{name}_nobg"
-        self._set_busy(True, spin=False)
+        self._set_busy(True, spin=False, cancel=True)
         self.progress.set_fraction(0)
         self.progress.set_text("starting…")
         self.batch_status.set_text("Preparing…")
@@ -1353,10 +1438,35 @@ class Window(Adw.ApplicationWindow):
             self.save_btn.set_sensitive(True)
             self.status.set_text("Done in %.2fs." % msg["seconds"])
             self._set_busy(False)
+        elif t == "gif_progress":
+            self._footer_progress(msg["done"], msg["total"])
+            if msg["done"] == 0:
+                self.status.set_text("Removing background — %d frames…"
+                                     % msg["total"])
+            else:
+                self.status.set_text("Removing background — frame %d / %d"
+                                     % (msg["done"], msg["total"]))
+        elif t == "gif_done":
+            self.res_panel.view.load_file(msg["output"])   # first-frame preview
+            self.result_output = msg["output"]
+            self.save_btn.set_sensitive(True)
+            self.status.set_text("Done: %d frames in %.1fs — Save the GIF."
+                                 % (msg["frames"], msg["seconds"]))
+            self._set_busy(False)
+        elif t == "canceled":
+            self._set_busy(False, spin=(msg.get("scope") != "batch"))
+            if msg.get("scope") == "batch":
+                self.progress.set_text("cancelled")
+                self.batch_status.set_text(
+                    "Cancelled after %d / %d." % (msg.get("done", 0),
+                                                  msg.get("total", 0)))
+            else:
+                self.status.set_text("Cancelled.")
         elif t == "progress":
             total = max(msg["total"], 1)
             self.progress.set_fraction(msg["done"] / total)
             self.progress.set_text("%d / %d" % (msg["done"], total))
+            self._footer_progress(msg["done"], total)
             if msg.get("name"):
                 self.batch_status.set_text("Processing " + msg["name"])
         elif t == "done_batch":
@@ -1394,9 +1504,10 @@ class Window(Adw.ApplicationWindow):
             self.seg_status.set_text(
                 "%s unavailable — trying a lighter model…" % msg["rung"])
         elif t == "seg_progress":
-            # The scan shimmer conveys activity; keep a calm static label rather
-            # than a jittery running count.
+            # The scan shimmer conveys activity; keep a calm static label, but
+            # also drive the shared footer progress bar.
             self.seg_status.set_text("Finding objects…")
+            self._footer_progress(msg["done"], msg["total"])
         elif t == "seg_objects":
             self._seg_set_busy(False)
             self.seg_objects = msg["objects"]
