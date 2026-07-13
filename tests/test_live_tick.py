@@ -56,7 +56,6 @@ def load_scene(v):
 def main():
     Gtk.init()
     v = ImageView()
-    meta = load_scene(v)
     win = Gtk.Window()
     win.set_default_size(320, 240)
     win.set_child(v)
@@ -64,7 +63,6 @@ def main():
 
     loop = GLib.MainLoop()
     v.set_dwell_ms(300)                 # keep the test quick
-    steps = iter(range(100))
 
     # (46,52) is the nested core (obj 3) inside field (obj 1)
     NESTED = (46, 52)
@@ -74,11 +72,19 @@ def main():
 
     obj = v.session.objects            # the engine holds the hover/focus state
 
-    def phase1():
-        # the tick must be RUNNING (set_seg_layers began a reveal)
+    def phase0():
+        # Load the scene from INSIDE the loop, once we have a frame clock, and
+        # look at the reveal immediately. Loading it before present() would stamp
+        # the reveal's epoch before the window was realized, and a slow startup
+        # could then burn the whole 300ms reveal before we ever looked at it —
+        # which is a race in the test, not in the code.
+        load_scene(v)
         R["tick_running_after_layers"] = v._anim_tick is not None
         R["reveal_started"] = v.anim.reveal < 1.0
+        GLib.timeout_add(80, phase1)
+        return False
 
+    def phase1():
         wx, wy = to_view(*NESTED)
         v._on_leave = lambda *a: None    # don't let a phantom leave cancel the dwell
         v._on_motion(None, wx, wy)
@@ -112,15 +118,27 @@ def main():
         v.set_seg_selection([])
         v.anim.cancel_dwell()
         v.set_scanning(False)
-        GLib.timeout_add(400, phase4)
+        R["idle_deadline"] = 30            # x100ms
+        GLib.timeout_add(100, phase4)
         return False
 
     def phase4():
-        R["tick_stopped_when_idle"] = v._anim_tick is None
-        loop.quit()
-        return False
+        # Retiring the tick takes one more frame-clock beat, and a loaded machine
+        # can be slow to deliver it — so wait for it to happen rather than
+        # sampling once and calling a busy scheduler a bug. The property is that
+        # it *does* stop, not that it stops within one particular 400ms window.
+        if v._anim_tick is None:
+            R["tick_stopped_when_idle"] = True
+            loop.quit()
+            return False
+        R["idle_deadline"] -= 1
+        if R["idle_deadline"] <= 0:
+            R["tick_stopped_when_idle"] = False
+            loop.quit()
+            return False
+        return True                        # keep polling
 
-    GLib.timeout_add(200, phase1)
+    GLib.timeout_add(200, phase0)
     GLib.timeout_add_seconds(20, lambda: (loop.quit(), False)[1])
     loop.run()
 

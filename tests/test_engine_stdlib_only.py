@@ -69,6 +69,14 @@ def main():
         assert s.feed(engine.events.PointerEnter(10, 10)) == [
             engine.effects.GrabFocus()]
         assert s.display_list().ops           # it can build a frame
+
+        # the settings catalogue: a UI must be able to build itself from this
+        # without GTK, because the browser's will
+        ix = importlib.import_module("engine.interactables")
+        st = ix.new_settings()
+        assert st.describe()["groups"][0]["title"] == "Model"
+        assert ix.model_id(st) == "birefnet-general"
+        assert not st.visible("model")        # hidden until "Custom model…"
         assert engine.PROTOCOL_VERSION >= 1
     finally:
         sys.meta_path.pop(0)

@@ -21,6 +21,8 @@ gi.require_version("Adw", "1")
 from gi.repository import Gtk, Gdk, GdkPixbuf, Gio, GLib, Adw  # noqa: E402
 
 from shell_gtk.canvas import ImageView  # noqa: E402
+from shell_gtk.sidebar import Sidebar  # noqa: E402
+from engine import interactables as IX  # noqa: E402
 
 APP_ID = "io.github.cristeigabriela.BgBeGone"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,51 +32,9 @@ WORKER = os.environ.get("BGBG_WORKER", os.path.join(APP_DIR, "worker.py"))
 LOG = os.path.join(GLib.get_user_cache_dir(), "bg-be-gone-worker.log")
 APP_VERSION = os.environ.get("BGBG_VERSION", "1.1.0")
 
-SUBJECTS = [
-    ("General (objects, scenes)", "birefnet-general"),
-    ("Person / portrait", "birefnet-portrait"),
-    ("Anime / illustration", "isnet-anime"),
-    ("Fast (lower quality)", "u2net"),
-]
-MODELS = [
-    ("BiRefNet — General", "birefnet-general"),
-    ("BiRefNet — General Lite", "birefnet-general-lite"),
-    ("BiRefNet — Massive", "birefnet-massive"),
-    ("BiRefNet — Portrait", "birefnet-portrait"),
-    ("BiRefNet — HRSOD", "birefnet-hrsod"),
-    ("BiRefNet — DIS", "birefnet-dis"),
-    ("ISNet — General", "isnet-general-use"),
-    ("ISNet — Anime", "isnet-anime"),
-    ("U2Net", "u2net"),
-    ("U2Net — Human Seg", "u2net_human_seg"),
-    ("Silueta", "silueta"),
-]
-BGS = [
-    ("Transparent", "transparent"),
-    ("Blur background", "blur"),
-    ("White", "#ffffff"),
-    ("Black", "#000000"),
-    ("Green screen", "#00b140"),
-    ("Custom…", "custom"),
-]
-SEG_MODES = [
-    ("Everything — pick layers", "everything"),
-    ("Click to select", "point"),
-]
-# Grid density for "segment everything": label -> points-per-side (0 = auto).
-SEG_DETAIL = [
-    ("Auto", 0),
-    ("Fast", 16),
-    ("Balanced", 24),
-    ("Fine", 32),
-    ("Maximum", 44),
-]
-# Hover-dwell before drilling general -> specific: label -> milliseconds.
-SEG_FOCUS = [
-    ("Quick", 800),
-    ("Normal", 1600),
-    ("Relaxed", 2600),
-]
+# Every setting the user can touch — the models, the backgrounds, the
+# segmentation knobs — is declared once in engine/interactables.py, and the
+# sidebar below is built from it. Nothing here knows what a "model" is.
 IMG_PATTERNS = ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp", "*.tif", "*.tiff",
                 "*.gif"]
 PROVIDER_LABELS = {
@@ -377,6 +337,9 @@ class Window(Adw.ApplicationWindow):
         self.tmpdir = os.environ.get("BGBG_TMPDIR") or tempfile.mkdtemp(
             prefix="bg-be-gone-")
         os.makedirs(self.tmpdir, exist_ok=True)
+        # Every user-facing setting, and its current value. The sidebar is built
+        # from this; nothing in this file holds a list of models or backgrounds.
+        self.settings = IX.new_settings()
         self.source_path = None
         self._source_is_gif = False
         self.result_output = None
@@ -483,57 +446,50 @@ class Window(Adw.ApplicationWindow):
         box.set_margin_end(12)
         scroller.set_child(box)
 
-        # One coherent picker: friendly Subject presets, plus a "Custom model…"
-        # entry that reveals the exact-model list (same pattern as the Background
-        # "Custom…" colour reveal). No hidden mode flag.
-        model_grp = Adw.PreferencesGroup(title="Model")
-        self.subject_row = Adw.ComboRow(
-            title="Subject",
-            model=Gtk.StringList.new([s[0] for s in SUBJECTS] + ["Custom model…"]))
-        self.subject_row.set_subtitle("What the image mainly contains")
-        self.subject_row.connect("notify::selected", self._on_subject_changed)
-        model_grp.add(self.subject_row)
+        # The whole sidebar is a walk over the engine's schema: every group,
+        # row, option, default and visibility rule comes from
+        # engine/interactables.py, so the browser's sidebar can be the same walk
+        # over the same declaration.
+        self.sidebar = Sidebar(self.settings, on_change=self._on_setting_changed)
+        for grp in self.sidebar.widgets:
+            box.append(grp)
 
-        self.model_row = Adw.ComboRow(
-            title="Model", model=Gtk.StringList.new([m[0] for m in MODELS]))
-        self.model_row.set_subtitle("Exact rembg model")
-        self.model_row.set_visible(False)
-        self.model_row.connect("notify::selected", lambda *_: self._mark_stale())
-        model_grp.add(self.model_row)
-        self.model_grp = model_grp
-        box.append(model_grp)
-        box.append(self._build_seg_group())
-
-        out_grp = Adw.PreferencesGroup(title="Output")
-        self.bg_row = Adw.ComboRow(
-            title="Background",
-            model=Gtk.StringList.new([b[0] for b in BGS]))
-        self.bg_row.connect("notify::selected", lambda *_: self._sync_color())
-        out_grp.add(self.bg_row)
-
-        self.color_row = Adw.ActionRow(title="Custom colour")
-        self.color_btn = Gtk.ColorDialogButton.new(Gtk.ColorDialog())
-        rgba = Gdk.RGBA()
-        rgba.parse("#00b140")
-        self.color_btn.set_rgba(rgba)
-        self.color_btn.connect("notify::rgba", self._seg_bg_changed)
-        self.color_btn.set_valign(Gtk.Align.CENTER)
-        self.color_row.add_suffix(self.color_btn)
-        self.color_row.set_sensitive(False)
-        out_grp.add(self.color_row)
-
-        self.blur_row = Adw.SpinRow(
-            title="Blur strength",
-            adjustment=Gtk.Adjustment(value=20, lower=2, upper=80,
-                                      step_increment=1, page_increment=5))
-        self.blur_row.set_visible(False)
-        out_grp.add(self.blur_row)
-
-        self.alpha_row = Adw.SwitchRow(
-            title="Alpha matting", subtitle="Cleaner edges, a little slower")
-        out_grp.add(self.alpha_row)
-        box.append(out_grp)
+        # Named handles for the rows the rest of the window still talks to.
+        r = self.sidebar.rows
+        self.subject_row = r["subject"]
+        self.model_row = r["model"]
+        self.bg_row = r["bg"]
+        self.color_row = r["bg_color"]
+        self.color_btn = self.sidebar.buttons["bg_color"]
+        self.blur_row = r["blur"]
+        self.alpha_row = r["alpha"]
+        self.seg_focus_row = r["seg_focus"]
+        self.seg_adv = r["seg_advanced"]
+        self.seg_model_row = r["seg_model"]
+        self.seg_detail_row = r["seg_detail"]
+        self.model_grp = self.sidebar.groups["model"]
+        self.seg_grp = self.sidebar.groups["seg"]
         return scroller
+
+    def _on_setting_changed(self, sid):
+        """A setting the user actually changed. Visibility already re-applied
+        itself from the schema; this is only the consequences beyond the row."""
+        if sid == "subject":
+            self._mark_stale()
+            if getattr(self, "footer_context", None) is not None:
+                self._update_footer()
+        elif sid == "model":
+            self._mark_stale()
+        elif sid == "bg":
+            self._mark_stale()
+            self._seg_bg_changed()
+        elif sid == "bg_color":
+            self._seg_bg_changed()
+        elif sid == "seg_focus":
+            if getattr(self, "seg_panel", None) is not None:
+                self.seg_panel.view.set_dwell_ms(IX.dwell_ms(self.settings))
+        elif sid == "seg_model":
+            self._on_seg_model_changed()
 
     def _build_statusbar(self):
         """Persistent window footer: device (left), the active page's status/hint
@@ -613,16 +569,15 @@ class Window(Adw.ApplicationWindow):
 
     def _footer_context(self):
         page = self.stack.get_visible_child_name()
+        st = self.settings
         if page == "segment":
-            it = self.seg_model_row.get_selected_item()
-            model = it.get_string() if it is not None else ""
+            model = st.label("seg_model")
             mode = "Click" if self._seg_mode() == "point" else "Everything"
             return "Segment · %s · %s" % (mode, model) if model else "Segment · %s" % mode
         if page == "batch":
             return "Batch"
-        i = self.subject_row.get_selected()
-        name = (MODELS[self.model_row.get_selected()][0] if i >= len(SUBJECTS)
-                else SUBJECTS[i][0])
+        name = (st.label("model") if st.get("subject") == "custom"
+                else st.label("subject"))
         return "Single · %s" % name
 
     def _set_device(self, provider, label):
@@ -636,98 +591,31 @@ class Window(Adw.ApplicationWindow):
         self.device_dot.add_css_class(cls)
         self.device_dot.set_tooltip_text(label)
 
-    def _on_subject_changed(self, *_):
-        # The exact-model picker only appears for the "Custom model…" entry.
-        custom = self.subject_row.get_selected() >= len(SUBJECTS)
-        self.model_row.set_visible(custom)
-        self._mark_stale()
-        if getattr(self, "footer_context", None) is not None:
-            self._update_footer()
-
-    def _sync_color(self):
-        bg = BGS[self.bg_row.get_selected()][1]
-        self.color_row.set_sensitive(bg == "custom")
-        self.blur_row.set_visible(bg == "blur")
-        self._mark_stale()
-        self._seg_bg_changed()
-
     def _seg_bg_changed(self, *_):
         if getattr(self, "seg_panel", None) is not None and \
                 self.stack.get_visible_child_name() == "segment":
             self._update_seg_preview()
 
     def get_settings(self):
-        i = self.subject_row.get_selected()
-        if i >= len(SUBJECTS):                      # "Custom model…"
-            model = MODELS[self.model_row.get_selected()][1]
-        else:
-            model = SUBJECTS[i][1]
-        bg = BGS[self.bg_row.get_selected()][1]
-        if bg == "custom":
-            c = self.color_btn.get_rgba()
-            bg = "#%02x%02x%02x" % (round(c.red * 255), round(c.green * 255),
-                                    round(c.blue * 255))
-        return model, bg, self.alpha_row.get_active(), int(self.blur_row.get_value())
+        st = self.settings
+        return (IX.model_id(st), IX.background(st),
+                IX.alpha_matting(st), IX.blur_strength(st))
 
     # ---------- segmentation sidebar + page ----------
-    def _build_seg_group(self):
-        grp = Adw.PreferencesGroup(title="Segmentation")
-        self.seg_grp = grp
-        # Mode lives on the page as a segmented control (see _build_segment).
-
-        # Focus speed (visible): how long to hover before drilling to the part.
-        self.seg_focus_row = Adw.ComboRow(
-            title="Focus speed",
-            model=Gtk.StringList.new([f[0] for f in SEG_FOCUS]))
-        self.seg_focus_row.set_subtitle("Hover this long to focus a sub-object")
-        self.seg_focus_row.set_selected(1)     # Normal
-        self.seg_focus_row.connect("notify::selected", self._on_seg_focus_changed)
-        grp.add(self.seg_focus_row)
-
-        # Advanced (collapsed by default): model override + detail.
-        # (Device is shown once, in the sidebar footer — not duplicated here.)
-        self.seg_adv = Adw.ExpanderRow(title="Advanced",
-                                       subtitle="Model and detail")
-        self.seg_model_row = Adw.ComboRow(
-            title="Model", model=Gtk.StringList.new(["Auto"]))
-        self.seg_model_row.set_subtitle("Auto — by GPU / VRAM")
-        self.seg_model_row.connect("notify::selected", self._on_seg_model_changed)
-        self.seg_adv.add_row(self.seg_model_row)
-
-        self.seg_detail_row = Adw.ComboRow(
-            title="Detail", model=Gtk.StringList.new([d[0] for d in SEG_DETAIL]))
-        self.seg_detail_row.set_subtitle("Finer finds more, but is slower")
-        self.seg_detail_row.connect("notify::selected", lambda *_: None)
-        self.seg_adv.add_row(self.seg_detail_row)
-        grp.add(self.seg_adv)
-        grp.set_visible(False)
-        return grp
-
-    def _vram_str(self, mb):
-        if not mb:
-            return "CPU · low VRAM"
-        return ("~%.1f GB" % (mb / 1000)).replace(".0", "")
-
     def _apply_seg_models(self):
-        names = ["Auto — best for your GPU"]
-        for m in self._seg_models:
-            names.append("%s · %s" % (m["label"], self._vram_str(m.get("vram", 0))))
-        self._syncing_seg = True
-        self.seg_model_row.set_model(Gtk.StringList.new(names))
-        self.seg_model_row.set_selected(0)
-        self._syncing_seg = False
+        """The worker told us which SAM models this GPU can actually hold."""
+        self.settings.set_options("seg_model",
+                                  IX.seg_model_choices(self._seg_models))
+        self.sidebar.reload_options("seg_model")
 
     def _seg_model_choice(self):
-        i = self.seg_model_row.get_selected()
-        if i <= 0 or i > len(self._seg_models):
-            return "auto"
-        return self._seg_models[i - 1]["rung"]
+        return IX.seg_model(self.settings)
 
     def _seg_detail(self):
-        return SEG_DETAIL[self.seg_detail_row.get_selected()][1] or None
+        return IX.seg_detail(self.settings)
 
     def _seg_mode(self):
-        return self.seg_mode_toggle.get_active_name() or "everything"
+        return IX.seg_mode(self.settings)
 
     @staticmethod
     def _domain(page):
@@ -770,10 +658,11 @@ class Window(Adw.ApplicationWindow):
             self.worker.send({"op": "unload", "scope": scope})
 
     def _sync_sidebar_page(self):
-        seg = self.stack.get_visible_child_name() == "segment"
-        self.model_grp.set_visible(not seg)
-        self.seg_grp.set_visible(seg and self._seg_available)
-        self.alpha_row.set_visible(not seg)
+        # Which page is showing and whether the worker has SAM are the only two
+        # things the schema's visibility rules need from the app.
+        self.settings.set_context(page=self.stack.get_visible_child_name(),
+                                  seg_available=self._seg_available)
+        self.sidebar.sync()
 
     def _accel_save(self):
         p = self.stack.get_visible_child_name()
@@ -828,10 +717,13 @@ class Window(Adw.ApplicationWindow):
         page.append(bar)
 
         # Segmented Mode control (Apple-style), centered under the action bar.
+        # Page furniture, but the same catalogue: the modes are declared once,
+        # in the engine, and rendered here as a segmented control rather than a
+        # sidebar row (engine.settings.PAGE).
         self.seg_mode_toggle = Adw.ToggleGroup()
-        self.seg_mode_toggle.add(Adw.Toggle(name="everything", label="Everything"))
-        self.seg_mode_toggle.add(Adw.Toggle(name="point", label="Click to select"))
-        self.seg_mode_toggle.set_active_name("everything")
+        for c in self.settings.options("seg_mode"):
+            self.seg_mode_toggle.add(Adw.Toggle(name=c.value, label=c.label))
+        self.seg_mode_toggle.set_active_name(self.settings.get("seg_mode"))
         self.seg_mode_toggle.set_halign(Gtk.Align.CENTER)
         self.seg_mode_toggle.connect("notify::active-name", self._on_seg_mode_changed)
         page.append(self.seg_mode_toggle)
@@ -876,12 +768,7 @@ class Window(Adw.ApplicationWindow):
             self._hide_footer_progress()
 
     def _extract_bg(self):
-        bg = BGS[self.bg_row.get_selected()][1]
-        if bg == "custom":
-            c = self.color_btn.get_rgba()
-            bg = "#%02x%02x%02x" % (round(c.red * 255), round(c.green * 255),
-                                    round(c.blue * 255))
-        return bg, int(self.blur_row.get_value())
+        return IX.background(self.settings), IX.blur_strength(self.settings)
 
     def _ensure_seg_loaded(self, cb):
         if not self.source_path:
@@ -1068,6 +955,8 @@ class Window(Adw.ApplicationWindow):
         self.seg_status.set_text("Cancelling…")
 
     def _on_seg_mode_changed(self, *_):
+        self.settings.set("seg_mode",
+                          self.seg_mode_toggle.get_active_name() or "everything")
         mode = self._seg_mode()
         self.seg_panel.view.set_seg_mode(mode)
         self._seg_clear_overlays()
@@ -1087,11 +976,6 @@ class Window(Adw.ApplicationWindow):
         self.seg_loaded_for = None  # force re-encode with the new model
         self.seg_adv.set_subtitle("Reloads on next segment")
         self._update_footer()
-
-    def _on_seg_focus_changed(self, *_):
-        if getattr(self, "seg_panel", None) is None:
-            return
-        self.seg_panel.view.set_dwell_ms(SEG_FOCUS[self.seg_focus_row.get_selected()][1])
 
     # ---------- single page ----------
     def _build_single(self):

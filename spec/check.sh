@@ -31,6 +31,7 @@ run "pane / coords"           python tests/test_engine_pane.py
 run "hit-testing"             python tests/test_engine_hittest.py
 run "animation state machine" python tests/test_engine_anim.py
 run "interaction (events->effects)" python tests/test_engine_interaction.py
+run "settings / UiSchema"     python tests/test_engine_settings.py
 
 echo "── renderer ────────────────────────────────"
 run "render goldens (22)"     python spec/tools/rasterize.py --check
