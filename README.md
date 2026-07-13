@@ -6,7 +6,8 @@
 
 A local image background remover *and object segmenter* with a GTK interface. It
 runs [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) and other
-[rembg](https://github.com/danielgatis/rembg) models for **background removal**, or,
+[rembg](https://github.com/danielgatis/rembg) models for **background removal**
+(stills, animated GIFs, or a whole folder), or,
 Meta's [Segment Anything](https://github.com/facebookresearch/sam2) (SAM 2.1) for **image segmentation**, through ONNX Runtime, with GPU acceleration on NVIDIA (CUDA) and AMD (ROCm), and
 a CPU fallback.
 
@@ -17,7 +18,7 @@ Everything runs on your machine. No images are uploaded.
 <td width="50%" align="center" valign="top">
 <img src="media/single.png" alt="Background removal" width="100%">
 <br><b>Background removal</b>
-<br><sub>Cuts the subject out of its background, one image or a whole folder, using <a href="https://github.com/ZhengPeng7/BiRefNet">BiRefNet</a>.</sub>
+<br><sub>Cuts the subject out of its background — a still, an animated GIF, or a whole folder — using <a href="https://github.com/ZhengPeng7/BiRefNet">BiRefNet</a>.</sub>
 </td>
 <td width="50%" align="center" valign="top">
 <img src="media/segment.png" alt="Object segmentation" width="100%">
@@ -29,7 +30,10 @@ Everything runs on your machine. No images are uploaded.
 
 ## Features
 
-- Single-image and batch background removal.
+- Single-image, animated GIF, and batch background removal.
+- **Animated GIFs:** open one like any other image. Every frame is processed with
+  the model kept loaded, progress is reported per frame, and the frames are
+  rebuilt into an animated GIF. Source and result panels play it back.
 - **Object segmentation (Segment page):** "Segment everything" turns the image
   into colour-tinted layers — click objects to keep them (the rest dim out) and
   Extract; or switch to "Click to select" to point at one object (Ctrl-click or
@@ -37,13 +41,14 @@ Everything runs on your machine. No images are uploaded.
   removal.
 - **VRAM-aware model selection:** the SAM model is chosen automatically from your
   GPU and free VRAM (SAM 2.1 large/base+/small/tiny, or MobileSAM on CPU),
-  stepping down on out-of-memory or failure. Override it manually, and **Cancel**
-  a slow run at any time.
+  stepping down on out-of-memory or failure. Override it manually.
+- **Cancel** any run — single, GIF, batch or segmentation.
+- A status bar shows the active device, the current step, and progress.
 - Interactive source and result panels: zoom, pan, rotate, flip, reset — per side.
 - Drag and drop.
 - Output: transparent, blurred background, or solid colour (white, black, green
   screen, custom).
-- Subject presets (general, person, anime) plus an advanced model picker.
+- Subject presets (general, person, anime, fast) plus an advanced model picker.
 - Optional alpha matting for cleaner edges.
 - Can be installed **segmentation-only**, without the background-removal
   dependency (see below).
@@ -104,24 +109,35 @@ The GPU builds are larger. If unsure, use the CPU build or install from source.
 - **Single:** open or drop an image, choose settings, click **Generate**, then
   **Save result**. Right-click either panel (or use the toolbar icons) to rotate,
   flip, reset the view, or zoom to actual size. Scroll to zoom, drag to pan.
+- **Animated GIF:** open one on the Single page and press **Generate** — nothing
+  else changes. The status bar counts the frames as they are processed, **Cancel**
+  stops between frames, and **Save result** writes an animated GIF. Note that GIF
+  only supports on/off transparency, so a transparent background gives hard edges;
+  choose a solid colour or blur to avoid that.
 - **Batch:** choose an input folder and an output folder, set a rename pattern
   (`{name}` = original filename, `{n}` = index), and click **Run batch**. Output
   is PNG.
 - **Segment:** open an image and pick a **Mode** in the sidebar. In *Everything*,
   click **Segment everything** to detect objects as tinted layers, click the ones
-  to keep (the rest dim), then **Extract selection**. In *Click to select*, click
-  an object to select it (Ctrl-click or right-click to subtract), then **Extract**.
-  The chosen SAM model and device are shown in the sidebar; **Cancel** stops a
-  slow run. Extract uses the same background options as background removal.
+  to keep (the rest dim), then **Extract selection**. Hovering highlights the whole
+  object; keep hovering to focus the part under the cursor (**Focus speed** sets how
+  long that takes). In *Click to select*, click an object to select it (Ctrl-click
+  or right-click to subtract), then **Extract**. **Cancel** stops a slow run.
+  Extract uses the same background options as background removal.
 
 ## GPU support
 
 The worker picks the first available ONNX Runtime provider: CUDA (NVIDIA),
-ROCm/MIGraphX (AMD), then CPU. The active device is shown in the sidebar.
+ROCm/MIGraphX (AMD), then CPU. The active device is shown in the status bar.
 
 - NVIDIA: `install.sh` installs `onnxruntime-gpu` and the required CUDA runtime.
 - AMD: `install.sh` installs the CPU runtime and attempts `onnxruntime-rocm`. For
   ROCm acceleration you may need to install a wheel matching your ROCm version.
+
+If the GPU cannot run a model — usually not enough free VRAM — that image falls
+back to the CPU (slower) instead of failing, and the GPU is used again once VRAM
+frees up. Models are released when you leave their page, so background removal and
+segmentation do not hold memory at the same time.
 
 ## Credits
 
