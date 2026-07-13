@@ -20,7 +20,7 @@ gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("Adw", "1")
 from gi.repository import Gtk, Gdk, GdkPixbuf, Gio, GLib, Adw  # noqa: E402
 
-from viewer import ImageView  # noqa: E402
+from shell_gtk.canvas import ImageView  # noqa: E402
 
 APP_ID = "io.github.cristeigabriela.BgBeGone"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))

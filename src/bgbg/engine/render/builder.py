@@ -182,6 +182,11 @@ def _seg(sc, anim, now, rect, view_scale):
     """The segmentation overlay, in draw order."""
     sel, hover = sc.selected, sc.hover_id
     gen, spec = sc.hover_gen, sc.hover_spec
+    # Paint the selection in id order. `sel` is a set, and a set's iteration
+    # order is its hash order in Python but its insertion order in JS — so
+    # relying on it would make the two cores emit ops in different orders for
+    # the same scene. `sel` stays the set, for O(1) membership.
+    sel_order = sorted(sel)
     # Over a stack, light up the whole (general) and the part (specific) as
     # distinct colour layers rather than one flat highlight.
     layered = (sc.hover_depth >= 2 and gen and spec and gen != spec
@@ -201,11 +206,11 @@ def _seg(sc, anim, now, rect, view_scale):
 
     # 2. dim everything outside the selection
     if sc.masks and sel:
-        out.append(_dim_outside([sc.masks[o] for o in sel], rect, 0.55))
+        out.append(_dim_outside([sc.masks[o] for o in sel_order], rect, 0.55))
 
     # 3. selected objects — glow + fill + ants, with a tactile "pop"
     iw, ih = sc.image_size
-    for oid in sel:
+    for oid in sel_order:
         mask, col = sc.masks.get(oid), sc.colors.get(oid)
         if mask is None or col is None:
             continue

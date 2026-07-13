@@ -29,7 +29,6 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk  # noqa: E402
 
 import rasterize as R  # noqa: E402
-from engine.render.builder import build  # noqa: E402
 from engine.render.codec import to_json, from_json, encode  # noqa: E402
 
 GOLDENS = os.path.join(SPEC, "goldens", "display_list")
@@ -37,8 +36,8 @@ GOLDENS = os.path.join(SPEC, "goldens", "display_list")
 
 def build_for(fx, meta, objs, maps):
     v = R.build_view(fx, meta, objs, maps)
-    pane = v._sync_pane()
-    return build(v._scene(), pane, v.anim, v._now())
+    v._sync()                      # feed the engine the (faked) widget size
+    return v.session.display_list()
 
 
 def main():

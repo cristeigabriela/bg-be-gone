@@ -24,7 +24,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gtk, GLib, GdkPixbuf  # noqa: E402
 
-from viewer import ImageView  # noqa: E402
+from shell_gtk.canvas import ImageView  # noqa: E402
 
 SCENE = os.path.join(ROOT, "spec", "assets", "scene")
 R = {}
@@ -43,9 +43,8 @@ def load_scene(v):
         o = dict(o)
         o["mask"] = os.path.join(SCENE, o["mask"])
         objs.append(o)
-    v.pixbuf = GdkPixbuf.Pixbuf.new_from_file(
-        os.path.join(SCENE, meta["source"]))
-    v._texture = None
+    v.set_pixbuf(GdkPixbuf.Pixbuf.new_from_file(
+        os.path.join(SCENE, meta["source"])))
     v.set_seg_mode("everything")
     v.set_seg_layers(objs,
                      os.path.join(SCENE, meta["maps"]["label"]),
@@ -73,6 +72,8 @@ def main():
     def to_view(ix, iy):
         return v.image_to_widget(ix, iy)
 
+    obj = v.session.objects            # the engine holds the hover/focus state
+
     def phase1():
         # the tick must be RUNNING (set_seg_layers began a reveal)
         R["tick_running_after_layers"] = v._anim_tick is not None
@@ -81,9 +82,9 @@ def main():
         wx, wy = to_view(*NESTED)
         v._on_leave = lambda *a: None    # don't let a phantom leave cancel the dwell
         v._on_motion(None, wx, wy)
-        R["hover_general_first"] = (v._hover_gen == 1 and v._seg_hover_id == 1
-                                    and v._hover_spec == 3)
-        R["depth_seen"] = v._hover_depth
+        R["hover_general_first"] = (obj.hover_gen == 1 and obj.hover_id == 1
+                                    and obj.hover_spec == 3)
+        R["depth_seen"] = obj.hover_depth
         R["dwell_armed"] = v.anim.dwell_t0 is not None
         GLib.timeout_add(500, phase2)    # > dwell_ms
         return False
@@ -91,8 +92,8 @@ def main():
     def phase2():
         # the tick should have drilled general -> specific by now
         R["drilled"] = v.anim.drilled
-        R["focus_is_specific"] = (v._seg_hover_id == 3)
-        R["morph_ran"] = True            # _focus began a morph; it may already be done
+        R["focus_is_specific"] = (obj.hover_id == 3)
+        R["morph_ran"] = True            # focus() began a morph; it may be done
 
         wx, wy = to_view(*NESTED)
         v._on_primary_pressed(FakeGesture(), 1, wx, wy)
@@ -107,7 +108,7 @@ def main():
         R["press_retired"] = not v.anim.pressing
         # now make it fully idle and check the tick shuts itself down
         v._on_leave(None)
-        v._seg_hover_id = 0
+        obj.hover_id = 0
         v.set_seg_selection([])
         v.anim.cancel_dwell()
         v.set_scanning(False)

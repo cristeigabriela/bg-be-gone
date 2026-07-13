@@ -58,6 +58,17 @@ def main():
         a = engine.AnimState()
         a.advance(0)
         assert not a.needs_tick()
+        assert engine.parse_color("#51e5ff")[2] == 1.0
+
+        # the whole interactive surface, not just the maths: a session must feed
+        # events and hand back effects with no GTK anywhere in sight
+        s = engine.EngineSession()
+        s.resize(200, 200)
+        s.set_image("src", (100, 100))
+        s.drain_effects()
+        assert s.feed(engine.events.PointerEnter(10, 10)) == [
+            engine.effects.GrabFocus()]
+        assert s.display_list().ops           # it can build a frame
         assert engine.PROTOCOL_VERSION >= 1
     finally:
         sys.meta_path.pop(0)

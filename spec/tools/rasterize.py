@@ -37,7 +37,7 @@ FIXTURES = os.path.join(SPEC, "fixtures")
 GOLDENS = os.path.join(SPEC, "goldens", "render")
 
 sys.path.insert(0, os.path.join(ROOT, "src", "bgbg"))
-from viewer import ImageView  # noqa: E402
+from shell_gtk.canvas import ImageView  # noqa: E402
 
 
 def _ms_ago(ms):
@@ -58,16 +58,22 @@ def load_scene():
 
 
 def build_view(fx, meta, objs, maps):
-    """An ImageView with the scene loaded and the fixture's state applied."""
+    """An ImageView with the scene loaded and the fixture's state applied.
+
+    The widget is still the thing under test — it is what ships — but all the
+    state now lives in the engine session behind it, so that is what a fixture
+    addresses.
+    """
     v = ImageView()
     vw, vh = fx["view"]
     v.get_width = lambda: vw          # offscreen: no allocation
     v.get_height = lambda: vh
-    v._now = lambda: 0                # pin the clock: fixtures state ages as
+    v.session.clock = lambda: 0       # pin the clock: fixtures state ages as
     #                                   negative µs relative to "now"
+    anim, objects = v.session.anim, v.session.objects
 
-    v.pixbuf = GdkPixbuf.Pixbuf.new_from_file(os.path.join(SCENE, meta["source"]))
-    v._texture = None
+    v.set_pixbuf(GdkPixbuf.Pixbuf.new_from_file(
+        os.path.join(SCENE, meta["source"])))
 
     mode = fx.get("seg_mode")
     if mode:
@@ -83,43 +89,45 @@ def build_view(fx, meta, objs, maps):
     v.fv = bool(p.get("fv", False))
 
     a = fx.get("anim", {})
-    v._pulse = float(a.get("pulse", 0.5))
-    v._ant = float(a.get("ant", 0.0))
-    v._scan_phase = float(a.get("scan_phase", 0.0))
-    v._reveal = float(a.get("reveal", 1.0))     # set_seg_layers begins a reveal
-    v._reveal_t0 = None
-    v._scanning = bool(fx.get("scanning", False))
+    anim.pulse = float(a.get("pulse", 0.5))
+    anim.ant = float(a.get("ant", 0.0))
+    anim.scan_phase = float(a.get("scan_phase", 0.0))
+    anim.reveal = float(a.get("reveal", 1.0))   # set_seg_layers begins a reveal
+    anim.reveal_t0 = None
+    anim.scanning = bool(fx.get("scanning", False))
 
     v.set_seg_selection(fx.get("selected", []))
 
     h = fx.get("hover")
     if h:
-        v._hover_gen = int(h.get("gen", 0))
-        v._hover_spec = int(h.get("spec", 0))
-        v._hover_depth = int(h.get("depth", 0))
-        v._hover_drilled = bool(h.get("drilled", False))
-        v._seg_hover_id = v._hover_spec if v._hover_drilled else v._hover_gen
+        objects.hover_gen = int(h.get("gen", 0))
+        objects.hover_spec = int(h.get("spec", 0))
+        objects.hover_depth = int(h.get("depth", 0))
+        anim.drilled = bool(h.get("drilled", False))
+        objects.hover_id = (objects.hover_spec if anim.drilled
+                            else objects.hover_gen)
 
     for oid, ms in (fx.get("pop") or {}).items():
-        v._pop[int(oid)] = _ms_ago(ms)
+        anim.pop[int(oid)] = _ms_ago(ms)
 
     pr = fx.get("press")
     if pr:
-        v._press_obj = int(pr["obj"])
-        v._press_pt = tuple(pr["pt"])
-        v._press_t0 = _ms_ago(pr["press_ms_ago"])
-        v._release_t0 = _ms_ago(pr.get("release_ms_ago"))
+        anim.press_obj = int(pr["obj"])
+        anim.press_pt = tuple(pr["pt"])
+        anim.press_t0 = _ms_ago(pr["press_ms_ago"])
+        anim.release_t0 = _ms_ago(pr.get("release_ms_ago"))
 
     mo = fx.get("morph")
     if mo:
-        v._begin_morph(int(mo["from"]), int(mo["to"]))   # builds rings/colours
-        v._morph_t0 = _ms_ago(mo["ms_ago"])
+        # the rings/colours the tween interpolates between
+        objects.morph = objects.build_morph(int(mo["from"]), int(mo["to"]))
+        anim.morph_t0 = _ms_ago(mo["ms_ago"])
 
     pm = fx.get("point_mask")
     if pm:
         obj = next(o for o in objs if o["id"] == pm)
         v.set_point_mask(obj["mask"], obj["contour"])
-        v._reveal = float(a.get("reveal", 1.0))
+        anim.reveal = float(a.get("reveal", 1.0))
     return v
 
 

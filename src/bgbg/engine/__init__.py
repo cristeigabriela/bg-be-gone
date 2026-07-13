@@ -12,8 +12,13 @@ from .geometry import (          # noqa: F401
     MIN_ZOOM, MAX_ZOOM, clamp, lerp, ease_out, ease_out_back,
     polygon_area_abs, resample_closed, align_ring,
 )
-from .pane import Pane                            # noqa: F401
-from .hittest import PixelMap, HitMaps, Hit       # noqa: F401
-from .anim import AnimState, Tick, Press          # noqa: F401
+from .color import parse_color                     # noqa: F401
+from .pane import Pane                             # noqa: F401
+from .hittest import PixelMap, HitMaps, Hit        # noqa: F401
+from .anim import AnimState, Tick, Press           # noqa: F401
+from .objects import ObjectStore                   # noqa: F401
+from .interaction import Interaction               # noqa: F401
+from .session import EngineSession, CursorInfo     # noqa: F401
+from . import effects, events                      # noqa: F401
 
 PROTOCOL_VERSION = 1

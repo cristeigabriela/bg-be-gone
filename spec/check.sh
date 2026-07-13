@@ -30,14 +30,16 @@ run "stdlib-only import"      python tests/test_engine_stdlib_only.py
 run "pane / coords"           python tests/test_engine_pane.py
 run "hit-testing"             python tests/test_engine_hittest.py
 run "animation state machine" python tests/test_engine_anim.py
+run "interaction (events->effects)" python tests/test_engine_interaction.py
 
 echo "── renderer ────────────────────────────────"
 run "render goldens (22)"     python spec/tools/rasterize.py --check
 run "display-list goldens"    python spec/tools/displaylist.py --check
 run "mask union (regression)" python tests/test_mask_union.py
 
-echo "── live (real GTK frame clock) ─────────────"
+echo "── live (real GTK window) ──────────────────"
 run "tick / dwell / press"    timeout 60 python tests/test_live_tick.py
+run "app seam (hover/click/sidebar)" timeout 60 python tests/test_live_app_segment.py
 
 echo
 if [ "$fail" -eq 0 ]; then

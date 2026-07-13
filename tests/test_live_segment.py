@@ -83,8 +83,10 @@ def tick():
         from PIL import Image as _I  # only to inspect; the shell never needs PIL
         modes = {_I.open(o["mask"]).mode for o in w.seg_objects}
         R["mask_modes"] = sorted(modes)
-        # textures loaded into the view
-        R["textures_loaded"] = len(w.seg_panel.view._seg_masks) == len(w.seg_objects)
+        # textures loaded into the shell, objects into the engine
+        R["textures_loaded"] = (
+            len(w.seg_panel.view.textures.masks) == len(w.seg_objects)
+            and len(w.seg_panel.view.session.objects.masks) == len(w.seg_objects))
         # select two objects -> exercises the mask UNION path end to end
         ids = [o["id"] for o in w.seg_objects][:2]
         R["selected"] = ids
