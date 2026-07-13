@@ -35,6 +35,7 @@ run "interaction (events->effects)" python tests/test_engine_interaction.py
 echo "── renderer ────────────────────────────────"
 run "render goldens (22)"     python spec/tools/rasterize.py --check
 run "display-list goldens"    python spec/tools/displaylist.py --check
+run "sidebar (row-for-row)"   timeout 60 python spec/tools/uidump.py --check
 run "mask union (regression)" python tests/test_mask_union.py
 
 echo "── live (real GTK window) ──────────────────"

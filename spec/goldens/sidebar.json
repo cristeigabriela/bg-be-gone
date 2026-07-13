@@ -1,0 +1,1073 @@
+[
+ {
+  "sidebar": [
+   {
+    "group": "Model",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "General (objects, scenes)",
+       "Person / portrait",
+       "Anime / illustration",
+       "Fast (lower quality)",
+       "Custom model\u2026"
+      ],
+      "selected": 0,
+      "subtitle": "What the image mainly contains",
+      "title": "Subject"
+     },
+     {
+      "kind": "ComboRow",
+      "options": [
+       "BiRefNet \u2014 General",
+       "BiRefNet \u2014 General Lite",
+       "BiRefNet \u2014 Massive",
+       "BiRefNet \u2014 Portrait",
+       "BiRefNet \u2014 HRSOD",
+       "BiRefNet \u2014 DIS",
+       "ISNet \u2014 General",
+       "ISNet \u2014 Anime",
+       "U2Net",
+       "U2Net \u2014 Human Seg",
+       "Silueta"
+      ],
+      "selected": 0,
+      "subtitle": "Exact rembg model",
+      "title": "Model",
+      "visible": false
+     }
+    ]
+   },
+   {
+    "group": "Segmentation",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "Quick",
+       "Normal",
+       "Relaxed"
+      ],
+      "selected": 1,
+      "subtitle": "Hover this long to focus a sub-object",
+      "title": "Focus speed"
+     },
+     {
+      "kind": "ExpanderRow",
+      "rows": [
+       {
+        "kind": "ActionRow",
+        "subtitle": "Model and detail",
+        "title": "Advanced"
+       },
+       {
+        "kind": "ComboRow",
+        "options": [
+         "Auto"
+        ],
+        "selected": 0,
+        "subtitle": "Auto \u2014 by GPU / VRAM",
+        "title": "Model"
+       },
+       {
+        "kind": "ComboRow",
+        "options": [
+         "Auto",
+         "Fast",
+         "Balanced",
+         "Fine",
+         "Maximum"
+        ],
+        "selected": 0,
+        "subtitle": "Finer finds more, but is slower",
+        "title": "Detail"
+       }
+      ],
+      "subtitle": "Model and detail",
+      "title": "Advanced"
+     }
+    ],
+    "visible": false
+   },
+   {
+    "group": "Output",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "Transparent",
+       "Blur background",
+       "White",
+       "Black",
+       "Green screen",
+       "Custom\u2026"
+      ],
+      "selected": 0,
+      "title": "Background"
+     },
+     {
+      "kind": "ActionRow",
+      "sensitive": false,
+      "title": "Custom colour"
+     },
+     {
+      "kind": "SpinRow",
+      "range": [
+       2.0,
+       80.0
+      ],
+      "title": "Blur strength",
+      "value": 20.0,
+      "visible": false
+     },
+     {
+      "active": false,
+      "kind": "SwitchRow",
+      "subtitle": "Cleaner edges, a little slower",
+      "title": "Alpha matting"
+     }
+    ]
+   }
+  ],
+  "state": "single/defaults"
+ },
+ {
+  "sidebar": [
+   {
+    "group": "Model",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "General (objects, scenes)",
+       "Person / portrait",
+       "Anime / illustration",
+       "Fast (lower quality)",
+       "Custom model\u2026"
+      ],
+      "selected": 4,
+      "subtitle": "What the image mainly contains",
+      "title": "Subject"
+     },
+     {
+      "kind": "ComboRow",
+      "options": [
+       "BiRefNet \u2014 General",
+       "BiRefNet \u2014 General Lite",
+       "BiRefNet \u2014 Massive",
+       "BiRefNet \u2014 Portrait",
+       "BiRefNet \u2014 HRSOD",
+       "BiRefNet \u2014 DIS",
+       "ISNet \u2014 General",
+       "ISNet \u2014 Anime",
+       "U2Net",
+       "U2Net \u2014 Human Seg",
+       "Silueta"
+      ],
+      "selected": 0,
+      "subtitle": "Exact rembg model",
+      "title": "Model"
+     }
+    ]
+   },
+   {
+    "group": "Segmentation",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "Quick",
+       "Normal",
+       "Relaxed"
+      ],
+      "selected": 1,
+      "subtitle": "Hover this long to focus a sub-object",
+      "title": "Focus speed"
+     },
+     {
+      "kind": "ExpanderRow",
+      "rows": [
+       {
+        "kind": "ActionRow",
+        "subtitle": "Model and detail",
+        "title": "Advanced"
+       },
+       {
+        "kind": "ComboRow",
+        "options": [
+         "Auto"
+        ],
+        "selected": 0,
+        "subtitle": "Auto \u2014 by GPU / VRAM",
+        "title": "Model"
+       },
+       {
+        "kind": "ComboRow",
+        "options": [
+         "Auto",
+         "Fast",
+         "Balanced",
+         "Fine",
+         "Maximum"
+        ],
+        "selected": 0,
+        "subtitle": "Finer finds more, but is slower",
+        "title": "Detail"
+       }
+      ],
+      "subtitle": "Model and detail",
+      "title": "Advanced"
+     }
+    ],
+    "visible": false
+   },
+   {
+    "group": "Output",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "Transparent",
+       "Blur background",
+       "White",
+       "Black",
+       "Green screen",
+       "Custom\u2026"
+      ],
+      "selected": 0,
+      "title": "Background"
+     },
+     {
+      "kind": "ActionRow",
+      "sensitive": false,
+      "title": "Custom colour"
+     },
+     {
+      "kind": "SpinRow",
+      "range": [
+       2.0,
+       80.0
+      ],
+      "title": "Blur strength",
+      "value": 20.0,
+      "visible": false
+     },
+     {
+      "active": false,
+      "kind": "SwitchRow",
+      "subtitle": "Cleaner edges, a little slower",
+      "title": "Alpha matting"
+     }
+    ]
+   }
+  ],
+  "state": "single/subject=custom-model"
+ },
+ {
+  "sidebar": [
+   {
+    "group": "Model",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "General (objects, scenes)",
+       "Person / portrait",
+       "Anime / illustration",
+       "Fast (lower quality)",
+       "Custom model\u2026"
+      ],
+      "selected": 0,
+      "subtitle": "What the image mainly contains",
+      "title": "Subject"
+     },
+     {
+      "kind": "ComboRow",
+      "options": [
+       "BiRefNet \u2014 General",
+       "BiRefNet \u2014 General Lite",
+       "BiRefNet \u2014 Massive",
+       "BiRefNet \u2014 Portrait",
+       "BiRefNet \u2014 HRSOD",
+       "BiRefNet \u2014 DIS",
+       "ISNet \u2014 General",
+       "ISNet \u2014 Anime",
+       "U2Net",
+       "U2Net \u2014 Human Seg",
+       "Silueta"
+      ],
+      "selected": 0,
+      "subtitle": "Exact rembg model",
+      "title": "Model",
+      "visible": false
+     }
+    ]
+   },
+   {
+    "group": "Segmentation",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "Quick",
+       "Normal",
+       "Relaxed"
+      ],
+      "selected": 1,
+      "subtitle": "Hover this long to focus a sub-object",
+      "title": "Focus speed"
+     },
+     {
+      "kind": "ExpanderRow",
+      "rows": [
+       {
+        "kind": "ActionRow",
+        "subtitle": "Model and detail",
+        "title": "Advanced"
+       },
+       {
+        "kind": "ComboRow",
+        "options": [
+         "Auto"
+        ],
+        "selected": 0,
+        "subtitle": "Auto \u2014 by GPU / VRAM",
+        "title": "Model"
+       },
+       {
+        "kind": "ComboRow",
+        "options": [
+         "Auto",
+         "Fast",
+         "Balanced",
+         "Fine",
+         "Maximum"
+        ],
+        "selected": 0,
+        "subtitle": "Finer finds more, but is slower",
+        "title": "Detail"
+       }
+      ],
+      "subtitle": "Model and detail",
+      "title": "Advanced"
+     }
+    ],
+    "visible": false
+   },
+   {
+    "group": "Output",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "Transparent",
+       "Blur background",
+       "White",
+       "Black",
+       "Green screen",
+       "Custom\u2026"
+      ],
+      "selected": 1,
+      "title": "Background"
+     },
+     {
+      "kind": "ActionRow",
+      "sensitive": false,
+      "title": "Custom colour"
+     },
+     {
+      "kind": "SpinRow",
+      "range": [
+       2.0,
+       80.0
+      ],
+      "title": "Blur strength",
+      "value": 20.0
+     },
+     {
+      "active": false,
+      "kind": "SwitchRow",
+      "subtitle": "Cleaner edges, a little slower",
+      "title": "Alpha matting"
+     }
+    ]
+   }
+  ],
+  "state": "single/bg=blur"
+ },
+ {
+  "sidebar": [
+   {
+    "group": "Model",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "General (objects, scenes)",
+       "Person / portrait",
+       "Anime / illustration",
+       "Fast (lower quality)",
+       "Custom model\u2026"
+      ],
+      "selected": 0,
+      "subtitle": "What the image mainly contains",
+      "title": "Subject"
+     },
+     {
+      "kind": "ComboRow",
+      "options": [
+       "BiRefNet \u2014 General",
+       "BiRefNet \u2014 General Lite",
+       "BiRefNet \u2014 Massive",
+       "BiRefNet \u2014 Portrait",
+       "BiRefNet \u2014 HRSOD",
+       "BiRefNet \u2014 DIS",
+       "ISNet \u2014 General",
+       "ISNet \u2014 Anime",
+       "U2Net",
+       "U2Net \u2014 Human Seg",
+       "Silueta"
+      ],
+      "selected": 0,
+      "subtitle": "Exact rembg model",
+      "title": "Model",
+      "visible": false
+     }
+    ]
+   },
+   {
+    "group": "Segmentation",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "Quick",
+       "Normal",
+       "Relaxed"
+      ],
+      "selected": 1,
+      "subtitle": "Hover this long to focus a sub-object",
+      "title": "Focus speed"
+     },
+     {
+      "kind": "ExpanderRow",
+      "rows": [
+       {
+        "kind": "ActionRow",
+        "subtitle": "Model and detail",
+        "title": "Advanced"
+       },
+       {
+        "kind": "ComboRow",
+        "options": [
+         "Auto"
+        ],
+        "selected": 0,
+        "subtitle": "Auto \u2014 by GPU / VRAM",
+        "title": "Model"
+       },
+       {
+        "kind": "ComboRow",
+        "options": [
+         "Auto",
+         "Fast",
+         "Balanced",
+         "Fine",
+         "Maximum"
+        ],
+        "selected": 0,
+        "subtitle": "Finer finds more, but is slower",
+        "title": "Detail"
+       }
+      ],
+      "subtitle": "Model and detail",
+      "title": "Advanced"
+     }
+    ],
+    "visible": false
+   },
+   {
+    "group": "Output",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "Transparent",
+       "Blur background",
+       "White",
+       "Black",
+       "Green screen",
+       "Custom\u2026"
+      ],
+      "selected": 5,
+      "title": "Background"
+     },
+     {
+      "kind": "ActionRow",
+      "title": "Custom colour"
+     },
+     {
+      "kind": "SpinRow",
+      "range": [
+       2.0,
+       80.0
+      ],
+      "title": "Blur strength",
+      "value": 20.0,
+      "visible": false
+     },
+     {
+      "active": false,
+      "kind": "SwitchRow",
+      "subtitle": "Cleaner edges, a little slower",
+      "title": "Alpha matting"
+     }
+    ]
+   }
+  ],
+  "state": "single/bg=custom"
+ },
+ {
+  "sidebar": [
+   {
+    "group": "Model",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "General (objects, scenes)",
+       "Person / portrait",
+       "Anime / illustration",
+       "Fast (lower quality)",
+       "Custom model\u2026"
+      ],
+      "selected": 0,
+      "subtitle": "What the image mainly contains",
+      "title": "Subject"
+     },
+     {
+      "kind": "ComboRow",
+      "options": [
+       "BiRefNet \u2014 General",
+       "BiRefNet \u2014 General Lite",
+       "BiRefNet \u2014 Massive",
+       "BiRefNet \u2014 Portrait",
+       "BiRefNet \u2014 HRSOD",
+       "BiRefNet \u2014 DIS",
+       "ISNet \u2014 General",
+       "ISNet \u2014 Anime",
+       "U2Net",
+       "U2Net \u2014 Human Seg",
+       "Silueta"
+      ],
+      "selected": 0,
+      "subtitle": "Exact rembg model",
+      "title": "Model",
+      "visible": false
+     }
+    ],
+    "visible": false
+   },
+   {
+    "group": "Segmentation",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "Quick",
+       "Normal",
+       "Relaxed"
+      ],
+      "selected": 1,
+      "subtitle": "Hover this long to focus a sub-object",
+      "title": "Focus speed"
+     },
+     {
+      "kind": "ExpanderRow",
+      "rows": [
+       {
+        "kind": "ActionRow",
+        "subtitle": "Model and detail",
+        "title": "Advanced"
+       },
+       {
+        "kind": "ComboRow",
+        "options": [
+         "Auto"
+        ],
+        "selected": 0,
+        "subtitle": "Auto \u2014 by GPU / VRAM",
+        "title": "Model"
+       },
+       {
+        "kind": "ComboRow",
+        "options": [
+         "Auto",
+         "Fast",
+         "Balanced",
+         "Fine",
+         "Maximum"
+        ],
+        "selected": 0,
+        "subtitle": "Finer finds more, but is slower",
+        "title": "Detail"
+       }
+      ],
+      "subtitle": "Model and detail",
+      "title": "Advanced"
+     }
+    ],
+    "visible": false
+   },
+   {
+    "group": "Output",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "Transparent",
+       "Blur background",
+       "White",
+       "Black",
+       "Green screen",
+       "Custom\u2026"
+      ],
+      "selected": 0,
+      "title": "Background"
+     },
+     {
+      "kind": "ActionRow",
+      "sensitive": false,
+      "title": "Custom colour"
+     },
+     {
+      "kind": "SpinRow",
+      "range": [
+       2.0,
+       80.0
+      ],
+      "title": "Blur strength",
+      "value": 20.0,
+      "visible": false
+     },
+     {
+      "active": false,
+      "kind": "SwitchRow",
+      "subtitle": "Cleaner edges, a little slower",
+      "title": "Alpha matting",
+      "visible": false
+     }
+    ]
+   }
+  ],
+  "state": "segment/seg-unavailable"
+ },
+ {
+  "sidebar": [
+   {
+    "group": "Model",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "General (objects, scenes)",
+       "Person / portrait",
+       "Anime / illustration",
+       "Fast (lower quality)",
+       "Custom model\u2026"
+      ],
+      "selected": 0,
+      "subtitle": "What the image mainly contains",
+      "title": "Subject"
+     },
+     {
+      "kind": "ComboRow",
+      "options": [
+       "BiRefNet \u2014 General",
+       "BiRefNet \u2014 General Lite",
+       "BiRefNet \u2014 Massive",
+       "BiRefNet \u2014 Portrait",
+       "BiRefNet \u2014 HRSOD",
+       "BiRefNet \u2014 DIS",
+       "ISNet \u2014 General",
+       "ISNet \u2014 Anime",
+       "U2Net",
+       "U2Net \u2014 Human Seg",
+       "Silueta"
+      ],
+      "selected": 0,
+      "subtitle": "Exact rembg model",
+      "title": "Model",
+      "visible": false
+     }
+    ],
+    "visible": false
+   },
+   {
+    "group": "Segmentation",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "Quick",
+       "Normal",
+       "Relaxed"
+      ],
+      "selected": 1,
+      "subtitle": "Hover this long to focus a sub-object",
+      "title": "Focus speed"
+     },
+     {
+      "kind": "ExpanderRow",
+      "rows": [
+       {
+        "kind": "ActionRow",
+        "subtitle": "Model and detail",
+        "title": "Advanced"
+       },
+       {
+        "kind": "ComboRow",
+        "options": [
+         "Auto"
+        ],
+        "selected": 0,
+        "subtitle": "Auto \u2014 by GPU / VRAM",
+        "title": "Model"
+       },
+       {
+        "kind": "ComboRow",
+        "options": [
+         "Auto",
+         "Fast",
+         "Balanced",
+         "Fine",
+         "Maximum"
+        ],
+        "selected": 0,
+        "subtitle": "Finer finds more, but is slower",
+        "title": "Detail"
+       }
+      ],
+      "subtitle": "Model and detail",
+      "title": "Advanced"
+     }
+    ]
+   },
+   {
+    "group": "Output",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "Transparent",
+       "Blur background",
+       "White",
+       "Black",
+       "Green screen",
+       "Custom\u2026"
+      ],
+      "selected": 0,
+      "title": "Background"
+     },
+     {
+      "kind": "ActionRow",
+      "sensitive": false,
+      "title": "Custom colour"
+     },
+     {
+      "kind": "SpinRow",
+      "range": [
+       2.0,
+       80.0
+      ],
+      "title": "Blur strength",
+      "value": 20.0,
+      "visible": false
+     },
+     {
+      "active": false,
+      "kind": "SwitchRow",
+      "subtitle": "Cleaner edges, a little slower",
+      "title": "Alpha matting",
+      "visible": false
+     }
+    ]
+   }
+  ],
+  "state": "segment/available"
+ },
+ {
+  "sidebar": [
+   {
+    "group": "Model",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "General (objects, scenes)",
+       "Person / portrait",
+       "Anime / illustration",
+       "Fast (lower quality)",
+       "Custom model\u2026"
+      ],
+      "selected": 0,
+      "subtitle": "What the image mainly contains",
+      "title": "Subject"
+     },
+     {
+      "kind": "ComboRow",
+      "options": [
+       "BiRefNet \u2014 General",
+       "BiRefNet \u2014 General Lite",
+       "BiRefNet \u2014 Massive",
+       "BiRefNet \u2014 Portrait",
+       "BiRefNet \u2014 HRSOD",
+       "BiRefNet \u2014 DIS",
+       "ISNet \u2014 General",
+       "ISNet \u2014 Anime",
+       "U2Net",
+       "U2Net \u2014 Human Seg",
+       "Silueta"
+      ],
+      "selected": 0,
+      "subtitle": "Exact rembg model",
+      "title": "Model",
+      "visible": false
+     }
+    ],
+    "visible": false
+   },
+   {
+    "group": "Segmentation",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "Quick",
+       "Normal",
+       "Relaxed"
+      ],
+      "selected": 1,
+      "subtitle": "Hover this long to focus a sub-object",
+      "title": "Focus speed"
+     },
+     {
+      "kind": "ExpanderRow",
+      "rows": [
+       {
+        "kind": "ActionRow",
+        "subtitle": "Model and detail",
+        "title": "Advanced"
+       },
+       {
+        "kind": "ComboRow",
+        "options": [
+         "Auto \u2014 best for your GPU",
+         "SAM 2.1 Tiny \u00b7 ~1.5 GB",
+         "SAM 2.1 Small \u00b7 ~2.6 GB",
+         "MobileSAM \u00b7 ~0.9 GB"
+        ],
+        "selected": 0,
+        "subtitle": "Auto \u2014 by GPU / VRAM",
+        "title": "Model"
+       },
+       {
+        "kind": "ComboRow",
+        "options": [
+         "Auto",
+         "Fast",
+         "Balanced",
+         "Fine",
+         "Maximum"
+        ],
+        "selected": 0,
+        "subtitle": "Finer finds more, but is slower",
+        "title": "Detail"
+       }
+      ],
+      "subtitle": "Model and detail",
+      "title": "Advanced"
+     }
+    ]
+   },
+   {
+    "group": "Output",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "Transparent",
+       "Blur background",
+       "White",
+       "Black",
+       "Green screen",
+       "Custom\u2026"
+      ],
+      "selected": 0,
+      "title": "Background"
+     },
+     {
+      "kind": "ActionRow",
+      "sensitive": false,
+      "title": "Custom colour"
+     },
+     {
+      "kind": "SpinRow",
+      "range": [
+       2.0,
+       80.0
+      ],
+      "title": "Blur strength",
+      "value": 20.0,
+      "visible": false
+     },
+     {
+      "active": false,
+      "kind": "SwitchRow",
+      "subtitle": "Cleaner edges, a little slower",
+      "title": "Alpha matting",
+      "visible": false
+     }
+    ]
+   }
+  ],
+  "state": "segment/models-loaded"
+ },
+ {
+  "sidebar": [
+   {
+    "group": "Model",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "General (objects, scenes)",
+       "Person / portrait",
+       "Anime / illustration",
+       "Fast (lower quality)",
+       "Custom model\u2026"
+      ],
+      "selected": 0,
+      "subtitle": "What the image mainly contains",
+      "title": "Subject"
+     },
+     {
+      "kind": "ComboRow",
+      "options": [
+       "BiRefNet \u2014 General",
+       "BiRefNet \u2014 General Lite",
+       "BiRefNet \u2014 Massive",
+       "BiRefNet \u2014 Portrait",
+       "BiRefNet \u2014 HRSOD",
+       "BiRefNet \u2014 DIS",
+       "ISNet \u2014 General",
+       "ISNet \u2014 Anime",
+       "U2Net",
+       "U2Net \u2014 Human Seg",
+       "Silueta"
+      ],
+      "selected": 0,
+      "subtitle": "Exact rembg model",
+      "title": "Model",
+      "visible": false
+     }
+    ]
+   },
+   {
+    "group": "Segmentation",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "Quick",
+       "Normal",
+       "Relaxed"
+      ],
+      "selected": 1,
+      "subtitle": "Hover this long to focus a sub-object",
+      "title": "Focus speed"
+     },
+     {
+      "kind": "ExpanderRow",
+      "rows": [
+       {
+        "kind": "ActionRow",
+        "subtitle": "Model and detail",
+        "title": "Advanced"
+       },
+       {
+        "kind": "ComboRow",
+        "options": [
+         "Auto \u2014 best for your GPU",
+         "SAM 2.1 Tiny \u00b7 ~1.5 GB",
+         "SAM 2.1 Small \u00b7 ~2.6 GB",
+         "MobileSAM \u00b7 ~0.9 GB"
+        ],
+        "selected": 0,
+        "subtitle": "Auto \u2014 by GPU / VRAM",
+        "title": "Model"
+       },
+       {
+        "kind": "ComboRow",
+        "options": [
+         "Auto",
+         "Fast",
+         "Balanced",
+         "Fine",
+         "Maximum"
+        ],
+        "selected": 0,
+        "subtitle": "Finer finds more, but is slower",
+        "title": "Detail"
+       }
+      ],
+      "subtitle": "Model and detail",
+      "title": "Advanced"
+     }
+    ],
+    "visible": false
+   },
+   {
+    "group": "Output",
+    "rows": [
+     {
+      "kind": "ComboRow",
+      "options": [
+       "Transparent",
+       "Blur background",
+       "White",
+       "Black",
+       "Green screen",
+       "Custom\u2026"
+      ],
+      "selected": 0,
+      "title": "Background"
+     },
+     {
+      "kind": "ActionRow",
+      "sensitive": false,
+      "title": "Custom colour"
+     },
+     {
+      "kind": "SpinRow",
+      "range": [
+       2.0,
+       80.0
+      ],
+      "title": "Blur strength",
+      "value": 20.0,
+      "visible": false
+     },
+     {
+      "active": false,
+      "kind": "SwitchRow",
+      "subtitle": "Cleaner edges, a little slower",
+      "title": "Alpha matting"
+     }
+    ]
+   }
+  ],
+  "state": "batch/defaults"
+ }
+]

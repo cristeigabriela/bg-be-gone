@@ -475,6 +475,7 @@ class Window(Adw.ApplicationWindow):
         scroller = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER)
         scroller.set_size_request(280, -1)
+        self.sidebar_root = scroller
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         box.set_margin_top(16)
         box.set_margin_bottom(16)
