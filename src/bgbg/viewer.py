@@ -16,6 +16,8 @@ from gi.repository import Gtk, Gdk, Gsk, Graphene, GdkPixbuf, Gio, GLib  # noqa:
 
 from engine.pane import Pane  # noqa: E402
 from engine.hittest import PixelMap, HitMaps  # noqa: E402
+from engine import anim as anim_mod  # noqa: E402
+from engine.anim import AnimState  # noqa: E402
 from engine.geometry import (  # noqa: E402
     MIN_ZOOM, MAX_ZOOM,
     polygon_area_abs as _polygon_area_abs,
@@ -26,17 +28,7 @@ from engine.geometry import (  # noqa: E402
 )
 
 _CELL = 16
-_REVEAL_MS = 300.0
-_POP_MS = 300.0
-_DWELL_MS = 1600.0      # default: hover this long to drill general -> specific
-# press-and-hold "swizzle": a wave spawns every _SPAWN ms while held, each wave
-# lives _WAVE ms; on release the object springs back and the glow decays.
-_PRESS_WAVE_MS = 720.0
-_PRESS_SPAWN_MS = 450.0
-_PRESS_DECAY_MS = 460.0
-_PRESS_SPRING_MS = 360.0
-_MORPH_MS = 240.0       # outline tween when the focused object changes
-_MORPH_N = 64           # resampled outline vertices (correspondence for the lerp)
+_MORPH_N = anim_mod.MORPH_N
 
 
 def _rgba(r, g, b):
@@ -94,22 +86,12 @@ class ImageView(Gtk.Widget):
         self.on_seg_click = None
         # fired as the hovered object stack changes: (depth:int, drilled:bool)
         self.on_seg_hover = None
-        # hover-dwell disambiguation (general object first, drill to specific)
+        # hover-dwell disambiguation (general object first, drill to specific).
+        # The dwell *timer* lives in the engine; which object to focus is the
+        # widget's business (that moves to the engine in a later step).
         self._hover_gen = 0
         self._hover_spec = 0
         self._hover_depth = 0
-        self._hover_dwell_t0 = None
-        self._hover_drilled = False
-        self._dwell_ms = _DWELL_MS
-        # press-and-hold ripple. The animation is "alive" from press until it has
-        # fully decayed after release; _release_t0 is None only while held.
-        self._press_obj = 0
-        self._press_pt = None            # (ix, iy) image px
-        self._press_t0 = None
-        self._release_t0 = None
-        # scan shimmer shown while segmentation is running
-        self._scanning = False
-        self._scan_phase = 0.0
 
         # ---- interaction: space-to-pan, click-vs-drag ----
         self._space_down = False
@@ -123,10 +105,10 @@ class ImageView(Gtk.Widget):
         self._seg_morph = {}             # id -> [N (x,y)] canonical outline ring
         self._seg_sec_paths = {}         # id -> Gsk.Path of secondary polys, or None
         self._point_path = None          # Gsk.Path for point-mode object
-        # outline morph between focused objects (hover switch / dwell drill)
+        # outline morph between focused objects (hover switch / dwell drill).
+        # The engine owns the *clock*; these are the rings/colours it tweens.
         self._morph_from = None          # ring or None (None = entering)
         self._morph_to = None            # ring or None (None = leaving)
-        self._morph_t0 = None            # µs, or None when idle
         self._morph_cf = None            # from colour
         self._morph_ct = None            # to colour
         self._morph_sec_from = None      # secondary polys of the old object
@@ -134,12 +116,10 @@ class ImageView(Gtk.Widget):
         self._morph_cen_from = None      # (cx, cy) to bloom the old ring toward
         self._morph_cen_to = None
         self._anim_tick = None           # add_tick_callback handle
-        self._t0 = None                  # animation epoch (µs)
-        self._pulse = 0.0                # 0..1 breathing
-        self._ant = 0.0                  # marching-ants dash phase (px)
-        self._reveal = 1.0               # 0..1 fade/scale-in of overlays
-        self._reveal_t0 = None           # µs
-        self._pop = {}                   # id -> select "pop" start time (µs)
+
+        # Every clock (breathing glow, marching ants, shimmer, reveal, pop,
+        # hover-dwell, press ripple, morph) lives in the engine.
+        self.anim = AnimState()
 
         motion = Gtk.EventControllerMotion()
         motion.connect("motion", self._on_motion)
@@ -173,7 +153,7 @@ class ImageView(Gtk.Widget):
         self.add_controller(pclick)
 
         # pause GIF playback while this panel is off-screen (page switch / close)
-        self.connect("map", self._resume_animation)
+        self.connect("map", self._on_map)
         self.connect("unmap", lambda *_: self._pause_animation())
 
         self._build_menu()
@@ -196,6 +176,29 @@ class ImageView(Gtk.Widget):
     rot = property(lambda s: s.pane.rot, lambda s, v: setattr(s.pane, "rot", v))
     fh = property(lambda s: s.pane.fh, lambda s, v: setattr(s.pane, "fh", v))
     fv = property(lambda s: s.pane.fv, lambda s, v: setattr(s.pane, "fv", v))
+
+    # ---------- animation state (delegated to the engine's AnimState) ----------
+    def _a(name):        # noqa: N805  (a property factory, not a method)
+        return property(lambda s: getattr(s.anim, name),
+                        lambda s, v: setattr(s.anim, name, v))
+
+    _t0 = _a("t0")
+    _pulse = _a("pulse")
+    _ant = _a("ant")
+    _scan_phase = _a("scan_phase")
+    _reveal = _a("reveal")
+    _reveal_t0 = _a("reveal_t0")
+    _scanning = _a("scanning")
+    _pop = _a("pop")
+    _dwell_ms = _a("dwell_ms")
+    _hover_dwell_t0 = _a("dwell_t0")
+    _hover_drilled = _a("drilled")
+    _press_obj = _a("press_obj")
+    _press_pt = _a("press_pt")
+    _press_t0 = _a("press_t0")
+    _release_t0 = _a("release_t0")
+    _morph_t0 = _a("morph_t0")
+    del _a
 
     # ---------- public API ----------
     def load_file(self, path, keep_transform=False):
@@ -388,7 +391,7 @@ class ImageView(Gtk.Widget):
             self._seg_selected.discard(oid)
         else:
             self._seg_selected.add(oid)
-            self._pop[oid] = self._now()      # tactile "pop" on select
+            self.anim.begin_pop(oid, self._now())   # tactile "pop" on select
         self._start_anim()
         self.queue_draw()
 
@@ -472,8 +475,19 @@ class ImageView(Gtk.Widget):
 
     # ---------- animation ----------
     def _now(self):
+        """Animation clock, in microseconds.
+
+        GdkFrameClock.get_frame_time() is on the same monotonic timebase as
+        GLib.get_monotonic_time(), so falling back to it keeps timestamps
+        comparable when we have no frame clock yet (unrealized). Returning 0
+        there instead would stamp an animation's epoch at 0, and the moment a
+        real clock arrived the animation would be instantly "expired".
+
+        Offscreen rendering pins this (see spec/tools/rasterize.py) so a fixture
+        can address any moment of any animation.
+        """
         fc = self.get_frame_clock()
-        return fc.get_frame_time() if fc is not None else 0
+        return fc.get_frame_time() if fc is not None else GLib.get_monotonic_time()
 
     def _path_from_contours(self, contours):
         if not contours:
@@ -491,8 +505,7 @@ class ImageView(Gtk.Widget):
         return pb.to_path() if added else None
 
     def _begin_reveal(self):
-        self._reveal = 0.0
-        self._reveal_t0 = self._now()
+        self.anim.begin_reveal(self._now())
 
     def _start_anim(self):
         if self._anim_tick is None and self.get_frame_clock() is not None:
@@ -504,52 +517,36 @@ class ImageView(Gtk.Widget):
             self.remove_tick_callback(self._anim_tick)
             self._anim_tick = None
 
+    def _seg_active(self):
+        """Overlay state that wants the clock running but the engine doesn't own
+        yet (hover, selection, a point mask)."""
+        return bool(self._seg_hover_id or self._seg_selected
+                    or self._seg_point_tex is not None)
+
+    def _on_map(self, *_):
+        self._resume_animation()          # GIF playback
+        # Re-arm the overlay tick. A clock can be started (a reveal, say) while
+        # we are still unrealized, when add_tick_callback silently does nothing —
+        # so the animation would never play. Now that we have a frame clock,
+        # start it if anything is actually pending.
+        if self.anim.needs_tick(self._seg_active()):
+            self._start_anim()
+
     def _on_tick(self, widget, clock):
+        """Thin adapter: the engine advances every clock, the widget reacts."""
         t = clock.get_frame_time()
-        if self._t0 is None:
-            self._t0 = t
-        el = (t - self._t0) / 1_000_000.0
-        self._pulse = 0.5 * (1.0 + math.sin(el * 2.0 * math.pi * 1.1))
-        self._ant = el * 24.0                      # dash travel, px/s
-        if self._scanning:
-            self._scan_phase = (el / 1.2) % 1.0    # sweep loop, ~1.2 s
-        if self._reveal_t0 is not None:
-            p = (t - self._reveal_t0) / 1000.0 / _REVEAL_MS
-            if p >= 1.0:
-                self._reveal, self._reveal_t0 = 1.0, None
-            else:
-                self._reveal = 1.0 - (1.0 - p) ** 3   # ease-out cubic
-        for oid in [k for k, t0 in self._pop.items()
-                    if (t - t0) / 1000.0 > _POP_MS]:
-            del self._pop[oid]
-        # hover-dwell: after dwelling on a general object, drill to the specific
-        if (self._hover_gen and not self._hover_drilled
-                and self._hover_dwell_t0 is not None
-                and (t - self._hover_dwell_t0) / 1000.0 > self._dwell_ms):
-            self._hover_drilled = True
+        tick = self.anim.advance(t, active=self._seg_active())
+
+        if tick.dwell_fired and self._hover_gen:
+            # dwelled long enough: drill from the general object to the specific
             if self._hover_spec:
-                self._focus(self._hover_spec)     # morph general -> specific
-            self.queue_draw()
+                self._focus(self._hover_spec)     # morphs general -> specific
             if self.on_seg_hover:
                 self.on_seg_hover(self._hover_depth, True, self._px, self._py)
-        # retire the press animation once it has fully decayed after release
-        if (self._press_obj and self._release_t0 is not None
-                and (t - self._release_t0) / 1000.0 > _PRESS_WAVE_MS):
-            self._press_obj = 0
-            self._press_pt = None
-            self._release_t0 = None
+
+        if tick.animating or tick.changed:
             self.queue_draw()
-        # retire a finished outline morph
-        if (self._morph_t0 is not None
-                and (t - self._morph_t0) / 1000.0 >= _MORPH_MS):
-            self._morph_t0 = None
-            self.queue_draw()
-        animating = (self._seg_hover_id or self._seg_selected or self._press_obj
-                     or self._seg_point_tex is not None or self._scanning
-                     or self._morph_t0 is not None
-                     or self._reveal_t0 is not None or self._pop)
-        if animating:
-            self.queue_draw()
+        if tick.animating:
             return GLib.SOURCE_CONTINUE
         # nothing left to animate — retire the tick so we don't wake every frame
         # while idle (a hover/press/select/scan re-arms it via _start_anim).
@@ -557,13 +554,7 @@ class ImageView(Gtk.Widget):
         return GLib.SOURCE_REMOVE
 
     def _pop_scale(self, oid):
-        t0 = self._pop.get(oid)
-        if t0 is None:
-            return 1.0
-        p = (self._now() - t0) / 1000.0 / _POP_MS
-        if p <= 0.0 or p >= 1.0:
-            return 1.0
-        return 1.0 + 0.09 * math.sin(p * math.pi) * (1.0 - p)
+        return self.anim.pop_scale(oid, self._now())
 
     def widget_to_image(self, px, py):
         """Widget px -> image px (or None). See engine.pane.Pane."""
@@ -646,18 +637,14 @@ class ImageView(Gtk.Widget):
                 ix, iy = int(pt[0]), int(pt[1])
                 oid = self._seg_hover_id or self.hit_test(ix, iy)
                 if oid:
-                    self._press_obj = oid
-                    self._press_pt = (ix, iy)
-                    self._press_t0 = self._now()
-                    self._release_t0 = None
+                    self.anim.begin_press(oid, (ix, iy), self._now())
                     self._start_anim()
                     self.queue_draw()
 
     def _on_primary_released(self, gesture, n_press, x, y):
         # Don't clear the press object — let the ripple + spring-back play out
         # (the tick retires it once fully decayed). Only stamp the release time.
-        if self._press_obj and self._release_t0 is None:
-            self._release_t0 = self._now()
+        if self.anim.release_press(self._now()):
             self.queue_draw()
         # Select on release, and only for a real click — never while panning
         # (Space held) or when the press turned into a drag.
@@ -978,10 +965,8 @@ class ImageView(Gtk.Widget):
     def _snapshot_focus_outline(self, snapshot, hover, sel, scale):
         """The hovered object's marching-ants outline. While the focus is
         changing, tween the largest ring old->new and crossfade the rest."""
-        now = self._now()
-        if (self._morph_t0 is not None
-                and (now - self._morph_t0) / 1000.0 < _MORPH_MS):
-            e = _ease_out((now - self._morph_t0) / 1000.0 / _MORPH_MS)
+        e = self.anim.morph_progress(self._now())    # eased 0..1, or None when idle
+        if e is not None:
             self._draw_morph(snapshot, e, scale)
             return
         if hover and hover in self._seg_masks and hover not in sel:
@@ -1111,48 +1096,31 @@ class ImageView(Gtk.Widget):
         tex = self._seg_masks[oid]
         col = self._seg_colors.get(oid, self._seg_point_color)
         now = self._now()
-        held = self._release_t0 is None
-        rel_ms = 0.0 if held else (now - self._release_t0) / 1000.0
-        fade = 1.0 if held else max(0.0, 1.0 - rel_ms / _PRESS_DECAY_MS)
-        # press-scale: 0.97 while held, springs back to 1.0 (with overshoot).
-        if held:
-            sc = 0.97
-        else:
-            sc = 0.97 + 0.03 * _ease_out_back(min(1.0, rel_ms / _PRESS_SPRING_MS))
+        p = self.anim.press(now)           # engine owns the envelope maths
+        if p is None:
+            return
         iw, ih = self.pixbuf.get_width(), self.pixbuf.get_height()
         cx, cy = self._seg_centroids.get(oid) or (iw / 2, ih / 2)
         snapshot.save()
-        if abs(sc - 1.0) > 1e-4:
+        if abs(p.scale - 1.0) > 1e-4:
             snapshot.translate(Graphene.Point().init(cx, cy))
-            snapshot.scale(sc, sc)
+            snapshot.scale(p.scale, p.scale)
             snapshot.translate(Graphene.Point().init(-cx, -cy))
         # intensified glow + bright fill + ants (all decay after release)
-        glow_a = (0.34 + 0.24 * self._pulse) if held else 0.40 * fade
-        self._glow(snapshot, tex, col, glow_a, 26.0, rect)
-        self._tint(snapshot, tex, col, 0.30 * (1.0 if held else fade), rect)
+        self._glow(snapshot, tex, col, p.glow, 26.0, rect)
+        self._tint(snapshot, tex, col, p.tint, rect)
         ant_col = col
-        if not held and fade < 1.0:                     # fade the outline out too
-            ant_col = Gdk.RGBA()
-            ant_col.red, ant_col.green, ant_col.blue = col.red, col.green, col.blue
-            ant_col.alpha = col.alpha * fade
+        if not p.held and p.fade < 1.0:                 # fade the outline out too
+            ant_col = self._alpha(col, p.fade)
         self._ants(snapshot, self._seg_paths.get(oid), ant_col, scale)
         # expanding waves from the press point, clipped to the object
         px, py = self._press_pt
         maxr = self._seg_radius.get(oid, 160.0)
-        age_total = (now - self._press_t0) / 1000.0
-        last_spawn = age_total if held else (self._release_t0 - self._press_t0) / 1000.0
-        n = int(last_spawn / _PRESS_SPAWN_MS) + 1
-        first = max(0, int((age_total - _PRESS_WAVE_MS) / _PRESS_SPAWN_MS))
         snapshot.push_mask(Gsk.MaskMode.LUMINANCE)
         snapshot.append_texture(tex, rect)              # clip content to object
         snapshot.pop()
-        for i in range(first, n):
-            age = age_total - i * _PRESS_SPAWN_MS
-            if age < 0.0 or age >= _PRESS_WAVE_MS:
-                continue
-            ph = age / _PRESS_WAVE_MS
+        for ph, a in self.anim.waves(now):              # engine schedules the waves
             r = 8.0 + _ease_out(ph) * maxr
-            a = (1.0 - ph) * 0.5 * (1.0 if held else fade)
             ring = Gsk.PathBuilder()
             ring.add_circle(Graphene.Point().init(px, py), r)
             st = Gsk.Stroke.new(max(1.0, 3.0 / scale))

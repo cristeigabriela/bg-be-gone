@@ -63,6 +63,8 @@ def build_view(fx, meta, objs, maps):
     vw, vh = fx["view"]
     v.get_width = lambda: vw          # offscreen: no allocation
     v.get_height = lambda: vh
+    v._now = lambda: 0                # pin the clock: fixtures state ages as
+    #                                   negative µs relative to "now"
 
     v.pixbuf = GdkPixbuf.Pixbuf.new_from_file(os.path.join(SCENE, meta["source"]))
     v._texture = None

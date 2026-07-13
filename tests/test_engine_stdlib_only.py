@@ -55,6 +55,9 @@ def main():
         assert len(engine.resample_closed([(0, 0), (4, 0), (4, 4), (0, 4)], 16)) == 16
         m = engine.PixelMap(bytes([1, 1, 0]), 3, 3, 1, 1)   # id = 1 + 1*256
         assert engine.HitMaps(label=m).specific_at(0, 0) == 257
+        a = engine.AnimState()
+        a.advance(0)
+        assert not a.needs_tick()
         assert engine.PROTOCOL_VERSION >= 1
     finally:
         sys.meta_path.pop(0)

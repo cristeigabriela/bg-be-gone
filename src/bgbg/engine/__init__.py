@@ -14,5 +14,6 @@ from .geometry import (          # noqa: F401
 )
 from .pane import Pane                            # noqa: F401
 from .hittest import PixelMap, HitMaps, Hit       # noqa: F401
+from .anim import AnimState, Tick, Press          # noqa: F401
 
 PROTOCOL_VERSION = 1
