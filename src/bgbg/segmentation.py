@@ -582,11 +582,20 @@ def _obj_color(cx, cy):
 
 
 def _save_soft(mask, path, feather):
-    """Write a mask as a soft-edged (anti-aliased) L PNG."""
+    """Write a mask as an alpha-coverage PNG: white RGB, alpha = coverage.
+
+    Alpha, not luminance. Both GSK's mask node and Canvas2D's `destination-in`
+    key off ALPHA, so coverage masks composite as a real union when several are
+    stacked. Written as an `L` image they load back *opaque*, and stacking those
+    made each mask silently REPLACE the previous one instead of unioning with it
+    — which is why selecting several objects used to dim all but the last.
+    """
     im = Image.fromarray(np.where(mask, 255, 0).astype(np.uint8), "L")
     if feather > 0:
         im = im.filter(ImageFilter.GaussianBlur(feather))
-    im.save(path)
+    rgba = Image.new("RGBA", im.size, (255, 255, 255, 0))
+    rgba.putalpha(im)
+    rgba.save(path)
 
 
 # Clockwise 8-neighbour offsets (row, col) starting at West — for Moore tracing.
@@ -794,7 +803,11 @@ def load_union(paths):
     """Combine soft mask PNGs into one uint8 alpha (max), keeping soft edges."""
     out = None
     for p in paths:
-        a = np.asarray(Image.open(p).convert("L"))
+        im = Image.open(p)
+        if im.mode in ("RGBA", "LA"):          # coverage masks (see _save_soft)
+            a = np.asarray(im.convert("RGBA"))[..., 3]
+        else:                                  # legacy L masks
+            a = np.asarray(im.convert("L"))
         out = a if out is None else np.maximum(out, a)
     return out
 

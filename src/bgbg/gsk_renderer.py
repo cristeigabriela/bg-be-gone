@@ -16,9 +16,13 @@ from gi.repository import Gtk, Gdk, Gsk, Graphene  # noqa: E402
 
 from engine.render import ops as O  # noqa: E402
 
+# ALPHA, not LUMINANCE. Mask textures carry coverage in their alpha channel (see
+# segmentation._save_soft), so stacking several inside one mask node alpha-
+# composites them into a real UNION. Keyed off luminance they were opaque, and
+# each layer replaced the one before it.
 _MASK_MODE = {
-    "keep": Gsk.MaskMode.LUMINANCE,
-    "cut": Gsk.MaskMode.INVERTED_LUMINANCE,
+    "keep": Gsk.MaskMode.ALPHA,
+    "cut": Gsk.MaskMode.INVERTED_ALPHA,
 }
 
 
