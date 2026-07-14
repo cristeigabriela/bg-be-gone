@@ -143,8 +143,12 @@ JOBS = _index([
     Message("seg_point", [opt("points"), opt("use_prev")],
             "Refine one object from click prompts: [[x, y, label], ...]."),
     Message("seg_extract", [req("output"), opt("ids"), opt("mask"),
-                            opt("bg"), opt("blur")],
-            "Composite the selected objects (or one mask) onto a background."),
+                            opt("bg"), opt("blur"),
+                            opt("rot"), opt("fh"), opt("fv")],
+            "Composite the selected objects (or one mask) onto a background. "
+            "The masks live in un-rotated source space, so rot/fh/fv carry the "
+            "view transform the user was looking at and get baked into the "
+            "output — what you save is what you saw."),
     Message("seg_cancel", [], "Stop a segmentation pass in progress."),
     Message("shutdown", [], "Exit the worker."),
 ])

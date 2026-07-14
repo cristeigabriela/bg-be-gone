@@ -726,7 +726,10 @@ class Window(Adw.ApplicationWindow):
             return
         inp = os.path.join(self.tmpdir, "seg_input.png")
         try:
-            self.seg_panel.view.export_pixbuf().savev(inp, "png", [], [])
+            # The RAW pixbuf, not export_pixbuf(): the overlays must come back in
+            # un-rotated image space so they can ride the pane transform instead
+            # of being invalidated by it (step 12).
+            self.seg_panel.view.pixbuf.savev(inp, "png", [], [])
         except Exception as e:
             self._toast("Could not prepare image: %s" % e)
             return
@@ -833,6 +836,10 @@ class Window(Adw.ApplicationWindow):
     def _seg_extract_req(self, outp):
         bg, blur = self._extract_bg()
         req = {"op": "seg_extract", "bg": bg, "blur": blur, "output": outp}
+        # The masks are in un-rotated source space; the user may have rotated the
+        # view. Bake their transform into the output so the file matches what they
+        # were looking at when they picked the objects.
+        req.update(self.seg_panel.view.pane.export_transform())
         if self._seg_mode() == "point":
             req["mask"] = self.seg_point_mask
         else:
@@ -889,9 +896,13 @@ class Window(Adw.ApplicationWindow):
             return
         rv = self.seg_res_panel.view
         if rv.pixbuf is src and rv.session.objects.clip_active:
-            rv.update_composite(masks, eff.fill)      # keep zoom/pan/transform
+            rv.update_composite(masks, eff.fill)      # keep zoom/pan
         else:
             rv.set_composite(src, masks, eff.fill)
+        # Mirror the source panel's rotate/flip, so the preview shows the same
+        # orientation the extract will bake into the saved file.
+        sp = self.seg_panel.view.pane
+        rv.pane.rot, rv.pane.fh, rv.pane.fv = sp.rot, sp.fh, sp.fv
         # Save still renders the real PNG in the worker — the canvas preview is
         # not a file.
         self.seg_result_output = None

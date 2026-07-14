@@ -337,16 +337,53 @@ def test_cursor_info():
           ci.focused_id, 1)
 
 
-def test_rotate_drops_overlays():
-    """Overlays are registered to un-rotated pixels, so a rotate must drop them
-    rather than let them desync."""
+def test_rotate_keeps_overlays():
+    """Step 12: rotating and flipping used to THROW THE OVERLAYS AWAY. Now they
+    ride the pane transform — they are drawn inside the same transformed group as
+    the image, and the cursor is un-rotated before it indexes the id maps."""
     s, clock = new_session()
-    check("rotating clears the overlay and stops the clock",
-          s.rotate(1) or s.drain_effects(),
-          [StopTick(), Redraw(), ViewChanged()])
-    check("  ... the overlay is gone", s.has_seg(), False)
-    check("  ... but the mode is kept", s.objects.seg_mode, "everything")
+    s.set_selection([1])
+    s.drain_effects()
+
+    check("rotating no longer destroys the overlay",
+          s.rotate(1) or s.drain_effects(), [Redraw(), ViewChanged()])
+    check("  ... the objects are still there", s.has_seg(), True)
+    check("  ... and so is the selection", s.selection(), [1])
     check("  ... and the rotation applied", s.pane.rot, 1)
+
+    # ... and the display list still draws them, now inside a rotated transform
+    dl = s.display_list()
+    check("  ... the frame carries the rotation",
+          ["rotate" for op in dl.ops
+           for st in getattr(op, "transform", ()) if st[0] == "rotate"],
+          ["rotate"])
+
+
+def test_hit_testing_survives_rotate_and_flip():
+    """The overlays rendering correctly under rotation is only half of it — a
+    click has to land on the same object. The cursor is un-rotated before it
+    indexes the id maps, so it does."""
+    for rot, fh, fv, label in ((1, False, False, "rot 90"),
+                               (2, False, False, "rot 180"),
+                               (3, False, False, "rot 270"),
+                               (0, True, False, "flip h"),
+                               (0, False, True, "flip v"),
+                               (1, True, True, "rot 90 + both flips")):
+        s, clock = new_session()
+        s.pane.rot, s.pane.fh, s.pane.fv = rot, fh, fv
+
+        # where does the nested core (image 30,30) land on screen now?
+        vx, vy = s.pane.image_to_view(*CORE_PT)
+        s.feed(PointerMove(vx, vy))
+        check("%-20s hovering the nested core still finds it" % label,
+              (s.objects.hover_gen, s.objects.hover_spec, s.objects.hover_depth),
+              (1, 3, 2))
+
+        # and a click there still toggles the right object
+        s.feed(PointerDown(vx, vy))
+        got = [e for e in s.feed(PointerUp(vx, vy)) if isinstance(e, SegClick)]
+        check("%-20s ... and a click reports image (30, 30)" % label,
+              got, [SegClick(30, 30, 1, "toggle")])
 
 
 def test_tick_stops_when_idle():
@@ -369,7 +406,8 @@ def main():
                test_click_outside_the_image_is_ignored,
                test_enter_takes_focus,
                test_cursor_info,
-               test_rotate_drops_overlays,
+               test_rotate_keeps_overlays,
+               test_hit_testing_survives_rotate_and_flip,
                test_tick_stops_when_idle):
         print(fn.__doc__.splitlines()[0] if fn.__doc__ else fn.__name__)
         fn()

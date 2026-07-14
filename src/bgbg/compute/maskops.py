@@ -325,17 +325,29 @@ def load_union(paths):
     return out
 
 
-def composite_extract(src_pil, alpha, bg, dst, blur=20):
-    """Composite the ``alpha`` (uint8 HxW) cutout of ``src_pil`` over ``bg`` and
-    save to ``dst``. ``bg`` is "transparent" / "blur" / "#rrggbb".
+def composite_image(src_pil, alpha, bg, blur=20):
+    """The ``alpha`` (uint8 HxW) cutout of ``src_pil`` over ``bg``, as an image.
 
-    The background itself is the outputter's job (``compute.outputs_impl``) —
-    the same one the background-removal and GIF paths use, so a new effect is
-    added in one place rather than three.
+    The background itself is the outputter's job (``compute.outputs_impl``) — the
+    same one the background-removal and GIF paths use, so a new effect is added in
+    one place rather than three.
     """
     from compute import outputs_impl
 
     src = src_pil.convert("RGB")
     cut = outputs_impl.cutout(src, Image.fromarray(alpha.astype(np.uint8), "L"))
-    outputs_impl.apply_bg(cut, bg, source=src, blur=blur).save(dst)
+    return outputs_impl.apply_bg(cut, bg, source=src, blur=blur)
+
+
+def composite_extract(src_pil, alpha, bg, dst, blur=20, rot=0, fh=False, fv=False):
+    """...and saved to ``dst``, with the view transform baked in.
+
+    The masks live in un-rotated source space (so they can ride the pane
+    transform instead of being invalidated by it), which means the rotation the
+    user was looking at has to be applied here, at the end.
+    """
+    from compute import outputs_impl
+
+    img = composite_image(src_pil, alpha, bg, blur=blur)
+    outputs_impl.apply_transform(img, rot, fh, fv).save(dst)
     return dst

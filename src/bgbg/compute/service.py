@@ -327,24 +327,6 @@ def handle_batch(req):
          "seconds": round(time.time() - t, 1), "outdir": outdir, "id": rid})
 
 
-def _apply_transform(im, rot, fh, fv):
-    """Bake the view's rotate/flip into a frame, matching ImageView.export_pixbuf
-    (flip horizontal, flip vertical, then rotate clockwise) — so a rotated GIF
-    comes out exactly like a rotated still would."""
-    if fh:
-        im = im.transpose(Image.FLIP_LEFT_RIGHT)
-    if fv:
-        im = im.transpose(Image.FLIP_TOP_BOTTOM)
-    rot %= 4
-    if rot == 1:
-        im = im.transpose(Image.ROTATE_270)    # 90 clockwise
-    elif rot == 2:
-        im = im.transpose(Image.ROTATE_180)
-    elif rot == 3:
-        im = im.transpose(Image.ROTATE_90)     # 90 counter-clockwise
-    return im
-
-
 def _compose_frame(orig_rgba, cut_rgba, bg, blur):
     """Apply the chosen background to one processed GIF frame; returns RGBA.
 
@@ -410,7 +392,7 @@ def handle_gif(req):
                 return
             im.seek(i)
             durations.append(im.info.get("duration", 100))
-            frame = _apply_transform(im.convert("RGBA"), rot, fh, fv)
+            frame = outputs_impl.apply_transform(im.convert("RGBA"), rot, fh, fv)
             cut = _remove_resilient(model, rid, frame, alpha).convert("RGBA")
             fp = os.path.join(framedir, "f%05d.png" % i)
             _compose_frame(frame, cut, bg, blur).save(fp)
@@ -546,7 +528,10 @@ def handle_seg_extract(req):
         return
     t = time.time()
     alpha = maskops.load_union(paths)
-    maskops.composite_extract(_seg["image"], alpha, bg, dst, blur=blur)
+    maskops.composite_extract(_seg["image"], alpha, bg, dst, blur=blur,
+                              rot=int(req.get("rot", 0)),
+                              fh=bool(req.get("fh", False)),
+                              fv=bool(req.get("fv", False)))
     out({"type": "seg_extracted", "output": dst,
          "seconds": round(time.time() - t, 2), "id": rid})
 

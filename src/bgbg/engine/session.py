@@ -129,21 +129,25 @@ class EngineSession:
         self.pane.zoom_at(factor, cx, cy)
         self.emit(fx.Redraw())
 
+    # Rotate and flip are VIEW state. The overlays are registered to un-rotated
+    # image pixels and stay that way: the builder draws them inside the same
+    # Push(transform=...) as the image, so they ride the rotation for free, and
+    # `view_to_image` un-rotates before indexing the id maps, so hit-testing keeps
+    # working. Both used to throw the overlays away instead — you rotated, and
+    # your selection was gone.
+    #
+    # The one thing that has to hold for this to be true: whatever gets segmented
+    # must be the UN-transformed source (see app._ensure_seg_loaded), or the masks
+    # would come back in the rotated frame and the two would desync.
     def rotate(self, delta):
         if not self.pane.has_image():
             return
-        # Overlays are registered to un-rotated image pixels; drop them so they
-        # cannot desync. (Step 12 makes contours ride the pane transform instead.)
-        if self.objects.has_seg():
-            self.clear_seg(keep_mode=True)
         self.pane.rotate(delta)          # also resets zoom/pan
         self.emit(fx.Redraw(), fx.ViewChanged())
 
     def flip(self, horizontal):
         if not self.pane.has_image():
             return
-        if self.objects.has_seg():
-            self.clear_seg(keep_mode=True)
         self.pane.flip(horizontal)
         self.emit(fx.Redraw(), fx.ViewChanged())
 

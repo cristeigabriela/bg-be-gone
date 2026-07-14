@@ -64,3 +64,25 @@ def apply_bg(cut, bg, source=None, blur=20):
     if bg == "blur":
         return apply(cut, "blur", source=source, strength=blur)
     return apply(cut, "solid", color=bg)
+
+
+def apply_transform(im, rot=0, fh=False, fv=False):
+    """Bake a view transform into an image: flip horizontal, flip vertical, then
+    rotate clockwise — the same order as ImageView.export_pixbuf.
+
+    Used by the GIF path (a rotated GIF must come out like a rotated still) and by
+    the segmentation extract, whose masks live in un-rotated source space: the
+    view's rotation is baked in at the end, so what you save is what you saw.
+    """
+    if fh:
+        im = im.transpose(Image.FLIP_LEFT_RIGHT)
+    if fv:
+        im = im.transpose(Image.FLIP_TOP_BOTTOM)
+    rot %= 4
+    if rot == 1:
+        im = im.transpose(Image.ROTATE_270)    # 90 clockwise
+    elif rot == 2:
+        im = im.transpose(Image.ROTATE_180)
+    elif rot == 3:
+        im = im.transpose(Image.ROTATE_90)     # 90 counter-clockwise
+    return im

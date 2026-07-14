@@ -36,7 +36,7 @@ run "compute protocol"        python tests/test_engine_protocol.py
 run "outputter (local/compute)" python tests/test_engine_outputs.py
 
 echo "── renderer ────────────────────────────────"
-run "render goldens (25)"     python spec/tools/rasterize.py --check
+run "render goldens (28)"     python spec/tools/rasterize.py --check
 run "display-list goldens"    python spec/tools/displaylist.py --check
 run "sidebar (row-for-row)"   timeout 60 python spec/tools/uidump.py --check
 run "mask union (regression)" python tests/test_mask_union.py
