@@ -1,0 +1,89 @@
+{
+ "animating": false,
+ "ops": [
+  {
+   "cell": 16.0,
+   "dark": [
+    0.15,
+    0.15,
+    0.17,
+    1.0
+   ],
+   "light": [
+    0.2,
+    0.2,
+    0.22,
+    1.0
+   ],
+   "op": "checker",
+   "rect": [
+    0.0,
+    0.0,
+    320.0,
+    240.0
+   ]
+  },
+  {
+   "children": [
+    {
+     "children": [
+      {
+       "filter": "smooth",
+       "image": "src",
+       "op": "draw_image",
+       "rect": [
+        0.0,
+        0.0,
+        160.0,
+        120.0
+       ]
+      }
+     ],
+     "mask": {
+      "layers": [
+       1,
+       3
+      ],
+      "mode": "keep",
+      "rect": [
+       0.0,
+       0.0,
+       160.0,
+       120.0
+      ]
+     },
+     "op": "push"
+    }
+   ],
+   "op": "push",
+   "transform": [
+    [
+     "translate",
+     160.0,
+     120.0
+    ],
+    [
+     "scale",
+     2.0,
+     2.0
+    ],
+    [
+     "scale",
+     1.0,
+     1.0
+    ],
+    [
+     "translate",
+     -80.0,
+     -60.0
+    ]
+   ]
+  }
+ ],
+ "scale": 2.0,
+ "version": 1,
+ "view_size": [
+  320.0,
+  240.0
+ ]
+}

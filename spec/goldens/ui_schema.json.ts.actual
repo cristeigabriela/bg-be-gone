@@ -1,0 +1,277 @@
+{
+ "groups": [
+  {
+   "id": "model",
+   "rows": [
+    {
+     "id": "subject",
+     "kind": "choice",
+     "label": "Subject",
+     "options": [
+      {
+       "label": "General (objects, scenes)",
+       "value": "birefnet-general"
+      },
+      {
+       "label": "Person / portrait",
+       "value": "birefnet-portrait"
+      },
+      {
+       "label": "Anime / illustration",
+       "value": "isnet-anime"
+      },
+      {
+       "label": "Fast (lower quality)",
+       "value": "u2net"
+      },
+      {
+       "label": "Custom model…",
+       "value": "custom"
+      }
+     ],
+     "selected": 0,
+     "sensitive": true,
+     "subtitle": "What the image mainly contains",
+     "value": "birefnet-general",
+     "visible": true
+    },
+    {
+     "id": "model",
+     "kind": "choice",
+     "label": "Model",
+     "options": [
+      {
+       "label": "BiRefNet — General",
+       "value": "birefnet-general"
+      },
+      {
+       "label": "BiRefNet — General Lite",
+       "value": "birefnet-general-lite"
+      },
+      {
+       "label": "BiRefNet — Massive",
+       "value": "birefnet-massive"
+      },
+      {
+       "label": "BiRefNet — Portrait",
+       "value": "birefnet-portrait"
+      },
+      {
+       "label": "BiRefNet — HRSOD",
+       "value": "birefnet-hrsod"
+      },
+      {
+       "label": "BiRefNet — DIS",
+       "value": "birefnet-dis"
+      },
+      {
+       "label": "ISNet — General",
+       "value": "isnet-general-use"
+      },
+      {
+       "label": "ISNet — Anime",
+       "value": "isnet-anime"
+      },
+      {
+       "label": "U2Net",
+       "value": "u2net"
+      },
+      {
+       "label": "U2Net — Human Seg",
+       "value": "u2net_human_seg"
+      },
+      {
+       "label": "Silueta",
+       "value": "silueta"
+      }
+     ],
+     "selected": 0,
+     "sensitive": true,
+     "subtitle": "Exact rembg model",
+     "value": "birefnet-general",
+     "visible": false
+    }
+   ],
+   "title": "Model",
+   "visible": true
+  },
+  {
+   "id": "seg",
+   "rows": [
+    {
+     "id": "seg_mode",
+     "kind": "choice",
+     "label": "Mode",
+     "options": [
+      {
+       "label": "Everything",
+       "value": "everything"
+      },
+      {
+       "label": "Click to select",
+       "value": "point"
+      }
+     ],
+     "selected": 0,
+     "sensitive": true,
+     "value": "everything",
+     "visible": true
+    },
+    {
+     "id": "seg_focus",
+     "kind": "choice",
+     "label": "Focus speed",
+     "options": [
+      {
+       "label": "Quick",
+       "value": 800
+      },
+      {
+       "label": "Normal",
+       "value": 1600
+      },
+      {
+       "label": "Relaxed",
+       "value": 2600
+      }
+     ],
+     "selected": 1,
+     "sensitive": true,
+     "subtitle": "Hover this long to focus a sub-object",
+     "value": 1600,
+     "visible": true
+    },
+    {
+     "id": "seg_advanced",
+     "kind": "expander",
+     "label": "Advanced",
+     "rows": [
+      {
+       "id": "seg_model",
+       "kind": "choice",
+       "label": "Model",
+       "options": [
+        {
+         "label": "Auto",
+         "value": "auto"
+        }
+       ],
+       "selected": 0,
+       "sensitive": true,
+       "subtitle": "Auto — by GPU / VRAM",
+       "value": "auto",
+       "visible": true
+      },
+      {
+       "id": "seg_detail",
+       "kind": "choice",
+       "label": "Detail",
+       "options": [
+        {
+         "label": "Auto",
+         "value": 0
+        },
+        {
+         "label": "Fast",
+         "value": 16
+        },
+        {
+         "label": "Balanced",
+         "value": 24
+        },
+        {
+         "label": "Fine",
+         "value": 32
+        },
+        {
+         "label": "Maximum",
+         "value": 44
+        }
+       ],
+       "selected": 0,
+       "sensitive": true,
+       "subtitle": "Finer finds more, but is slower",
+       "value": 0,
+       "visible": true
+      }
+     ],
+     "sensitive": true,
+     "subtitle": "Model and detail",
+     "visible": true
+    }
+   ],
+   "title": "Segmentation",
+   "visible": false
+  },
+  {
+   "id": "output",
+   "rows": [
+    {
+     "id": "bg",
+     "kind": "choice",
+     "label": "Background",
+     "options": [
+      {
+       "label": "Transparent",
+       "value": "transparent"
+      },
+      {
+       "label": "Blur background",
+       "value": "blur"
+      },
+      {
+       "label": "White",
+       "value": "#ffffff"
+      },
+      {
+       "label": "Black",
+       "value": "#000000"
+      },
+      {
+       "label": "Green screen",
+       "value": "#00b140"
+      },
+      {
+       "label": "Custom…",
+       "value": "custom"
+      }
+     ],
+     "selected": 0,
+     "sensitive": true,
+     "value": "transparent",
+     "visible": true
+    },
+    {
+     "id": "bg_color",
+     "kind": "color",
+     "label": "Custom colour",
+     "sensitive": false,
+     "value": "#00b140",
+     "visible": true
+    },
+    {
+     "id": "blur",
+     "kind": "int",
+     "label": "Blur strength",
+     "max": 80,
+     "min": 2,
+     "sensitive": true,
+     "step": 1,
+     "value": 20,
+     "visible": false
+    },
+    {
+     "id": "alpha",
+     "kind": "bool",
+     "label": "Alpha matting",
+     "sensitive": true,
+     "subtitle": "Cleaner edges, a little slower",
+     "value": false,
+     "visible": true
+    }
+   ],
+   "title": "Output",
+   "visible": true
+  }
+ ]
+}

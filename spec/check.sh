@@ -46,6 +46,15 @@ run "worker smoke (starts, seg+rembg)" timeout 180 python tests/test_worker_smok
 run "outputter pixels (engine<->worker)" timeout 120 python tests/test_outputs_impl.py
 run "CV + model_io goldens"   timeout 180 python spec/tools/cvgold.py --check
 
+echo "── web core (TypeScript mirror, via bun) ────"
+if command -v bun >/dev/null 2>&1; then
+  run "pyround vs CPython"      bun run web/tests/pyround_test.ts
+  run "conformance (dl+schema+cv)" bun run web/conform.ts
+  run "canvas2d backend"        bun run web/tests/canvas2d_test.ts
+else
+  printf '%-34s %s\n' "web core" "SKIP (no bun)"
+fi
+
 echo "── live (real GTK window) ──────────────────"
 run "tick / dwell / press"    timeout 60 python tests/test_live_tick.py
 run "app seam (hover/click/sidebar)" timeout 60 python tests/test_live_app_segment.py
