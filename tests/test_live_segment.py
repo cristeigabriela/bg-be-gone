@@ -18,7 +18,7 @@ SRC = os.path.join(ROOT, "src", "bgbg")
 sys.path.insert(0, SRC)
 os.environ.setdefault("BGBG_VENV_PYTHON",
                       os.path.expanduser("~/.local/share/bg-be-gone/venv/bin/python"))
-os.environ.setdefault("BGBG_WORKER", os.path.join(SRC, "worker.py"))
+os.environ.setdefault("BGBG_WORKER", os.path.join(SRC, "compute", "service.py"))
 os.environ["BGBG_START_PAGE"] = "segment"
 os.chdir(SRC)
 

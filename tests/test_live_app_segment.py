@@ -35,29 +35,25 @@ gi.require_version("Adw", "1")
 from gi.repository import GLib, Gio  # noqa: E402
 
 import app as A  # noqa: E402
+from engine.ports import RecordingPort  # noqa: E402
 
 SCENE = os.path.join(ROOT, "spec", "assets", "scene")
 NESTED = (46, 52)          # image px: object 3 (the core) nested inside object 1
 R = {}
 
 
-class StubWorker:
-    """The compute port, without the subprocess. Records what the app asks for."""
+class StubPort(RecordingPort):
+    """The compute port, without the subprocess.
 
-    def __init__(self, on_message):
-        self.ok = True
-        self.error = None
-        self.sent = []
+    RecordingPort validates every job against engine.protocol, so this also
+    proves the app only ever sends jobs the protocol actually declares.
+    """
 
-    def send(self, req):
-        self.sent.append(req)
-        return 1
-
-    def shutdown(self):
-        pass
+    def __init__(self, python, script, on_event, log=None):
+        super().__init__(on_event)
 
 
-A.Worker = StubWorker
+A.WorkerPort = StubPort
 
 wins = []
 _orig = A.Window.__init__
@@ -131,7 +127,7 @@ def main():
     def phase3():
         # The selection must reach the compute layer — a prerender for exactly
         # the object we clicked.
-        req = [r for r in w.worker.sent if r.get("op") == "seg_extract"]
+        req = w.worker.sent("seg_extract")
         R["prerender_sent"] = bool(req)
         R["prerender_ids"] = req[-1].get("ids") if req else None
         loop.quit()

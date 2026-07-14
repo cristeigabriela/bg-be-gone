@@ -36,6 +36,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Gtk, Gio, Adw  # noqa: E402
 
 import app as A  # noqa: E402
+from engine.ports import RecordingPort  # noqa: E402
 
 GOLDEN = os.path.join(SPEC, "goldens", "sidebar.json")
 
@@ -48,21 +49,12 @@ SEG_MODELS = [
 ]
 
 
-class StubWorker:
-    def __init__(self, on_message):
-        self.ok = True
-        self.error = None
-        self.sent = []
-
-    def send(self, req):
-        self.sent.append(req)
-        return 1
-
-    def shutdown(self):
-        pass
+class StubPort(RecordingPort):
+    def __init__(self, python, script, on_event, log=None):
+        super().__init__(on_event)
 
 
-A.Worker = StubWorker
+A.WorkerPort = StubPort
 
 _wins = []
 _orig = A.Window.__init__

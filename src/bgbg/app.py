@@ -2,16 +2,13 @@
 """bg-be-gone — GTK/libadwaita frontend.
 
 Runs on the system Python. Image processing happens in a persistent worker
-subprocess (worker.py) inside the bundled virtualenv, which keeps the model
+subprocess (compute/service.py) inside the bundled virtualenv, which keeps the model
 resident on the GPU. Frontend and worker talk over line-delimited JSON.
 """
 import os
 import sys
-import json
 import shutil
 import tempfile
-import threading
-import subprocess
 
 import gi
 gi.require_version("Gtk", "4.0")
@@ -22,13 +19,15 @@ from gi.repository import Gtk, Gdk, GdkPixbuf, Gio, GLib, Adw  # noqa: E402
 
 from shell_gtk.canvas import ImageView  # noqa: E402
 from shell_gtk.sidebar import Sidebar  # noqa: E402
+from shell_gtk.worker_port import WorkerPort  # noqa: E402
 from engine import interactables as IX  # noqa: E402
 
 APP_ID = "io.github.cristeigabriela.BgBeGone"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 VENV_PY = (os.environ.get("BGBG_VENV_PYTHON")
            or os.path.expanduser("~/.local/share/bg-be-gone/venv/bin/python"))
-WORKER = os.environ.get("BGBG_WORKER", os.path.join(APP_DIR, "worker.py"))
+WORKER = os.environ.get("BGBG_WORKER",
+                        os.path.join(APP_DIR, "compute", "service.py"))
 LOG = os.path.join(GLib.get_user_cache_dir(), "bg-be-gone-worker.log")
 APP_VERSION = os.environ.get("BGBG_VERSION", "1.1.0")
 
@@ -153,62 +152,6 @@ def action_bar(primary=None, secondary=(), cancel=None, save=None, status_text="
     if save is not None:
         bar.append(save)
     return bar, status, spinner
-
-
-class Worker:
-    """Owns the venv subprocess and dispatches replies to the main loop."""
-
-    def __init__(self, on_message):
-        self._on_message = on_message
-        self._next_id = 1
-        self.ok = False
-        self.error = None
-        try:
-            self._logf = open(LOG, "a")
-            self.proc = subprocess.Popen(
-                [VENV_PY, WORKER], stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=self._logf, text=True, bufsize=1)
-            threading.Thread(target=self._reader, daemon=True).start()
-            self.ok = True
-        except Exception as e:
-            self.error = str(e)
-
-    def _reader(self):
-        for line in self.proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except Exception:
-                continue
-            GLib.idle_add(self._on_message, msg)
-
-    def send(self, req):
-        if not self.ok:
-            return -1
-        rid = self._next_id
-        self._next_id += 1
-        req["id"] = rid
-        try:
-            self.proc.stdin.write(json.dumps(req) + "\n")
-            self.proc.stdin.flush()
-        except Exception:
-            pass
-        return rid
-
-    def shutdown(self):
-        if not self.ok:
-            return
-        try:
-            self.proc.stdin.write('{"op":"shutdown"}\n')
-            self.proc.stdin.flush()
-            self.proc.wait(timeout=2)
-        except Exception:
-            try:
-                self.proc.terminate()
-            except Exception:
-                pass
 
 
 class Panel:
@@ -359,7 +302,8 @@ class Window(Adw.ApplicationWindow):
         self.seg_point_mask = None     # last point-mode mask path
         self.seg_result_output = None
         self._seg_rows = {}            # object id -> layer-list row widgets
-        self.worker = Worker(self._on_worker_message)
+        self.worker = WorkerPort(VENV_PY, WORKER, self._on_worker_message,
+                                 log=LOG)
 
         self.toasts = Adw.ToastOverlay()
         self.set_content(self.toasts)

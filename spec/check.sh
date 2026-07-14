@@ -32,12 +32,16 @@ run "hit-testing"             python tests/test_engine_hittest.py
 run "animation state machine" python tests/test_engine_anim.py
 run "interaction (events->effects)" python tests/test_engine_interaction.py
 run "settings / UiSchema"     python tests/test_engine_settings.py
+run "compute protocol"        python tests/test_engine_protocol.py
 
 echo "── renderer ────────────────────────────────"
 run "render goldens (22)"     python spec/tools/rasterize.py --check
 run "display-list goldens"    python spec/tools/displaylist.py --check
 run "sidebar (row-for-row)"   timeout 60 python spec/tools/uidump.py --check
 run "mask union (regression)" python tests/test_mask_union.py
+
+echo "── compute (real worker subprocess, no GTK) ─"
+run "worker smoke (starts, seg+rembg)" timeout 180 python tests/test_worker_smoke.py
 
 echo "── live (real GTK window) ──────────────────"
 run "tick / dwell / press"    timeout 60 python tests/test_live_tick.py

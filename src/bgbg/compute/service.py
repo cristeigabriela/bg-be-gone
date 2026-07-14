@@ -53,6 +53,13 @@ import os
 import sys
 import glob
 
+# This lives in bgbg/compute/ but `segmentation` is still a sibling of the
+# package (it becomes compute/sam.py in step 10), so put bgbg/ on the path.
+# Getting this wrong would not raise: the `import segmentation` below is inside a
+# try/except that degrades to "this worker has no segmentation", so it would
+# silently lose half the app instead of failing.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 def _ensure_gpu_libs():
     """Put any venv-bundled NVIDIA CUDA/cuDNN libs on LD_LIBRARY_PATH.

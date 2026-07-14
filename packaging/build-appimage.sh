@@ -61,7 +61,7 @@ cat > "$APPDIR/AppRun" <<'EOF'
 HERE="$(dirname "$(readlink -f "$0")")"
 export PYTHONHOME="$HERE/usr"
 export BGBG_VENV_PYTHON="$HERE/usr/bin/python3"
-export BGBG_WORKER="$HERE/usr/lib/bg-be-gone/src/bgbg/worker.py"
+export BGBG_WORKER="$HERE/usr/lib/bg-be-gone/src/bgbg/compute/service.py"
 for hook in "$HERE"/apprun-hooks/*.sh; do [ -f "$hook" ] && . "$hook"; done
 # The gtk hook forces GTK_THEME="" which flattens libadwaita styling; drop it so
 # libadwaita applies its stylesheet and reads the host colour scheme/accent.
