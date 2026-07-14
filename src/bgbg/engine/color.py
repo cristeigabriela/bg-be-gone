@@ -1,6 +1,6 @@
 """Colour parsing. Stdlib only.
 
-The compute side names object colours as CSS hex (`segmentation.py` derives them
+The compute side names object colours as CSS hex (`compute/maskops.py` derives them
 from a hue ramp), and the engine speaks (r, g, b, a) floats in 0..1. The shell
 used to parse these with `Gdk.RGBA`, which is a GTK dependency the engine cannot
 have — and which quantises to **float32**, so it returns 0.31764707 where exact

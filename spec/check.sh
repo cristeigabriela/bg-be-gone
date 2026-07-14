@@ -44,6 +44,7 @@ run "mask union (regression)" python tests/test_mask_union.py
 echo "── compute (real worker subprocess, no GTK) ─"
 run "worker smoke (starts, seg+rembg)" timeout 180 python tests/test_worker_smoke.py
 run "outputter pixels (engine<->worker)" timeout 120 python tests/test_outputs_impl.py
+run "CV + model_io goldens"   timeout 180 python spec/tools/cvgold.py --check
 
 echo "── live (real GTK window) ──────────────────"
 run "tick / dwell / press"    timeout 60 python tests/test_live_tick.py

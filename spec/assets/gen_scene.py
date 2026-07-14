@@ -22,7 +22,7 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src", "bgbg"))
-import segmentation as seg  # noqa: E402
+from compute import maskops as seg  # noqa: E402
 
 W, H = 160, 120
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scene")

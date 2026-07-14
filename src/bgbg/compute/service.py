@@ -53,11 +53,12 @@ import os
 import sys
 import glob
 
-# This lives in bgbg/compute/ but `segmentation` is still a sibling of the
-# package (it becomes compute/sam.py in step 10), so put bgbg/ on the path.
-# Getting this wrong would not raise: the `import segmentation` below is inside a
+# The worker is launched as a *script*, so sys.path[0] is bgbg/compute/ — put
+# bgbg/ on the path so `from compute import ...` resolves.
+# Getting this wrong would not raise: the segmentation import below is inside a
 # try/except that degrades to "this worker has no segmentation", so it would
-# silently lose half the app instead of failing.
+# silently lose half the app instead of failing. tests/test_worker_smoke.py is
+# there to catch exactly that.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -108,8 +109,11 @@ except Exception:  # noqa: BLE001
     sessions_names = []
 
 # Segmentation is optional too (needs the extra numpy dependency + weights).
+# `sam` is the model half; `maskops` is the CV half (contours, id maps, NMS) —
+# the one that gets mirrored into TypeScript.
 try:
-    import segmentation as seg
+    from compute import sam as seg
+    from compute import maskops
     _HAVE_SEG = True
 except Exception:  # noqa: BLE001
     _HAVE_SEG = False
@@ -496,7 +500,7 @@ def handle_seg_everything(req):
     if _cancel.is_set():
         out({"type": "seg_canceled", "id": rid})
         return
-    maps, objs = seg.save_objects(masks, _seg["size"], _seg["maskdir"], f"e{rid}")
+    maps, objs = maskops.save_objects(masks, _seg["size"], _seg["maskdir"], f"e{rid}")
     _seg["objects"] = objs
     out({"type": "seg_objects", "label_map": maps["label"],
          "general_map": maps["general"], "depth_map": maps["depth"],
@@ -519,9 +523,9 @@ def handle_seg_point(req):
     mask, score, low = session.decode_points(points, labels, prev_low=prev)
     _seg["prev_low"] = low
     mp = os.path.join(_seg["maskdir"], f"p{rid}.png")
-    bbox = seg.save_mask(mask, mp)
+    bbox = maskops.save_mask(mask, mp)
     out({"type": "seg_mask", "mask": mp, "score": round(score, 3),
-         "bbox": bbox, "contour": seg.contour(mask), "id": rid})
+         "bbox": bbox, "contour": maskops.contour(mask), "id": rid})
 
 
 def handle_seg_extract(req):
@@ -541,8 +545,8 @@ def handle_seg_extract(req):
              "id": rid})
         return
     t = time.time()
-    alpha = seg.load_union(paths)
-    seg.composite_extract(_seg["image"], alpha, bg, dst, blur=blur)
+    alpha = maskops.load_union(paths)
+    maskops.composite_extract(_seg["image"], alpha, bg, dst, blur=blur)
     out({"type": "seg_extracted", "output": dst,
          "seconds": round(time.time() - t, 2), "id": rid})
 
