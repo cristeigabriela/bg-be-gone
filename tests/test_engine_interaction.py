@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "src", "bgbg"))
 from engine.hittest import PixelMap                                # noqa: E402
 from engine.session import EngineSession                           # noqa: E402
 from engine.effects import (                                       # noqa: E402
-    Redraw, RequestTick, StopTick, SetCursor, GrabFocus, ViewChanged,
+    Redraw, RequestTick, SetCursor, GrabFocus, ViewChanged,
     ContextMenu, HoverChanged, SelectionChanged, SegClick,
 )
 from engine.events import (                                        # noqa: E402
