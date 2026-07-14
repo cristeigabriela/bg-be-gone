@@ -29,7 +29,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk  # noqa: E402
 
 import rasterize as R  # noqa: E402
-from engine.render.codec import to_json, from_json, encode  # noqa: E402
+from engine.render.codec import to_json, from_json  # noqa: E402
 
 GOLDENS = os.path.join(SPEC, "goldens", "display_list")
 

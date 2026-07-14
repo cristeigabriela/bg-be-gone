@@ -10,7 +10,6 @@ Needs the venv + a cached SAM model. Run: python tests/test_live_segment.py
 """
 import os
 import sys
-import json
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(HERE, "..")

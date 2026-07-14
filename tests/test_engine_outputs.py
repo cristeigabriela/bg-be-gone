@@ -75,34 +75,16 @@ def test_resolve():
           OUT.resolve("blur").params, {"strength": 20})
 
 
-def test_parity_with_the_worker():
-    """engine.outputs and compute.outputs_impl must agree on what each `bg`
-    means. outputs_impl needs PIL, so only import it if it is available — the
-    engine half is the one that must work everywhere."""
-    try:
-        from compute import outputs_impl
-    except ImportError:
-        print("  (compute.outputs_impl needs PIL — skipping the parity check)")
-        return
-
-    for bg in ("transparent", "blur", "#00b140"):
-        eff = OUT.resolve(bg)
-        # apply_bg is keyed by the same `bg` string the protocol carries, and
-        # dispatches to the same effect ids the engine registry declares.
-        check("the worker knows the effect the engine resolved for %r" % bg,
-              eff.id in ("transparent", "blur", "solid"), True)
-    check("both sides agree a solid background fills the whole canvas "
-          "(not just the subject)",
-          OUT.resolve("#ffffff").fill, (1.0, 1.0, 1.0, 1.0))
-
-
 def main():
     print("the registry")
     test_registry()
     print("resolve(): the bg setting -> an effect")
     test_resolve()
-    print("parity with the worker's implementation")
-    test_parity_with_the_worker()
+    # Parity with the worker's pixels is NOT checked here: this file is
+    # stdlib-only (it is the engine's half), and an import-it-and-assert-a-
+    # string-is-a-string "parity" check would prove nothing. The real one —
+    # the engine's display-list fill vs the worker's background pixel — needs
+    # PIL and lives in tests/test_outputs_impl.py.
     print()
     if FAILED:
         print("OUTPUTS FAILED (%d): %s" % (len(FAILED), ", ".join(FAILED)))

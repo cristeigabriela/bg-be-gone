@@ -27,7 +27,7 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("Gsk", "4.0")
 gi.require_version("Graphene", "1.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Gtk, Gdk, Gsk, Graphene, GdkPixbuf  # noqa: E402
+from gi.repository import Gtk, Gsk, Graphene, GdkPixbuf  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPEC = os.path.dirname(HERE)
