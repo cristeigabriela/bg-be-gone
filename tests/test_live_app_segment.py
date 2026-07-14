@@ -125,11 +125,28 @@ def main():
         return False
 
     def phase3():
-        # The selection must reach the compute layer — a prerender for exactly
-        # the object we clicked.
+        # Step 9: with a transparent background (the default), the preview is a
+        # display list — so NOTHING should have been sent to the worker, and the
+        # result panel should already be showing the cutout.
+        rv = w.seg_res_panel.view
+        R["no_roundtrip"] = not w.worker.sent("seg_extract")
+        R["preview_is_local"] = rv.session.objects.clip_active
+        R["preview_masks"] = len(rv.textures.clip)
+        R["preview_bg"] = rv.session.objects.clip_bg
+        R["save_enabled"] = w.seg_save_btn.get_sensitive()
+
+        # ... and switching to Blur — the one effect that needs real pixels —
+        # must fall back to the worker.
+        w.settings.set("bg", "blur")
+        w._update_seg_preview()
+        GLib.timeout_add(400, phase4)     # > the 150ms debounce
+        return False
+
+    def phase4():
+        R["blur_roundtrips"] = bool(w.worker.sent("seg_extract"))
         req = w.worker.sent("seg_extract")
-        R["prerender_sent"] = bool(req)
-        R["prerender_ids"] = req[-1].get("ids") if req else None
+        R["blur_ids"] = req[-1].get("ids") if req else None
+        R["blur_bg"] = req[-1].get("bg") if req else None
         loop.quit()
         return False
 
@@ -145,9 +162,20 @@ def main():
         ("hover -> app writes the stacked hint", R.get("hover_reached_app")),
         ("click -> exactly one object selected", len(sel) == 1),
         ("click -> app updates the sidebar", R.get("click_reached_app")),
-        ("selection reaches the compute layer", R.get("prerender_sent")),
-        ("... for the object that was clicked",
-         R.get("prerender_ids") == sel),
+        # step 9: the local outputter
+        ("transparent preview costs NO worker round-trip", R.get("no_roundtrip")),
+        ("... the result panel draws the cutout itself",
+         R.get("preview_is_local")),
+        ("... clipped to the object that was clicked",
+         R.get("preview_masks") == len(sel)),
+        ("... with no fill (the checkerboard shows through)",
+         R.get("preview_bg") is None),
+        ("... and Save is enabled without waiting for the worker",
+         R.get("save_enabled")),
+        ("Blur DOES round-trip (it needs the real pixels)",
+         R.get("blur_roundtrips")),
+        ("... for the same object, with bg=blur",
+         R.get("blur_ids") == sel and R.get("blur_bg") == "blur"),
     ]
     ok = True
     for label, got in checks:

@@ -812,25 +812,17 @@ def load_union(paths):
     return out
 
 
-def _hex_to_rgb(s):
-    s = s.lstrip("#")
-    return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
-
-
 def composite_extract(src_pil, alpha, bg, dst, blur=20):
     """Composite the ``alpha`` (uint8 HxW) cutout of ``src_pil`` over ``bg`` and
-    save to ``dst``. ``bg`` is "transparent" / "blur" / "#rrggbb"."""
+    save to ``dst``. ``bg`` is "transparent" / "blur" / "#rrggbb".
+
+    The background itself is the outputter's job (``compute.outputs_impl``) —
+    the same one the background-removal and GIF paths use, so a new effect is
+    added in one place rather than three.
+    """
+    from compute import outputs_impl
+
     src = src_pil.convert("RGB")
-    cutout = src.convert("RGBA")
-    cutout.putalpha(Image.fromarray(alpha.astype(np.uint8), "L"))
-    if bg == "transparent":
-        cutout.save(dst)
-    elif bg == "blur":
-        base = src.filter(ImageFilter.GaussianBlur(max(1, blur))).convert("RGBA")
-        base.alpha_composite(cutout)
-        base.convert("RGB").save(dst)
-    else:
-        flat = Image.new("RGBA", cutout.size, _hex_to_rgb(bg) + (255,))
-        flat.alpha_composite(cutout)
-        flat.convert("RGB").save(dst)
+    cut = outputs_impl.cutout(src, Image.fromarray(alpha.astype(np.uint8), "L"))
+    outputs_impl.apply_bg(cut, bg, source=src, blur=blur).save(dst)
     return dst

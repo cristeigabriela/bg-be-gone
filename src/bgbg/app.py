@@ -21,6 +21,7 @@ from shell_gtk.canvas import ImageView  # noqa: E402
 from shell_gtk.sidebar import Sidebar  # noqa: E402
 from shell_gtk.worker_port import WorkerPort  # noqa: E402
 from engine import interactables as IX  # noqa: E402
+from engine import outputs as OUT  # noqa: E402
 
 APP_ID = "io.github.cristeigabriela.BgBeGone"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -838,21 +839,63 @@ class Window(Adw.ApplicationWindow):
             req["ids"] = list(self.seg_panel.view.get_seg_selection())
         return req
 
+    def _cancel_seg_preview(self):
+        if getattr(self, "_seg_preview_timer", None):
+            GLib.source_remove(self._seg_preview_timer)
+            self._seg_preview_timer = None
+
     def _update_seg_preview(self):
-        """Debounced worker prerender: the right panel shows the real output —
-        all selected objects composited over the chosen background — exactly like
-        the Single result, and as a normal image you can flip/rotate/zoom."""
+        """Show the real output — the selected objects over the chosen
+        background — in the right panel.
+
+        A transparent or solid background is just display-list ops (a mask and a
+        fill), so the renderer draws it *now*: no worker, no temp PNG, no 150 ms
+        debounce. Only Blur genuinely needs the pixels, so only Blur still costs
+        a round-trip. See engine/outputs.py.
+        """
         if not self._seg_has_selection():
-            if getattr(self, "_seg_preview_timer", None):
-                GLib.source_remove(self._seg_preview_timer)
-                self._seg_preview_timer = None
+            self._cancel_seg_preview()
             self.seg_res_panel.view.clear()
             self.seg_result_output = None
             self.seg_save_btn.set_sensitive(False)
             return
-        if getattr(self, "_seg_preview_timer", None):
-            GLib.source_remove(self._seg_preview_timer)
+
+        eff = OUT.resolve(IX.background(self.settings),
+                          IX.blur_strength(self.settings))
+        if eff.local:
+            self._cancel_seg_preview()      # a pending blur prerender is stale
+            self._seg_live_preview(eff)
+            return
+
+        self._cancel_seg_preview()
         self._seg_preview_timer = GLib.timeout_add(150, self._do_seg_prerender)
+
+    def _seg_preview_masks(self):
+        """The mask textures the cutout is clipped to."""
+        v = self.seg_panel.view
+        if self._seg_mode() == "point":
+            tex = v.point_texture()
+            return [tex] if tex is not None else []
+        return [t for t in (v.seg_texture(i) for i in v.get_seg_selection())
+                if t is not None]
+
+    def _seg_live_preview(self, eff):
+        """Draw the cutout on the canvas, this frame. The masks are already
+        uploaded (they are the same textures the Segment panel highlights with),
+        so this is a display list, not a render."""
+        src = self.seg_panel.view.pixbuf
+        masks = self._seg_preview_masks()
+        if src is None or not masks:
+            return
+        rv = self.seg_res_panel.view
+        if rv.pixbuf is src and rv.session.objects.clip_active:
+            rv.update_composite(masks, eff.fill)      # keep zoom/pan/transform
+        else:
+            rv.set_composite(src, masks, eff.fill)
+        # Save still renders the real PNG in the worker — the canvas preview is
+        # not a file.
+        self.seg_result_output = None
+        self.seg_save_btn.set_sensitive(True)
 
     def _do_seg_prerender(self):
         self._seg_preview_timer = None

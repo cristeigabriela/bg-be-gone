@@ -81,13 +81,21 @@ def _shimmer(scan_phase, rect, iw, ih):
 
 
 def _composite(sc, rect):
-    """Result-panel cutout: the source clipped to the union of selected masks."""
+    """The outputter's local preview: the source clipped to the union of the
+    selected masks, over the chosen background.
+
+    The background fills the WHOLE rect and the cutout goes on top — it is a
+    background, not a backing for the subject. Masking the fill to the subject
+    (as this did while it was dead code) paints the colour *underneath* the
+    object, where the object then covers it, so a solid background rendered as a
+    bare checkerboard and the preview disagreed with the file the worker saved.
+    This mirrors compute/outputs_impl.apply(): fill, then alpha_composite.
+    """
     if not sc.clip_masks:
         return []
     out = []
     if sc.clip_bg is not None:
-        out.append(Push(mask=MaskSpec(sc.clip_masks, rect, "keep"),
-                        children=[FillRect(rect, sc.clip_bg)]))
+        out.append(FillRect(rect, sc.clip_bg))
     out.append(Push(mask=MaskSpec(sc.clip_masks, rect, "keep"),
                     children=[DrawImage(sc.image, rect)]))
     return out

@@ -38,6 +38,7 @@ GOLDENS = os.path.join(SPEC, "goldens", "render")
 
 sys.path.insert(0, os.path.join(ROOT, "src", "bgbg"))
 from shell_gtk.canvas import ImageView  # noqa: E402
+from engine.color import parse_color  # noqa: E402
 
 
 def _ms_ago(ms):
@@ -122,6 +123,17 @@ def build_view(fx, meta, objs, maps):
         # the rings/colours the tween interpolates between
         objects.morph = objects.build_morph(int(mo["from"]), int(mo["to"]))
         anim.morph_t0 = _ms_ago(mo["ms_ago"])
+
+    comp = fx.get("composite")
+    if comp:
+        # The outputter's LOCAL preview (engine/outputs.py): the source clipped
+        # to a union of masks, over a solid fill or the bare checkerboard. This
+        # is what the Segment result panel now draws instead of round-tripping a
+        # PNG through the worker, so it needs to be pinned like everything else.
+        masks = [v.textures.masks[i] for i in comp["ids"]
+                 if i in v.textures.masks]
+        bg = parse_color(comp["bg"]) if comp.get("bg") else None
+        v.set_composite(v.pixbuf, masks, bg)
 
     pm = fx.get("point_mask")
     if pm:

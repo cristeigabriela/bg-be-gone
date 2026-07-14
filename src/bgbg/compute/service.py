@@ -93,8 +93,10 @@ import tempfile  # noqa: E402
 import threading  # noqa: E402
 import traceback  # noqa: E402
 
-from PIL import Image, ImageFilter  # noqa: E402
+from PIL import Image  # noqa: E402
 import onnxruntime as ort  # noqa: E402
+
+from compute import outputs_impl  # noqa: E402
 
 # Background removal is optional (a segmentation-only install ships without it).
 try:
@@ -230,11 +232,6 @@ def _remove_resilient(model, req_id, img, alpha):
         return remove(img, session=session, alpha_matting=alpha)
 
 
-def _hex_to_rgb(s):
-    s = s.lstrip("#")
-    return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
-
-
 def _checkerboard(size, cell=24):
     w, h = size
     board = Image.new("RGB", (w, h), (245, 245, 245))
@@ -252,29 +249,20 @@ def process_one(model, req_id, src, dst, alpha, bg, blur=20, want_preview=False)
     img = Image.open(src)
     res = _remove_resilient(model, req_id, img, alpha).convert("RGBA")
 
-    preview_path = None
-    if bg == "transparent":
-        res.save(dst)
-        if want_preview:
-            board = _checkerboard(res.size).convert("RGBA")
-            board.alpha_composite(res)
-            preview_path = dst + ".preview.png"
-            board.convert("RGB").save(preview_path)
-    elif bg == "blur":
-        # Keep the picture, blur only the background: sharp foreground (the
-        # model's cutout) composited over a Gaussian-blurred copy of the source.
-        base = img.convert("RGB").filter(ImageFilter.GaussianBlur(max(1, blur)))
-        base = base.convert("RGBA")
-        base.alpha_composite(res)
-        base.convert("RGB").save(dst)
-        if want_preview:
-            preview_path = dst
-    else:
-        flat = Image.new("RGBA", res.size, _hex_to_rgb(bg) + (255,))
-        flat.alpha_composite(res)
-        flat.convert("RGB").save(dst)
-        if want_preview:
-            preview_path = dst
+    # One outputter, shared with the segmentation extract path (outputs_impl).
+    outputs_impl.apply_bg(res, bg, source=img, blur=blur).save(dst)
+
+    if not want_preview:
+        return None
+    if bg != "transparent":
+        return dst
+    # Transparent has nothing to show against, so the preview gets a
+    # checkerboard baked in. (On the canvas the renderer draws one; this is for
+    # the saved-preview path, which is a flat image.)
+    board = _checkerboard(res.size).convert("RGBA")
+    board.alpha_composite(res)
+    preview_path = dst + ".preview.png"
+    board.convert("RGB").save(preview_path)
     return preview_path
 
 
@@ -354,16 +342,13 @@ def _apply_transform(im, rot, fh, fv):
 
 
 def _compose_frame(orig_rgba, cut_rgba, bg, blur):
-    """Apply the chosen background to one processed frame; returns RGBA."""
-    if bg == "transparent":
-        return cut_rgba
-    if bg == "blur":
-        base = orig_rgba.convert("RGB").filter(
-            ImageFilter.GaussianBlur(max(1, blur))).convert("RGBA")
-    else:
-        base = Image.new("RGBA", cut_rgba.size, _hex_to_rgb(bg) + (255,))
-    base.alpha_composite(cut_rgba)
-    return base
+    """Apply the chosen background to one processed GIF frame; returns RGBA.
+
+    The same outputter as the single and segment paths — the GIF encoder just
+    wants RGBA back rather than a file.
+    """
+    img = outputs_impl.apply_bg(cut_rgba, bg, source=orig_rgba, blur=blur)
+    return img.convert("RGBA")
 
 
 def _gif_palette_frame(path, transparent):
