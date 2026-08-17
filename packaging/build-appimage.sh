@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build an AppImage for bg-be-gone (variant: cpu | cuda | rocm).
+# Build an AppImage for bg-be-gone
+# (variant: cpu | cuda | rocm | rocm-gfx1031 | seg | seg-cuda | seg-rocm).
 #
 # Built on Arch Linux (locally and in the CI arch container) so the bundled
 # GTK4 + libadwaita match a normal Arch install (same look as running from
@@ -13,7 +14,7 @@ WORK="${WORK:-$ROOT/build}"
 APPDIR="$WORK/AppDir"
 ARCH="$(uname -m)"
 VERSION="${VERSION:-1.1.0}"; export VERSION
-VARIANT="${VARIANT:-cpu}"   # cpu | cuda | rocm | seg | seg-cuda | seg-rocm
+VARIANT="${VARIANT:-cpu}"   # cpu | cuda | rocm | rocm-gfx1031 | seg | seg-cuda | seg-rocm
 ID=io.github.cristeigabriela.BgBeGone
 export APPIMAGE_EXTRACT_AND_RUN=1   # so the tool AppImages run without FUSE
 
@@ -97,12 +98,21 @@ ADW_LIB="$(find /usr/lib -maxdepth 1 -name 'libadwaita-1.so.0' | head -1)"
   --library "$ADW_LIB" \
   --exclude-library 'libtcl*' --exclude-library 'libtk*'
 
-# AMD builds ship the stock onnxruntime-rocm, which covers the GPUs AMD builds
-# for. Cards outside that list (gfx1031 and friends) are NOT served by
-# impersonating another chip — that produces wrong output and can reset the GPU.
-# Point ROCM_WHEEL at a provider built for the target arch instead; see
-# https://github.com/cristeigabriela/onnxruntime-rocm-gfx1031
-ROCM_WHEEL="${ROCM_WHEEL:-onnxruntime-rocm}"
+# onnxruntime's ROCm provider ships precompiled kernels for a fixed set of GPUs.
+# The worker uses it only when it finds device code for the card in front of it
+# and otherwise runs on the CPU — a card is never made to impersonate another,
+# because that yields wrong output and can reset the GPU.
+#
+# So a ROCm AppImage only accelerates the arches its bundled provider was built
+# for. The stock wheel covers what AMD builds for; the gfx1031 variant bundles a
+# provider for Navi 22 (RX 6700/6750 XT), which the stock wheel has no code for
+# and which ROCm does not officially support. Those builds are single-arch, so
+# they are shipped separately rather than replacing the stock one.
+ROCM_WHEEL_GFX1031="https://github.com/cristeigabriela/onnxruntime-rocm-gfx1031/releases/download/v1.22.2-gfx1031/onnxruntime_rocm-1.22.2-cp312-cp312-linux_x86_64.whl"
+case "$VARIANT" in
+  *-gfx1031) ROCM_WHEEL="${ROCM_WHEEL:-$ROCM_WHEEL_GFX1031}" ;;
+  *)         ROCM_WHEEL="${ROCM_WHEEL:-onnxruntime-rocm}" ;;
+esac
 
 # --- add rembg + onnxruntime (variant) after GTK is bundled --------------
 # Install with the 3.12 venv python for wheel tags, into the bundled
@@ -116,7 +126,7 @@ case "$VARIANT" in
     uv pip install --python "$VPY" --target "$SITE_DST" --quiet "rembg[gpu]" \
       "numba>=0.60" "llvmlite>=0.43" nvidia-cuda-runtime nvidia-cublas \
       nvidia-cufft nvidia-curand nvidia-cudnn-cu13 ;;
-  rocm)
+  rocm|rocm-gfx1031)
     uv pip install --python "$VPY" --target "$SITE_DST" --quiet "rembg[cpu]" \
       "numba>=0.60" "llvmlite>=0.43"
     # Every onnxruntime flavour owns the same package dir, so clear the CPU one
@@ -128,7 +138,7 @@ case "$VARIANT" in
     uv pip install --python "$VPY" --target "$SITE_DST" --quiet \
       onnxruntime-gpu numpy pillow nvidia-cuda-runtime nvidia-cublas \
       nvidia-cufft nvidia-curand nvidia-cudnn-cu13 ;;
-  seg-rocm)
+  seg-rocm|seg-rocm-gfx1031)
     uv pip install --python "$VPY" --target "$SITE_DST" --quiet \
       numpy pillow "$ROCM_WHEEL" flatbuffers packaging protobuf coloredlogs sympy ;;
   seg)
