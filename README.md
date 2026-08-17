@@ -131,8 +131,37 @@ The worker picks the first available ONNX Runtime provider: CUDA (NVIDIA),
 ROCm/MIGraphX (AMD), then CPU. The active device is shown in the status bar.
 
 - NVIDIA: `install.sh` installs `onnxruntime-gpu` and the required CUDA runtime.
-- AMD: `install.sh` installs the CPU runtime and attempts `onnxruntime-rocm`. For
-  ROCm acceleration you may need to install a wheel matching your ROCm version.
+- AMD: `install.sh` installs `onnxruntime-rocm`, checks the provider actually
+  contains device code for your GPU, then runs a small model on it to confirm
+  before claiming acceleration works. You need the ROCm runtime from your distro;
+  if it is missing, the installer names the packages and falls back to the CPU.
+
+### AMD: your GPU is never impersonated
+
+onnxruntime's ROCm provider ships *precompiled* kernels for a fixed list of
+chips. Cards outside that list — including every RDNA2 die except the 6800/6900
+— are commonly made to work by impersonating a sibling with
+`HSA_OVERRIDE_GFX_VERSION`. **bg-be-gone never does this**, because it is not
+safe: an RX 6750 XT (gfx1031, 40 CU) running gfx1030 (80 CU) kernels produces
+NaN on BiRefNet and then hangs the GPU hard enough to force a full reset,
+taking the desktop compositor with it.
+
+Instead the installer reads the offload-bundle tags out of the provider binary
+and uses the GPU only if code for your exact arch is present. If it is not, the
+CPU is used — slower, but correct, and it cannot wedge your machine.
+
+To get GPU acceleration on a card the stock wheel does not cover, install a
+provider built for it and re-run the installer:
+
+```sh
+BGBG_ROCM_WHEEL=/path/to/onnxruntime_rocm-*.whl ./install.sh
+```
+
+A checkout of
+[onnxruntime-rocm-gfx1031](https://github.com/cristeigabriela/onnxruntime-rocm-gfx1031)
+sitting next to this one is picked up automatically. It carries the patches, the
+build script and prebuilt wheels for gfx1031 (RX 6700/6750 XT), which measures
+0.707 s/image on BiRefNet with no faults.
 
 If the GPU cannot run a model — usually not enough free VRAM — that image falls
 back to the CPU (slower) instead of failing, and the GPU is used again once VRAM

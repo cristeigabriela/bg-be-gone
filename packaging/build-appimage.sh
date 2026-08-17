@@ -97,6 +97,13 @@ ADW_LIB="$(find /usr/lib -maxdepth 1 -name 'libadwaita-1.so.0' | head -1)"
   --library "$ADW_LIB" \
   --exclude-library 'libtcl*' --exclude-library 'libtk*'
 
+# AMD builds ship the stock onnxruntime-rocm, which covers the GPUs AMD builds
+# for. Cards outside that list (gfx1031 and friends) are NOT served by
+# impersonating another chip — that produces wrong output and can reset the GPU.
+# Point ROCM_WHEEL at a provider built for the target arch instead; see
+# https://github.com/cristeigabriela/onnxruntime-rocm-gfx1031
+ROCM_WHEEL="${ROCM_WHEEL:-onnxruntime-rocm}"
+
 # --- add rembg + onnxruntime (variant) after GTK is bundled --------------
 # Install with the 3.12 venv python for wheel tags, into the bundled
 # site-packages, so linuxdeploy never sees these self-contained wheels.
@@ -112,14 +119,18 @@ case "$VARIANT" in
   rocm)
     uv pip install --python "$VPY" --target "$SITE_DST" --quiet "rembg[cpu]" \
       "numba>=0.60" "llvmlite>=0.43"
+    # Every onnxruntime flavour owns the same package dir, so clear the CPU one
+    # before unpacking the ROCm build over the top.
     rm -rf "$SITE_DST/onnxruntime" "$SITE_DST"/onnxruntime-[0-9]*.dist-info
-    uv pip install --python "$VPY" --target "$SITE_DST" --quiet onnxruntime-rocm ;;
+    uv pip install --python "$VPY" --target "$SITE_DST" --quiet \
+      "$ROCM_WHEEL" coloredlogs sympy ;;
   seg-cuda)
     uv pip install --python "$VPY" --target "$SITE_DST" --quiet \
       onnxruntime-gpu numpy pillow nvidia-cuda-runtime nvidia-cublas \
       nvidia-cufft nvidia-curand nvidia-cudnn-cu13 ;;
   seg-rocm)
-    uv pip install --python "$VPY" --target "$SITE_DST" --quiet numpy pillow onnxruntime-rocm ;;
+    uv pip install --python "$VPY" --target "$SITE_DST" --quiet \
+      numpy pillow "$ROCM_WHEEL" flatbuffers packaging protobuf coloredlogs sympy ;;
   seg)
     uv pip install --python "$VPY" --target "$SITE_DST" --quiet onnxruntime numpy pillow ;;
   *)

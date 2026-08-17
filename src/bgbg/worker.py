@@ -54,6 +54,125 @@ import sys
 import glob
 
 
+_rocm_unsafe = False       # provider has no code for this card — skip ROCm
+
+
+def _gfx_arch():
+    """The AMD GPU's LLVM target (``"gfx1031"``) via amdkfd, or None.
+
+    The driver packs it as major*10000 + minor*100 + step, with minor and step
+    as nibbles in the name, so 100301 is gfx1031 and 90010 is gfx90a.
+    """
+    for props in sorted(glob.glob("/sys/class/kfd/kfd/topology/nodes/*/properties")):
+        try:
+            with open(props) as f:
+                for line in f:
+                    if line.startswith("gfx_target_version"):
+                        v = int(line.split()[1])
+                        if v:
+                            return "gfx%d%x%x" % (v // 10000, v // 100 % 100, v % 100)
+        except (OSError, ValueError, IndexError):
+            continue
+    return None
+
+
+def _rocm_ep_path():
+    """Path to the installed ROCm execution provider, or None.
+
+    Located on disk rather than through ``ort.get_available_providers()``,
+    because this has to run before onnxruntime is imported.
+    """
+    venv = os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
+    found = glob.glob(os.path.join(
+        venv, "lib", "python*", "site-packages", "onnxruntime", "capi",
+        "libonnxruntime_providers_rocm.so"))
+    return found[0] if found else None
+
+
+def _have_rocm_ep():
+    return _rocm_ep_path() is not None
+
+
+def _rocm_ep_has_arch(arch):
+    """True if the ROCm provider carries device code for `arch`.
+
+    hipcc tags each embedded offload bundle with its target triple, so the
+    binary is asked directly rather than matched against a list of what some
+    wheel is assumed to ship — which is what lets a provider built locally for
+    this exact card be recognised as usable.
+    """
+    path = _rocm_ep_path()
+    if not path:
+        return False
+    needle = ("amdgcn-amd-amdhsa--" + arch).encode()
+    try:
+        with open(path, "rb") as f:
+            overlap = b""
+            while True:
+                block = f.read(8 << 20)
+                if not block:
+                    return False
+                if needle in overlap + block:
+                    return True
+                overlap = block[-len(needle):]
+    except OSError:
+        return False
+
+
+def _check_rocm_arch():
+    """Drop the ROCm provider unless it has device code for this card.
+
+    install.sh settles this at install time; this is the backstop for a venv
+    that predates it, a card swapped since, or the AppImage.
+
+    Deliberately no HSA_OVERRIDE_GFX_VERSION fallback. Making a card run a
+    sibling's kernels is the usual advice for GPUs ROCm does not support, and it
+    is not safe: mismatched kernels decode as garbage on the shader core, page
+    fault, time out the graphics ring and force a GPU reset that takes the
+    compositor with it. The CPU is slower but correct.
+    """
+    global _rocm_unsafe
+    # Kill switch, for taking ROCm out of the picture without rebuilding.
+    if os.environ.get("BGBG_NO_ROCM"):
+        _rocm_unsafe = True
+        return
+    if not _have_rocm_ep():
+        return
+    arch = _gfx_arch()
+    if arch is not None and not _rocm_ep_has_arch(arch):
+        _rocm_unsafe = True
+
+
+def _load_gpu_env():
+    """Apply the GPU settings install.sh recorded in ``gpu.env``.
+
+    Tuning the GPU stack reads only at process start, so it has to land before
+    onnxruntime is imported. Kept out of the user's global environment on
+    purpose — it would affect every other ROCm app too. Anything already set
+    wins, so it stays overridable per-launch.
+    """
+    venv = os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
+    for path in (os.environ.get("BGBG_GPU_ENV"),
+                 os.path.join(os.path.dirname(venv), "gpu.env"),
+                 os.path.join(os.environ.get("XDG_DATA_HOME",
+                                             os.path.expanduser("~/.local/share")),
+                              "bg-be-gone", "gpu.env")):
+        if not path:
+            continue
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            os.environ.setdefault(key.strip(), val.strip())
+        return
+
+
 def _ensure_gpu_libs():
     """Put any venv-bundled NVIDIA CUDA/cuDNN libs on LD_LIBRARY_PATH.
 
@@ -75,6 +194,8 @@ def _ensure_gpu_libs():
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
+_load_gpu_env()
+_check_rocm_arch()
 _ensure_gpu_libs()
 
 import gc  # noqa: E402
@@ -85,6 +206,7 @@ import shutil  # noqa: E402
 import tempfile  # noqa: E402
 import threading  # noqa: E402
 import traceback  # noqa: E402
+import warnings  # noqa: E402
 
 from PIL import Image, ImageFilter  # noqa: E402
 import onnxruntime as ort  # noqa: E402
@@ -145,6 +267,8 @@ def _name(p):
 
 def preferred_providers():
     avail = set(ort.get_available_providers())
+    if _rocm_unsafe:
+        avail -= {"ROCMExecutionProvider", "MIGraphXExecutionProvider"}
     chosen = []
     for p in _PROVIDER_ORDER:
         if p not in avail:
@@ -166,10 +290,26 @@ _GPU_PROVIDERS = {"CUDAExecutionProvider", "ROCMExecutionProvider",
                   "MIGraphXExecutionProvider"}
 
 
+def _session_options():
+    """Session options for the rembg models.
+
+    Graph optimisation is off for the same reason segmentation.py turns it off
+    on the SAM graphs: onnxruntime's optimiser miscompiles a fused op and emits
+    NaN. On a GPU provider that is worse than a bad cutout — the miscompiled
+    kernel can fault the device hard enough to force a reset — so the models
+    that go through rembg get the same treatment.
+    """
+    so = ort.SessionOptions()
+    so.log_severity_level = 3
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    return so
+
+
 def get_session(model, req_id):
     if model not in _sessions:
         out({"type": "loading", "model": model, "id": req_id})
-        sess = new_session(model, providers=preferred_providers())
+        sess = new_session(model, sess_opts=_session_options(),
+                           providers=preferred_providers())
         active = sess.inner_session.get_providers()
         prov = active[0] if active else "CPUExecutionProvider"
         _sessions[model] = sess
@@ -185,7 +325,14 @@ def get_cpu_session(model, req_id):
     if model not in _cpu_sessions:
         out({"type": "loading", "model": model, "id": req_id})
         _cpu_sessions[model] = new_session(
-            model, providers=["CPUExecutionProvider"])
+            model, sess_opts=_session_options(),
+            providers=["CPUExecutionProvider"])
+    # Tell the UI the run moved to the CPU. Without this the status bar keeps
+    # claiming the GPU through every fallback, so a wrong-but-fast result and a
+    # correct-but-slow one look identical from the outside.
+    out({"type": "device", "provider": "CPUExecutionProvider",
+         "label": _PROVIDER_LABELS["CPUExecutionProvider"],
+         "gpu": False, "id": req_id})
     return _cpu_sessions[model]
 
 
@@ -193,6 +340,8 @@ def _is_ort_runtime_error(e):
     """True for an onnxruntime run failure — most importantly a GPU out-of-memory,
     which BiRefNet surfaces as a failed Mul node deep in the ASPP decoder."""
     if type(e).__module__.startswith("onnxruntime"):
+        return True
+    if isinstance(e, RuntimeWarning):      # NaN mask, promoted in _remove_resilient
         return True
     m = str(e).lower()
     return ("onnxruntimeerror" in m or "non-zero status" in m
@@ -206,7 +355,14 @@ def _remove_resilient(model, req_id, img, alpha):
     session is kept, so a later run recovers automatically once VRAM frees up."""
     session = get_session(model, req_id)
     try:
-        res = remove(img, session=session, alpha_matting=alpha)
+        with warnings.catch_warnings():
+            # A NaN mask does not raise: rembg scales the prediction to uint8,
+            # numpy warns "invalid value encountered in cast", and the user gets
+            # a silently garbage cutout that still reports success. Promote that
+            # one warning to an error so it lands in the CPU-retry path below.
+            warnings.filterwarnings("error", category=RuntimeWarning,
+                                    message="invalid value encountered")
+            res = remove(img, session=session, alpha_matting=alpha)
         _fallback_notified.discard(model)      # GPU healthy again
         return res
     except Exception as e:
