@@ -92,17 +92,28 @@ Uninstall with `./uninstall.sh` (add `--purge` to also remove the environment).
 
 ## AppImage
 
-Each [release](../../releases) attaches three AppImages — pick one for your
+Each [release](../../releases) attaches several AppImages — pick one for your
 hardware, `chmod +x`, and run:
 
 | File | Use |
 | --- | --- |
 | `bg-be-gone-<ver>-cpu-x86_64.AppImage` | Any machine (CPU only). |
 | `bg-be-gone-<ver>-cuda-x86_64.AppImage` | NVIDIA GPU (recent driver); CPU fallback. |
-| `bg-be-gone-<ver>-rocm-x86_64.AppImage` | AMD GPU with ROCm; CPU fallback. |
+| `bg-be-gone-<ver>-rocm-x86_64.AppImage` | AMD GPU that ROCm supports; CPU fallback. |
+| `bg-be-gone-<ver>-rocm-gfx1031-x86_64.AppImage` | AMD RX 6700 XT / 6750 XT (gfx1031) only. |
 | `bg-be-gone-<ver>-seg-x86_64.AppImage` | Lean, segmentation-only (no background removal). |
 
 The GPU builds are larger. If unsure, use the CPU build or install from source.
+
+**Which AMD build?** onnxruntime's ROCm provider carries precompiled kernels for
+a fixed set of GPUs, and bg-be-gone uses it only when it finds code for the card
+in front of it — otherwise it runs on the CPU. So the `rocm` build accelerates
+the GPUs AMD builds for (RX 6800/6900, RX 7000, Instinct), and the
+`rocm-gfx1031` build accelerates the RX 6700 XT / 6750 XT, which AMD does not
+ship kernels for. Each is single-arch: on the wrong card it still works, just on
+the CPU. If neither matches your GPU, the `cpu` build is the same experience
+without the download size — and see
+[GPU support](#gpu-support) for building a provider for your own card.
 
 ## Usage
 
@@ -127,8 +138,9 @@ The GPU builds are larger. If unsure, use the CPU build or install from source.
 
 ## GPU support
 
-The worker picks the first available ONNX Runtime provider: CUDA (NVIDIA),
-ROCm/MIGraphX (AMD), then CPU. The active device is shown in the status bar.
+The worker picks the first available ONNX Runtime provider: CUDA (NVIDIA), ROCm
+(AMD), then CPU. The active device is shown in the status bar — including when a
+run falls back, so a CPU result is never reported as a GPU one.
 
 - NVIDIA: `install.sh` installs `onnxruntime-gpu` and the required CUDA runtime.
 - AMD: `install.sh` installs `onnxruntime-rocm`, checks the provider actually
@@ -150,18 +162,37 @@ Instead the installer reads the offload-bundle tags out of the provider binary
 and uses the GPU only if code for your exact arch is present. If it is not, the
 CPU is used — slower, but correct, and it cannot wedge your machine.
 
-To get GPU acceleration on a card the stock wheel does not cover, install a
-provider built for it and re-run the installer:
+#### Getting your card accelerated anyway
+
+To use a GPU the stock wheel has no code for, supply a provider built for it and
+re-run the installer:
 
 ```sh
 BGBG_ROCM_WHEEL=/path/to/onnxruntime_rocm-*.whl ./install.sh
 ```
 
-A checkout of
-[onnxruntime-rocm-gfx1031](https://github.com/cristeigabriela/onnxruntime-rocm-gfx1031)
-sitting next to this one is picked up automatically. It carries the patches, the
-build script and prebuilt wheels for gfx1031 (RX 6700/6750 XT), which measures
-0.707 s/image on BiRefNet with no faults.
+For the RX 6700 XT / 6750 XT there is a prebuilt one — download the wheel from
+[onnxruntime-rocm-gfx1031 releases](https://github.com/cristeigabriela/onnxruntime-rocm-gfx1031/releases)
+and pass it as above. A checkout of that repo sitting next to this one is picked
+up automatically, so this also works:
+
+```sh
+git clone https://github.com/cristeigabriela/onnxruntime-rocm-gfx1031 ../onnxruntime-rocm-gfx1031
+./install.sh
+```
+
+Measured there on an RX 6750 XT: 0.707 s/image on BiRefNet-general, correct
+output, no GPU faults.
+
+**Another AMD card?** That repo's `./build.sh` builds a provider for any target
+(`ARCH=gfx1032 ./build.sh`) and carries the five upstream patches needed to
+compile against a current distro ROCm. Check first whether you need it at all —
+if this prints your arch, the stock wheel already covers you:
+
+```sh
+strings -a "$(python -c 'import onnxruntime,os;print(os.path.dirname(onnxruntime.__file__))')/capi/libonnxruntime_providers_rocm.so" \
+  | grep -oE 'amdgcn-amd-amdhsa--gfx[0-9a-z]+' | sort -u
+```
 
 If the GPU cannot run a model — usually not enough free VRAM — that image falls
 back to the CPU (slower) instead of failing, and the GPU is used again once VRAM

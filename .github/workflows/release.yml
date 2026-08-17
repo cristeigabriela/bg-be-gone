@@ -55,7 +55,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [cpu, cuda, rocm, seg]
+        # rocm-gfx1031 bundles a provider built for Navi 22 (RX 6700/6750 XT),
+        # which the stock ROCm wheel has no device code for. Single-arch, so it
+        # ships alongside `rocm` rather than replacing it.
+        variant: [cpu, cuda, rocm, rocm-gfx1031, seg]
     steps:
       - name: Install build dependencies
         run: |
