@@ -29,10 +29,30 @@ jobs:
           sudo apt-get install -y -qq shellcheck desktop-file-utils appstream
 
       - name: Shell scripts
-        run: shellcheck install.sh uninstall.sh bin/bg-be-gone packaging/build-appimage.sh
+        run: shellcheck install.sh uninstall.sh bin/bg-be-gone packaging/build-appimage.sh packaging/build-windows-gtk.sh
 
       - name: Desktop entry
         run: desktop-file-validate data/io.github.cristeigabriela.BgBeGone.desktop
 
       - name: AppStream metadata
         run: appstreamcli validate --no-net data/io.github.cristeigabriela.BgBeGone.metainfo.xml
+
+  windows-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Syntax check
+        run: python -m compileall -q src
+
+      - name: Lint PowerShell (PSScriptAnalyzer)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $issues = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
+          $issues | Format-Table -AutoSize
+          if ($issues) { throw "PSScriptAnalyzer found $($issues.Count) error(s)" }

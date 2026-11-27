@@ -129,6 +129,14 @@ to also remove the venv, the ROCm kernel cache and downloaded models). Models
 download on first use to `%LOCALAPPDATA%\bg-be-gone` (BiRefNet ~1 GB; SAM
 ~110–770 MB). MSYS2 stays installed; delete `C:\msys64` to remove it.
 
+Each [release](../../releases) also attaches prebuilt Windows artifacts per
+variant: `bg-be-gone-<ver>-<variant>-win64.zip` (portable — unzip and run
+`BgBeGone.vbs`) and `bg-be-gone-<ver>-<variant>-win64-setup.exe` (installer).
+Use `directml` for GPU acceleration, `cpu` for any machine, or `seg` for the
+lean segmentation-only build. On Blackwell (RTX 50-series) GPUs prefer
+`directml`; the `cuda` build targets older NVIDIA cards and otherwise falls back
+to CPU.
+
 ## AppImage
 
 Each [release](../../releases) attaches several AppImages — pick one for your

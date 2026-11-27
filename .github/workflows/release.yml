@@ -84,8 +84,67 @@ jobs:
           name: bg-be-gone-${{ matrix.variant }}
           path: dist/*.AppImage
 
+  windows:
+    needs: version
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # directml replaces the Linux rocm variant (universal DX12 GPU on Windows).
+        variant: [cpu, directml, cuda, seg]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (GTK4 + libadwaita + PyGObject)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-libadwaita
+            mingw-w64-ucrt-x86_64-python-gobject
+            mingw-w64-ucrt-x86_64-python-cairo
+            mingw-w64-ucrt-x86_64-librsvg
+            mingw-w64-ucrt-x86_64-adwaita-icon-theme
+            mingw-w64-ucrt-x86_64-hicolor-icon-theme
+            mingw-w64-ucrt-x86_64-shared-mime-info
+            mingw-w64-ucrt-x86_64-ntldd
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Collect GTK bundle + app
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ROOT="$(pwd)" VERSION="$VERSION" ./packaging/build-windows-gtk.sh
+
+      - name: Build worker venv (${{ matrix.variant }})
+        shell: pwsh
+        run: >-
+          ./packaging/build-windows-worker.ps1
+          -Variant ${{ matrix.variant }}
+          -Dest "dist/BgBeGone/worker"
+
+      - name: Package zip + installer
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          VARIANT: ${{ matrix.variant }}
+        run: ./packaging/package-windows.ps1 -Version $env:VERSION -Variant $env:VARIANT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # bg-be-gone-win-* keeps these distinct from the AppImage job's
+          # bg-be-gone-<variant> so merge-multiple in release doesn't collide.
+          name: bg-be-gone-win-${{ matrix.variant }}
+          path: dist-out/*
+
   release:
-    needs: [version, appimage]
+    needs: [version, appimage, windows]
     if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -99,5 +158,8 @@ jobs:
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           name: bg-be-gone ${{ needs.version.outputs.version }}
-          files: dist/*.AppImage
+          files: |
+            dist/*.AppImage
+            dist/*.zip
+            dist/*.exe
           generate_release_notes: true
