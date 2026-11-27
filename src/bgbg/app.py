@@ -242,7 +242,10 @@ class Worker:
                 msg = json.loads(line)
             except Exception:
                 continue
-            GLib.idle_add(self._on_message, msg)
+            # Above redraw priority: at the default idle priority, a reply could
+            # wait for as long as the Segment outlines kept animating, which on
+            # Windows starved it until the next input event.
+            GLib.idle_add(self._on_message, msg, priority=GLib.PRIORITY_DEFAULT)
 
     def send(self, req):
         if not self.ok:
@@ -376,7 +379,9 @@ class Panel:
             self.placeholder.set_visible(not has)
             self.zoom_badge.set_visible(has)
             return False
-        GLib.idle_add(apply)
+        # Still deferred past the current snapshot, but not starved by an
+        # animation like the worker replies above.
+        GLib.idle_add(apply, priority=GLib.PRIORITY_DEFAULT)
         if self._ext_change:
             self._ext_change()
 
@@ -385,7 +390,8 @@ class Panel:
         # never relayout mid-snapshot.
         if percent != self._last_pct:
             self._last_pct = percent
-            GLib.idle_add(self.zoom_badge.set_text, "%d%%" % percent)
+            GLib.idle_add(self.zoom_badge.set_text, "%d%%" % percent,
+                          priority=GLib.PRIORITY_DEFAULT)
 
 
 class Window(Adw.ApplicationWindow):
