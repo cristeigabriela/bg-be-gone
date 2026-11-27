@@ -47,6 +47,7 @@ Responses (one JSON object per line on stdout):
   {"type":"seg_mask","mask":P,"score":f,"bbox":[x,y,w,h],"id":N}
   {"type":"seg_extracted","output":P,"seconds":f,"id":N}
   {"type":"seg_canceled","id":N}
+  {"type":"notice","message":str,"id":N|null}   # shown to the user; null at start-up
   {"type":"error","message":str,"id":N}
 """
 import os
@@ -72,6 +73,7 @@ import warnings  # noqa: E402
 from PIL import Image, ImageFilter  # noqa: E402
 # Imports onnxruntime, then rembg when it is installed.
 from engines import ort as ort_engine  # noqa: E402
+from engines import selection  # noqa: E402
 
 # Segmentation is optional too (needs the extra numpy dependency + weights).
 try:
@@ -562,8 +564,25 @@ def _worker_loop(q):
         _dispatch(req)
 
 
+def _report_engine_choice():
+    """Say what the engine settings asked for. Only ONNX Runtime exists so far.
+
+    Runs once per start: skipped layers go to the worker log, and a request
+    for PyTorch also reaches the user, since it can't be honoured.
+    """
+    choice = selection.resolve()
+    for problem in choice.problems:
+        sys.stderr.write(f"engine setting ignored: {problem}\n")
+    if choice.engine is selection.Engine.TORCH:
+        message = (f"The PyTorch engine was asked for by {choice.source.value}, but "
+                   "this build doesn't have it yet. Using ONNX Runtime.")
+        sys.stderr.write(message + "\n")
+        out({"type": "notice", "message": message, "id": None})
+
+
 def main():
     _ready()
+    _report_engine_choice()
     q = queue.Queue()
     threading.Thread(target=_worker_loop, args=(q,), daemon=True).start()
     for line in sys.stdin:

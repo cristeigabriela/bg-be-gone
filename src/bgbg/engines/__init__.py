@@ -1,6 +1,8 @@
 """The engines that run the background-removal models.
 
 ``engines.ort`` runs them on ONNX Runtime through rembg, on every platform.
+``engines.selection`` says which engine the settings ask for.
+
 Each engine is a module of its own, so one the worker doesn't use is never
 imported. This package itself imports nothing heavy, so the frontend can
 use it too.
