@@ -275,6 +275,37 @@ def test_batch_cuts_out_every_still_format_and_skips_gifs_and_other_files(worker
         assert_cut_out(out)
 
 
+def test_batch_skips_an_animated_webp_and_says_where_it_goes(worker, tmp_path):
+    """Batch would keep only its first frame, as with a GIF."""
+    inp, outdir = tmp_path / "in", tmp_path / "out"
+    inp.mkdir()
+    shutil.copyfile(TESTDATA / "subject.webp", inp / "still.webp")
+    shutil.copyfile(TESTDATA / "animated.webp", inp / "moving.webp")
+    reply, seen = worker.ask(
+        {"op": "batch", "model": "u2netp", "id": 1,
+         "input_dir": str(inp), "output_dir": str(outdir)},
+        until={"done_batch", "error"})
+    assert reply["type"] == "done_batch", "the still WebP is still processed: %s" \
+        % reply.get("message")
+    assert [p.name for p in outdir.iterdir()] == ["still_nobg.png"], \
+        "the animation is skipped, not cut down to one frame"
+    notices = [r["message"] for r in seen if r.get("type") == "notice"]
+    assert any("moving.webp" in n and "Single" in n for n in notices), \
+        "the user is told which file was skipped and where to open it: %s" % notices
+
+
+@pytest.mark.parametrize("fixture, frames", [
+    ("animated.webp", 3),
+    # The odd one out: a still WebP is one frame.
+    ("subject.webp", 1),
+], ids=["animated", "still"])
+def test_frames_counts_a_webp_from_the_file_itself(worker, fixture, frames):
+    """The frontend asks this, not GdkPixbuf, whose WebP loader may decode stills only."""
+    reply, _ = worker.ask({"op": "frames", "id": 1, "input": str(TESTDATA / fixture)},
+                          until={"frames", "error"})
+    assert reply.get("frames") == frames, reply
+
+
 @pytest.fixture
 def cutout(worker, tmp_path):
     """A transparent cut-out of subject.png, as the frontend would save it."""
@@ -316,3 +347,26 @@ def test_an_unreadable_image_is_named_in_the_error_and_the_log(worker, tmp_path)
         "the error's first line, which the frontend shows, names the file"
     assert str(bad) in (tmp_path / "worker.log").read_text(), \
         "the worker log has the file's full path"
+
+
+def test_an_animated_webp_comes_back_animated_with_its_timing(worker, tmp_path):
+    """Animated WebP goes through the GIF pipeline but stays a WebP, with full alpha."""
+    out = tmp_path / "result.webp"
+    reply, _ = worker.ask(
+        {"op": "gif", "model": "u2netp", "id": 1,
+         "input": str(TESTDATA / "animated.webp"), "output": str(out)},
+        until={"gif_done", "error"})
+    assert reply["type"] == "gif_done", "the animation must succeed: %s" % reply.get("message")
+    result = Image.open(out)
+    assert result.format == "WEBP", "the result keeps the source's format"
+    assert result.n_frames == 3, "every frame is kept"
+    durations = []
+    for i in range(result.n_frames):
+        result.seek(i)
+        alpha = result.convert("RGBA").getchannel("A")
+        durations.append(result.info["duration"])
+        assert alpha.getpixel(SUBJECT_PIXEL) > 224, "every frame keeps the subject"
+        assert alpha.getpixel(BACKGROUND_PIXEL) < 32, "every frame drops the background"
+    assert durations == [80, 120, 160], "each frame keeps its own duration"
+    assert Image.open(reply["preview"]).format == "PNG", \
+        "a PNG first frame stands in where GdkPixbuf has no WebP loader"

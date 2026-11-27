@@ -15,8 +15,10 @@ Requests (one JSON object per line on stdin):
   {"op":"batch","input_dir":D,"output_dir":D,"model":M,"alpha":bool,"bg":BG,
    "pattern":"{name}_nobg","id":N}
   {"op":"gif","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":int,
-   "rot":0..3,"fh":bool,"fv":bool,"id":N}   # per-frame background removal
+   "rot":0..3,"fh":bool,"fv":bool,"id":N}   # per-frame background removal;
+                                             # GIF or WebP (animated) by output
   {"op":"convert","input":P,"output":P,"id":N}   # re-encode as output's format
+  {"op":"frames","input":P,"id":N}           # count an image's frames
   {"op":"cancel"}                            # stop single/batch/gif in progress
   {"op":"models"}
   {"op":"seg_load","input":P,"model":"auto|large|base_plus|small|tiny|mobile","id":N}
@@ -37,8 +39,9 @@ Responses (one JSON object per line on stdout):
   {"type":"done_single","output":P,"preview":P,"seconds":f,"id":N}
   {"type":"done_batch","count":n,"seconds":f,"outdir":P,"id":N}
   {"type":"gif_progress","done":i,"total":n,"id":N}
-  {"type":"gif_done","output":P,"frames":n,"seconds":f,"id":N}
+  {"type":"gif_done","output":P,"preview":P,"frames":n,"seconds":f,"id":N}
   {"type":"converted","output":P,"frames":n,"id":N}
+  {"type":"frames","frames":n,"id":N}
   {"type":"canceled","scope":"single|batch|gif","id":N}
   {"type":"seg_download","done":i,"total":n,"id":N}
   {"type":"seg_step","rung":R,"message":str,"id":N}
@@ -267,6 +270,14 @@ def handle_convert(req):
          "frames": getattr(im, "n_frames", 1), "id": req.get("id")})
 
 
+def handle_frames(req):
+    """Count a source's frames, so the frontend can tell an animated WebP from
+    a still. GdkPixbuf can't be asked: a WebP loader that decodes only stills
+    reports an animation as one frame."""
+    im = open_image(req["input"])
+    out({"type": "frames", "frames": getattr(im, "n_frames", 1), "id": req.get("id")})
+
+
 def process_one(model, req_id, src, dst, alpha, bg, blur=20, want_preview=False):
     img = _plain(open_image(src))
     res = _remove_resilient(model, req_id, img, alpha).convert("RGBA")
@@ -312,6 +323,21 @@ def handle_single(req):
          "seconds": round(time.time() - t, 2), "id": rid})
 
 
+def _webp_frames(path):
+    """How many frames a WebP holds, from its header; 1 for any other format.
+
+    A file that won't open counts as one frame, so process_one reports it with
+    its name like any other unreadable image.
+    """
+    if formats.format_of(path) is not formats.WEBP:
+        return 1
+    try:
+        with Image.open(path) as im:
+            return getattr(im, "n_frames", 1)
+    except (UnidentifiedImageError, OSError):
+        return 1
+
+
 def handle_batch(req):
     rid = req.get("id")
     indir = req["input_dir"]
@@ -320,6 +346,13 @@ def handle_batch(req):
     files = sorted(f for f in glob.glob(os.path.join(indir, "*"))
                    if f.lower().endswith(formats.BATCH_SUFFIXES)
                    and os.path.isfile(f))
+    # Batch would keep only an animation's first frame, as with GIFs.
+    animated = [f for f in files if _webp_frames(f) > 1]
+    files = [f for f in files if f not in animated]
+    if animated:
+        out({"type": "notice", "id": rid, "message":
+             "Skipped %d animated WebP (%s): open them on the Single page."
+             % (len(animated), ", ".join(os.path.basename(f) for f in animated))})
     total = len(files)
     if total == 0:
         out({"type": "error", "message": "No images found in input folder.",
@@ -408,12 +441,22 @@ def _frames_to_gif(paths, dst, durations, loop, transparent):
     first.save(dst, **kw)
 
 
+def _frames_to_webp(paths, dst, durations, loop):
+    """Assemble frame PNGs into an animated WebP, streamed like _frames_to_gif.
+    WebP keeps the full alpha channel, so cut-out edges stay soft."""
+    first = Image.open(paths[0])
+    rest = (Image.open(p) for p in paths[1:])
+    first.save(dst, save_all=True, append_images=rest, duration=durations,
+               loop=loop, **_SAVE_OPTIONS[formats.WEBP])
+
+
 def handle_gif(req):
-    """Split an animated GIF into frames, remove each frame's background, and
-    reassemble. The model is loaded once and reused for every frame. Each
-    finished frame is written to disk (not held in RAM) so a long GIF stays
-    memory-bounded during the slow per-frame inference. Progress is per frame;
-    cancellable between frames."""
+    """Split an animated GIF or WebP into frames, remove each frame's
+    background, and reassemble into the format the output path names. The
+    model is loaded once and reused for every frame. Each finished frame is
+    written to disk (not held in RAM) so a long animation stays memory-bounded
+    during the slow per-frame inference. Progress is per frame; cancellable
+    between frames."""
     rid = req.get("id")
     src, dst, model = req["input"], req["output"], req["model"]
     alpha = req.get("alpha", False)
@@ -437,8 +480,9 @@ def handle_gif(req):
                 out({"type": "canceled", "scope": "gif", "id": rid})
                 return
             im.seek(i)
-            durations.append(im.info.get("duration", 100))
             frame = _apply_transform(im.convert("RGBA"), rot, fh, fv)
+            # After decoding: a WebP frame's duration is set only once it loads.
+            durations.append(im.info.get("duration", 100))
             cut = _remove_resilient(model, rid, frame, alpha).convert("RGBA")
             fp = os.path.join(framedir, "f%05d.png" % i)
             _compose_frame(frame, cut, bg, blur).save(fp)
@@ -447,8 +491,14 @@ def handle_gif(req):
         if _cancel.is_set():
             out({"type": "canceled", "scope": "gif", "id": rid})
             return
-        _frames_to_gif(paths, dst, durations, loop, bg == "transparent")
-        out({"type": "gif_done", "output": dst, "frames": n,
+        if formats.format_of(dst) is formats.WEBP:
+            _frames_to_webp(paths, dst, durations, loop)
+        else:
+            _frames_to_gif(paths, dst, durations, loop, bg == "transparent")
+        # For a frontend whose GdkPixbuf has no loader for the animation.
+        preview = dst + ".preview.png"
+        shutil.copyfile(paths[0], preview)
+        out({"type": "gif_done", "output": dst, "preview": preview, "frames": n,
              "seconds": round(time.time() - t, 2), "id": rid})
     finally:
         shutil.rmtree(framedir, ignore_errors=True)
@@ -609,6 +659,7 @@ _HANDLERS = {
     "batch": handle_batch,
     "gif": handle_gif,
     "convert": handle_convert,
+    "frames": handle_frames,
     "seg_load": handle_seg_load,
     "seg_everything": handle_seg_everything,
     "seg_point": handle_seg_point,
