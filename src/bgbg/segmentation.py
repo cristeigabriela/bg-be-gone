@@ -342,6 +342,7 @@ class SamSession:
         self.decoder = decoder
         self._enc_input = encoder.get_inputs()[0].name
         self._emb = None            # tuple of embedding tensors
+        self._emb_dev = None        # the same tensors resident on the GPU (DirectML)
         self._size = None           # (W, H) original
         self._scale = None          # 1024 / max(W, H)
         self._nw = self._nh = None  # resized-to-1024 content dims
@@ -350,15 +351,32 @@ class SamSession:
     def load(cls, rung, providers, progress=None):
         spec = MODELS[rung]
         enc_p, dec_p = ensure_model(rung, progress)
-        so = ort.SessionOptions()
-        so.log_severity_level = 3
+        dml = _provider_name(providers[0]) == "DmlExecutionProvider"
+
+        def options(level):
+            so = ort.SessionOptions()
+            so.log_severity_level = 3
+            so.graph_optimization_level = level
+            if dml:
+                # Required by the DirectML provider (onnxruntime docs).
+                so.enable_mem_pattern = False
+                so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            return so
+
         # onnxruntime 1.27's graph optimiser miscompiles a fused op in these
         # SAM ONNX graphs and emits NaN (nondeterministically, on both CPU and
         # CUDA). Disabling optimisation avoids the buggy pass and is measurably
         # faster here too. See the NaN guard in encode() as a backstop.
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-        enc = ort.InferenceSession(enc_p, so, providers=providers)
-        dec = ort.InferenceSession(dec_p, so, providers=providers)
+        off = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        # DirectML is the exception for the encoder: with optimisation off it
+        # dispatches every one of the encoder's small ops on its own, which
+        # made SAM 2.1 Large encode in 2.41 s on an RX 6750 XT. The basic level
+        # only folds constants and drops redundant nodes (no fusion), gave
+        # bit-identical embeddings and no NaN over 16 runs, and encodes in
+        # 0.58 s (Tiny: 1.82 s -> 0.21 s).
+        enc_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC if dml else off
+        enc = ort.InferenceSession(enc_p, options(enc_level), providers=providers)
+        dec = ort.InferenceSession(dec_p, options(off), providers=providers)
         return cls(rung, spec["family"], enc, dec)
 
     def provider(self):
@@ -397,6 +415,14 @@ class SamSession:
         if any(np.isnan(t).any() for t in self._emb):
             raise ComputeError(f"{self.rung}: encoder produced NaN on "
                                f"{self.provider()}")
+        # Every decode feeds the same ~16 MB of embeddings. On DirectML, upload
+        # them once per image instead of once per click: 35.8 -> 21.3 ms per
+        # decode on SAM 2.1 Large, identical logits.
+        self._emb_dev = None
+        if (self.family == "sam2"
+                and self.decoder.get_providers()[0] == "DmlExecutionProvider"):
+            self._emb_dev = tuple(ort.OrtValue.ortvalue_from_numpy(t, "dml", 0)
+                                  for t in self._emb)
         return self
 
     # ---- low-level decode ----
@@ -415,10 +441,23 @@ class SamSession:
         else:
             mi = mask_input
             hmi = np.ones((G,), np.float32)
+        prompts = {"point_coords": pc, "point_labels": pl,
+                   "mask_input": mi, "has_mask_input": hmi}
+        if self._emb_dev is not None:
+            b = self.decoder.io_binding()
+            for name, v in zip(("image_embed", "high_res_feats_0", "high_res_feats_1"),
+                               self._emb_dev):
+                b.bind_ortvalue_input(name, v)
+            for name, v in prompts.items():
+                b.bind_cpu_input(name, v)
+            for o in self.decoder.get_outputs():
+                b.bind_output(o.name, "cpu")
+            self.decoder.run_with_iobinding(b)
+            out = b.copy_outputs_to_cpu()
+            return out[0], out[1]
         out = self.decoder.run(None, {
             "image_embed": emb, "high_res_feats_0": he0, "high_res_feats_1": he1,
-            "point_coords": pc, "point_labels": pl,
-            "mask_input": mi, "has_mask_input": hmi})
+            **prompts})
         return out[0], out[1]
 
     def _crop_upscale(self, low):
