@@ -213,8 +213,8 @@ import onnxruntime as ort  # noqa: E402
 
 # Background removal is optional (a segmentation-only install ships without it).
 try:
-    from rembg import new_session, remove
-    from rembg.sessions import sessions_names
+    from rembg import remove
+    from rembg.sessions import sessions_class, sessions_names
     _HAVE_REMBG = True
 except Exception:  # noqa: BLE001
     _HAVE_REMBG = False
@@ -305,11 +305,21 @@ def _session_options():
     return so
 
 
+def _new_session(model, providers):
+    """A rembg session with our session options.
+
+    Built from the session class, not ``rembg.new_session``: that builds its
+    own SessionOptions and passes them positionally, so a ``sess_opts=`` from
+    us raises TypeError (every rembg from 2.0.61 to at least 2.0.76).
+    """
+    cls = next(c for c in sessions_class if c.name() == model)
+    return cls(model, _session_options(), providers=providers)
+
+
 def get_session(model, req_id):
     if model not in _sessions:
         out({"type": "loading", "model": model, "id": req_id})
-        sess = new_session(model, sess_opts=_session_options(),
-                           providers=preferred_providers())
+        sess = _new_session(model, preferred_providers())
         active = sess.inner_session.get_providers()
         prov = active[0] if active else "CPUExecutionProvider"
         _sessions[model] = sess
@@ -324,9 +334,7 @@ def get_cpu_session(model, req_id):
     job when the GPU can't (e.g. not enough VRAM)."""
     if model not in _cpu_sessions:
         out({"type": "loading", "model": model, "id": req_id})
-        _cpu_sessions[model] = new_session(
-            model, sess_opts=_session_options(),
-            providers=["CPUExecutionProvider"])
+        _cpu_sessions[model] = _new_session(model, ["CPUExecutionProvider"])
     # Tell the UI the run moved to the CPU. Without this the status bar keeps
     # claiming the GPU through every fallback, so a wrong-but-fast result and a
     # correct-but-slow one look identical from the outside.
