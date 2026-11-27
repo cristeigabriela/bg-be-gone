@@ -70,16 +70,8 @@ import traceback  # noqa: E402
 import warnings  # noqa: E402
 
 from PIL import Image, ImageFilter  # noqa: E402
-import onnxruntime as ort  # noqa: E402
-
-# Background removal is optional (a segmentation-only install ships without it).
-try:
-    from rembg import remove
-    from rembg.sessions import sessions_class, sessions_names
-    _HAVE_REMBG = True
-except Exception:  # noqa: BLE001
-    _HAVE_REMBG = False
-    sessions_names = []
+# Imports onnxruntime, then rembg when it is installed.
+from engines import ort as ort_engine  # noqa: E402
 
 # Segmentation is optional too (needs the extra numpy dependency + weights).
 try:
@@ -87,22 +79,6 @@ try:
     _HAVE_SEG = True
 except Exception:  # noqa: BLE001
     _HAVE_SEG = False
-
-# Preference order; the first one onnxruntime can actually initialise wins.
-_PROVIDER_ORDER = [
-    "CUDAExecutionProvider",
-    "ROCMExecutionProvider",
-    "MIGraphXExecutionProvider",
-    "DmlExecutionProvider",
-    "CPUExecutionProvider",
-]
-_PROVIDER_LABELS = {
-    "CUDAExecutionProvider": "NVIDIA (CUDA)",
-    "ROCMExecutionProvider": "AMD (ROCm)",
-    "MIGraphXExecutionProvider": "AMD (MIGraphX)",
-    "DmlExecutionProvider": "DirectML",
-    "CPUExecutionProvider": "CPU",
-}
 
 _sessions = {}
 _cpu_sessions = {}          # model -> CPU-only fallback session (low-VRAM path)
@@ -114,91 +90,16 @@ def out(obj):
     sys.stdout.flush()
 
 
-# HEURISTIC conv-algo search skips onnxruntime's default EXHAUSTIVE benchmark.
-# EXHAUSTIVE re-runs on every process's first inference (no on-disk cache), so it
-# would slow the first generation of *every* launch; HEURISTIC keeps it fast.
-_PROVIDER_OPTIONS = {
-    "CUDAExecutionProvider": {"cudnn_conv_algo_search": "HEURISTIC"},
-}
-
-
-def _name(p):
-    return p[0] if isinstance(p, tuple) else p
-
-
-def preferred_providers():
-    avail = set(ort.get_available_providers())
-    avail -= plat.unusable_providers()
-    chosen = []
-    for p in _PROVIDER_ORDER:
-        if p not in avail:
-            continue
-        opts = _PROVIDER_OPTIONS.get(p)
-        chosen.append((p, opts) if opts else p)
-    if not any(_name(c) == "CPUExecutionProvider" for c in chosen):
-        chosen.append("CPUExecutionProvider")
-    return chosen
-
-
-def provider_names():
-    return [_name(p) for p in preferred_providers()]
-
-
-# The first inference of a session still warms up (memory alloc, kernel load),
-# so the first generation is a little slower; the UI mentions this.
-_GPU_PROVIDERS = {"CUDAExecutionProvider", "ROCMExecutionProvider",
-                  "MIGraphXExecutionProvider"}
-
-
-def _session_options():
-    """Session options for the rembg models.
-
-    Graph optimisation is off for the same reason segmentation.py turns it off
-    on the SAM graphs: onnxruntime's optimiser miscompiles a fused op and emits
-    NaN. On a GPU provider that is worse than a bad cutout — the miscompiled
-    kernel can fault the device hard enough to force a reset — so the models
-    that go through rembg get the same treatment.
-    """
-    so = ort.SessionOptions()
-    so.log_severity_level = 3
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    # rembg.new_session honours OMP_NUM_THREADS; we build sessions without it.
-    if "OMP_NUM_THREADS" in os.environ:
-        threads = int(os.environ["OMP_NUM_THREADS"])
-        so.inter_op_num_threads = threads
-        so.intra_op_num_threads = threads
-    return so
-
-
-class UnknownModelError(ValueError):
-    def __init__(self, model):
-        super().__init__(f"unknown background-removal model: {model}")
-        self.model = model
-
-
-def _new_session(model, providers):
-    """A rembg session with our session options.
-
-    Built from the session class, not ``rembg.new_session``: that builds its
-    own SessionOptions and passes them positionally, so a ``sess_opts=`` from
-    us raises TypeError (every rembg from 2.0.61 to at least 2.0.76).
-    """
-    cls = next((c for c in sessions_class if c.name() == model), None)
-    if cls is None:
-        raise UnknownModelError(model)
-    return cls(model, _session_options(), providers=providers)
-
-
 def get_session(model, req_id):
     if model not in _sessions:
         out({"type": "loading", "model": model, "id": req_id})
-        sess = _new_session(model, preferred_providers())
+        sess = ort_engine.new_session(model, ort_engine.preferred_providers())
         active = sess.inner_session.get_providers()
         prov = active[0] if active else "CPUExecutionProvider"
         _sessions[model] = sess
         out({"type": "device", "provider": prov,
-             "label": _PROVIDER_LABELS.get(prov, prov),
-             "gpu": prov in _GPU_PROVIDERS, "id": req_id})
+             "label": ort_engine.PROVIDER_LABELS.get(prov, prov),
+             "gpu": prov in ort_engine.GPU_PROVIDERS, "id": req_id})
     return _sessions[model]
 
 
@@ -207,27 +108,14 @@ def get_cpu_session(model, req_id):
     job when the GPU can't (e.g. not enough VRAM)."""
     if model not in _cpu_sessions:
         out({"type": "loading", "model": model, "id": req_id})
-        _cpu_sessions[model] = _new_session(model, ["CPUExecutionProvider"])
+        _cpu_sessions[model] = ort_engine.new_session(model, ["CPUExecutionProvider"])
     # Tell the UI the run moved to the CPU. Without this the status bar keeps
     # claiming the GPU through every fallback, so a wrong-but-fast result and a
     # correct-but-slow one look identical from the outside.
     out({"type": "device", "provider": "CPUExecutionProvider",
-         "label": _PROVIDER_LABELS["CPUExecutionProvider"],
+         "label": ort_engine.PROVIDER_LABELS["CPUExecutionProvider"],
          "gpu": False, "id": req_id})
     return _cpu_sessions[model]
-
-
-def _is_ort_runtime_error(e):
-    """True for an onnxruntime run failure — most importantly a GPU out-of-memory,
-    which BiRefNet surfaces as a failed Mul node deep in the ASPP decoder."""
-    if type(e).__module__.startswith("onnxruntime"):
-        return True
-    if isinstance(e, RuntimeWarning):      # NaN mask, promoted in _remove_resilient
-        return True
-    m = str(e).lower()
-    return ("onnxruntimeerror" in m or "non-zero status" in m
-            or "out of memory" in m or "cuda" in m or "cudnn" in m
-            or "failed to allocate" in m or "hiperroroutofmemory" in m)
 
 
 def _remove_resilient(model, req_id, img, alpha):
@@ -243,11 +131,11 @@ def _remove_resilient(model, req_id, img, alpha):
             # one warning to an error so it lands in the CPU-retry path below.
             warnings.filterwarnings("error", category=RuntimeWarning,
                                     message="invalid value encountered")
-            res = remove(img, session=session, alpha_matting=alpha)
+            res = ort_engine.remove(img, session=session, alpha_matting=alpha)
         _fallback_notified.discard(model)      # GPU healthy again
         return res
     except Exception as e:
-        if not _is_ort_runtime_error(e):
+        if not ort_engine.is_runtime_error(e):
             raise
         if model not in _fallback_notified:
             _fallback_notified.add(model)
@@ -257,7 +145,7 @@ def _remove_resilient(model, req_id, img, alpha):
                             "to free memory, then try again.",
                  "id": req_id})
         session = get_cpu_session(model, req_id)
-        return remove(img, session=session, alpha_matting=alpha)
+        return ort_engine.remove(img, session=session, alpha_matting=alpha)
 
 
 def _hex_to_rgb(s):
@@ -479,7 +367,8 @@ class _Canceled(Exception):
 
 
 def _gpu_hint():
-    return any(_name(p) in _GPU_PROVIDERS for p in preferred_providers())
+    return any(ort_engine.provider_name(p) in ort_engine.GPU_PROVIDERS
+               for p in ort_engine.preferred_providers())
 
 
 def handle_seg_load(req):
@@ -502,7 +391,7 @@ def handle_seg_load(req):
 
     try:
         session, rung, mode = seg.auto_select_session(
-            preferred_providers(), _gpu_hint(), want=want, probe_image=pil,
+            ort_engine.preferred_providers(), _gpu_hint(), want=want, probe_image=pil,
             on_step=on_step, on_progress=on_progress)
     except _Canceled:
         out({"type": "seg_canceled", "id": rid})
@@ -511,8 +400,8 @@ def handle_seg_load(req):
     _seg = {"session": session, "image": pil, "rung": rung, "size": pil.size,
             "maskdir": maskdir, "objects": [], "prev_low": None}
     out({"type": "seg_ready", "rung": rung, "model": seg.MODELS[rung]["label"],
-         "provider": prov, "label": _PROVIDER_LABELS.get(prov, prov),
-         "gpu": prov in _GPU_PROVIDERS, "mode": mode, "family": session.family,
+         "provider": prov, "label": ort_engine.PROVIDER_LABELS.get(prov, prov),
+         "gpu": prov in ort_engine.GPU_PROVIDERS, "mode": mode, "family": session.family,
          "id": rid})
 
 
@@ -529,7 +418,7 @@ def handle_seg_everything(req):
     if not _require_seg(rid):
         return
     session = _seg["session"]
-    gpu = session.provider() in _GPU_PROVIDERS
+    gpu = session.provider() in ort_engine.GPU_PROVIDERS
     pps = int(req.get("points_per_side") or (32 if gpu else 16))
 
     def progress(done, total):
@@ -632,9 +521,9 @@ _BG_OPS = {"single", "batch", "gif"}
 
 def _ready():
     out({"type": "ready",
-         "models": list(sessions_names) if _HAVE_REMBG else [],
-         "providers": provider_names(),
-         "bgremove": _HAVE_REMBG,
+         "models": list(ort_engine.sessions_names) if ort_engine.HAVE_REMBG else [],
+         "providers": ort_engine.provider_names(),
+         "bgremove": ort_engine.HAVE_REMBG,
          "seg": _HAVE_SEG,
          "seg_models": ([{"rung": r, "label": seg.MODELS[r]["label"],
                           "vram": seg.MODELS[r]["vram_gate"]}
@@ -648,7 +537,7 @@ def _dispatch(req):
         if op == "models":
             _ready()
             return
-        if op in _BG_OPS and not _HAVE_REMBG:
+        if op in _BG_OPS and not ort_engine.HAVE_REMBG:
             out({"type": "error", "message":
                  "Background removal is not installed in this build.", "id": rid})
             return

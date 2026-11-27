@@ -115,19 +115,15 @@ def test_rembg_sessions_turn_graph_optimisation_off():
     Runs in its own interpreter: importing the worker can re-exec Python to
     put CUDA libraries on the loader path, which must not hit pytest itself.
     """
-    probe = (
-        "import sys, onnxruntime as ort; sys.path.insert(0, sys.argv[1]); import worker; "
-        "o = worker._new_session('u2netp', ['CPUExecutionProvider'])"
-        ".inner_session.get_session_options(); "
-        "print(o.graph_optimization_level == ort.GraphOptimizationLevel.ORT_DISABLE_ALL, "
-        "o.intra_op_num_threads)")
     env = dict(os.environ, OMP_NUM_THREADS="2")
-    done = subprocess.run([sys.executable, "-c", probe, str(WORKER.parent)],
-                          capture_output=True, text=True, env=env, timeout=REPLY_TIMEOUT_S)
+    done = subprocess.run(
+        [sys.executable, str(TESTDATA / "session_options_probe.py"), str(WORKER.parent)],
+        capture_output=True, text=True, env=env, timeout=REPLY_TIMEOUT_S)
     assert done.returncode == 0, done.stderr
-    optimisation_off, threads = done.stdout.split()
-    assert optimisation_off == "True", "graph optimisation must be off"
-    assert threads == "2", "OMP_NUM_THREADS must still cap the threads, as rembg.new_session did"
+    options = json.loads(done.stdout.strip().splitlines()[-1])
+    assert options["optimisation_off"], "graph optimisation must be off"
+    assert options["intra_op_threads"] == 2, \
+        "OMP_NUM_THREADS must still cap the threads, as rembg.new_session did"
 
 
 def test_subject_fixture_matches_the_pixels_the_tests_check():
