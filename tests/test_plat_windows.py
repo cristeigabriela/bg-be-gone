@@ -96,3 +96,33 @@ def test_the_install_scripts_probe_gets_the_same_environment(dirs):
     pythonhome, first_on_path = done.stdout.splitlines()
     assert pythonhome == "None", "the probed script must not see the launcher's PYTHONHOME"
     assert first_on_path != dirs["other_msys2"], "a second MSYS2 on PATH must not reach it"
+
+
+NVIDIA_SMI = Path(__file__).parent / "testdata" / "nvidia-smi"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="winvram reads DXGI")
+@pytest.mark.parametrize(
+    "adapter, smi, expected",
+    [
+        # DirectML runs on the AMD card; nvidia-smi only knows the NVIDIA one.
+        ("AMD Radeon RX 6800", "one-rtx4060.csv", None),
+        # The adapter DirectML uses is the one nvidia-smi reports.
+        ("NVIDIA GeForce RTX 4060", "one-rtx4060.csv", {"total": 8188, "free": 7900, "gpu": True}),
+        # Two cards by one name: which row is DirectML's can't be told.
+        ("NVIDIA GeForce RTX 3080", "two-rtx3080.csv", None),
+    ],
+    ids=["other-vendor", "same-card", "ambiguous"],
+)
+def test_the_nvidia_smi_fallback_measures_only_the_adapter_directml_uses(
+        monkeypatch, adapter, smi, expected):
+    """When DXGI can't say how much is used, nvidia-smi's numbers count only
+    for the card DirectML runs on; otherwise the VRAM is unknown."""
+    from plat import winvram
+    monkeypatch.setattr(winvram, "probe", lambda: None)
+    monkeypatch.setattr(winvram, "main_adapter",
+                        lambda: winvram.Adapter(0, adapter, 8 << 30, 1, 0))
+    output = (NVIDIA_SMI / smi).read_text(encoding="utf-8")
+    monkeypatch.setattr(windows.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=output, stderr=""))
+    assert windows.probe_vram() == expected, "SAM picks its model by these numbers"

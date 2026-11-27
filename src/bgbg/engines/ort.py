@@ -51,24 +51,27 @@ def provider_name(p):
     return p[0] if isinstance(p, tuple) else p
 
 
-def choose_providers(available, unusable):
+def choose_providers(available, unusable, machine_options=None):
     """The providers to hand onnxruntime, best first, with their options.
 
     Args:
         available: provider names onnxruntime reports.
         unusable: provider names this machine must not use (see
             ``plat.unusable_providers``).
+        machine_options: per-provider options this machine adds, such as
+            DirectML's adapter (see ``plat.provider_options``).
 
     Returns:
         A list of names, or ``(name, options)`` pairs for a provider with
         options. The CPU is always last, so a session can always be built.
     """
     avail = set(available) - set(unusable)
+    machine_options = machine_options or {}
     chosen = []
     for p in PROVIDER_ORDER:
         if p not in avail:
             continue
-        opts = PROVIDER_OPTIONS.get(p)
+        opts = {**PROVIDER_OPTIONS.get(p, {}), **machine_options.get(p, {})}
         chosen.append((p, opts) if opts else p)
     if not any(provider_name(c) == "CPUExecutionProvider" for c in chosen):
         chosen.append("CPUExecutionProvider")
@@ -76,7 +79,8 @@ def choose_providers(available, unusable):
 
 
 def preferred_providers():
-    return choose_providers(ort.get_available_providers(), plat.unusable_providers())
+    return choose_providers(ort.get_available_providers(), plat.unusable_providers(),
+                            plat.provider_options())
 
 
 def provider_names():
