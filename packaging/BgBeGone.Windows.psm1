@@ -1,0 +1,705 @@
+<#
+.SYNOPSIS
+  Windows install and packaging helpers: build, probe and swap the worker,
+  remove only what an install recorded, write the launcher, make the icon.
+
+.DESCRIPTION
+  The worker is a standalone CPython (python-build-standalone, the build
+  `uv python install` fetches) with the ML packages installed into its own
+  Lib\site-packages. Unlike a venv it has no pyvenv.cfg pointing back at the
+  machine that built it, so a release bundle starts on any PC.
+
+  Deletion rules, the same for every script that uses this module:
+  - A folder bg-be-gone builds carries an inventory, bg-be-gone-files.txt,
+    listing every file in it. Removing the folder removes exactly those
+    files, then the folders they leave empty. Anything else stays.
+  - Nothing is removed through a reparse point (junction or symlink): each
+    path is checked from the install root down before anything is deleted.
+  - New folders get a name no one else has (worker.new-<random>), so a build
+    never collides with a folder it didn't create.
+
+  Used by install.ps1, uninstall.ps1, build-windows-worker.ps1 and the
+  release packaging.
+#>
+
+# The CPython the worker runs on. 3.12 has wheels for onnxruntime, numba,
+# llvmlite and TheRock's torch; the patch release is pinned so every build
+# ships the same interpreter.
+$script:PythonVersion = '3.12.14'
+
+# The inventory a bg-be-gone folder carries at its top.
+$script:InventoryName = 'bg-be-gone-files.txt'
+
+$script:Utf8NoBom = New-Object Text.UTF8Encoding($false)
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+function Write-Utf8File {
+    <# Write text as UTF-8 without a BOM, which Python's json.load accepts. #>
+    param([string]$Path, [string]$Text)
+    [IO.File]::WriteAllText($Path, $Text, $script:Utf8NoBom)
+}
+
+function New-UniqueName {
+    <# A sibling name for $Path no other program uses: <Path><Suffix>-<8 hex>. #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Suffix)
+    "$Path$Suffix-" + [guid]::NewGuid().ToString('N').Substring(0, 8)
+}
+
+function New-PrivateTempDir {
+    <# A new, empty folder under %TEMP% that this run alone uses. #>
+    param([Parameter(Mandatory)][string]$Prefix)
+    $dir = Join-Path ([IO.Path]::GetTempPath()) ("$Prefix-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $dir -ErrorAction Stop | Out-Null
+    $dir
+}
+
+# ---------------------------------------------------------------------------
+# Reparse points and inventories
+# ---------------------------------------------------------------------------
+function Test-ReparsePoint {
+    <# True when $Path is a junction, symlink or other reparse point. #>
+    param([Parameter(Mandatory)][string]$Path)
+    [bool]([IO.File]::GetAttributes($Path) -band [IO.FileAttributes]::ReparsePoint)
+}
+
+function Assert-NoReparseBelow {
+    <#
+    .SYNOPSIS
+      Throw unless $Path is inside $Root and no folder from $Root down to
+      $Path (both included) is a reparse point.
+
+    .DESCRIPTION
+      $Cache remembers folders already checked, so an inventory of thousands
+      of files checks each folder once. Parts of the chain that don't exist
+      are fine: there is nothing there to delete through.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$Path,
+        [hashtable]$Cache = @{}
+    )
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not $full.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase) -and $full -ne $rootFull) {
+        throw "$Path is not inside $Root"
+    }
+    $step = $full
+    while ($step.Length -ge $rootFull.Length) {
+        if (-not $Cache.ContainsKey($step)) {
+            $exists = [IO.Directory]::Exists($step) -or [IO.File]::Exists($step)
+            $Cache[$step] = $exists -and (Test-ReparsePoint $step)
+        }
+        if ($Cache[$step]) { throw "$step is a junction or symbolic link; not removing anything through it" }
+        if ($step -eq $rootFull) { break }
+        $step = [IO.Path]::GetDirectoryName($step)
+    }
+}
+
+function Get-TreeFiles {
+    <#
+    .SYNOPSIS
+      Every file under $Root, relative to it, without following reparse points.
+
+    .DESCRIPTION
+      With -Include FilesAndFolders, folders are listed too, each with a
+      trailing backslash. Throws on a reparse point anywhere in the tree:
+      bg-be-gone never makes one, so one there means the tree is not what
+      was built.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [ValidateSet('Files', 'FilesAndFolders')][string]$Include = 'Files'
+    )
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $pending = New-Object System.Collections.Generic.Stack[IO.DirectoryInfo]
+    $pending.Push((New-Object IO.DirectoryInfo $rootFull))
+    $entries = New-Object System.Collections.Generic.List[string]
+    while ($pending.Count) {
+        $dir = $pending.Pop()
+        foreach ($entry in $dir.EnumerateFileSystemInfos()) {
+            if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "$($entry.FullName) is a junction or symbolic link"
+            }
+            $rel = $entry.FullName.Substring($rootFull.Length + 1)
+            if ($entry -is [IO.DirectoryInfo]) {
+                $pending.Push($entry)
+                if ($Include -eq 'FilesAndFolders') { $entries.Add($rel + '\') }
+            } else {
+                $entries.Add($rel)
+            }
+        }
+    }
+    $entries.Sort([StringComparer]::OrdinalIgnoreCase)
+    $entries
+}
+
+function Write-Inventory {
+    <#
+    .SYNOPSIS
+      Record every file and folder under $Root in $Root\bg-be-gone-files.txt,
+      itself included. Folders end in a backslash.
+    #>
+    param([Parameter(Mandatory)][string]$Root)
+    $list = @(Get-TreeFiles $Root -Include FilesAndFolders | Where-Object { $_ -ne $script:InventoryName }) +
+        $script:InventoryName
+    Write-Utf8File (Join-Path $Root $script:InventoryName) (($list -join "`r`n") + "`r`n")
+}
+
+function Test-Inventory {
+    <# True when $Root carries an inventory. #>
+    param([Parameter(Mandatory)][string]$Root)
+    Test-Path -LiteralPath (Join-Path $Root $script:InventoryName) -PathType Leaf
+}
+
+function Read-Inventory {
+    <# The relative paths $Root's inventory lists, or none. #>
+    param([Parameter(Mandatory)][string]$Root)
+    $path = Join-Path $Root $script:InventoryName
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return @() }
+    @([IO.File]::ReadAllLines($path, $script:Utf8NoBom) | Where-Object { $_ })
+}
+
+function Update-Inventory {
+    <#
+    .SYNOPSIS
+      Re-record $Root's inventory after a run that changed the tree.
+
+    .DESCRIPTION
+      The new inventory keeps what the old one listed and still exists, and
+      adds what this run created: entries present now that weren't in
+      $Before, the tree as Get-TreeFiles -Include FilesAndFolders saw it when
+      the run started. A file someone else put there in between stays
+      unlisted, so it is never removed.
+    #>
+    param([Parameter(Mandatory)][string]$Root, [string[]]$Before = @())
+    $had = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($rel in $Before) { [void]$had.Add($rel) }
+    $listed = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($rel in Read-Inventory $Root) { [void]$listed.Add($rel) }
+    $keep = foreach ($rel in Get-TreeFiles $Root -Include FilesAndFolders) {
+        if ($rel -eq $script:InventoryName) { continue }
+        if ($listed.Contains($rel) -or -not $had.Contains($rel)) { $rel }
+    }
+    $list = @($keep) + $script:InventoryName
+    Write-Utf8File (Join-Path $Root $script:InventoryName) (($list -join "`r`n") + "`r`n")
+}
+
+function Test-LegacyInstall {
+    <#
+    .SYNOPSIS
+      True when $Prefix holds an install made by install.ps1 before it kept a
+      manifest, judged from evidence only that version leaves.
+
+    .DESCRIPTION
+      That version wrote BgBeGone.cmd with the worker venv's own path in it,
+      and a worker venv with onnxruntime. A folder that merely has a
+      pyvenv.cfg, or a .cmd of the same name, is not enough.
+    #>
+    param([Parameter(Mandatory)][string]$Prefix)
+    $cmd = Join-Path $Prefix 'BgBeGone.cmd'
+    $worker = Join-Path $Prefix 'worker'
+    if (-not (Test-Path -LiteralPath $cmd -PathType Leaf)) { return $false }
+    $text = [IO.File]::ReadAllText($cmd)
+    $venvLine = 'set "BGBG_VENV_PYTHON=' + (Join-Path $worker 'Scripts\python.exe') + '"'
+    if (-not $text.StartsWith('@echo off') -or
+        $text.IndexOf($venvLine, [StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+        $text -notmatch 'set "BGBG_WORKER=[^"]*\\src\\bgbg\\worker\.py"') { return $false }
+    if (-not (Test-Path -LiteralPath (Join-Path $worker 'pyvenv.cfg') -PathType Leaf)) { return $false }
+    [bool](Get-ChildItem -LiteralPath (Join-Path $worker 'Lib\site-packages') -Filter 'onnxruntime*.dist-info' -Directory -ErrorAction SilentlyContinue)
+}
+
+function Remove-Inventory {
+    <#
+    .SYNOPSIS
+      Remove the files $Root's inventory lists, then the folders it lists or
+      that are left empty.
+
+    .DESCRIPTION
+      Every path is checked first (inside $Root, no reparse point on the way);
+      one bad path stops the removal before anything is deleted. Files the
+      inventory doesn't list stay where they are, and so do the folders that
+      hold them.
+
+    .OUTPUTS
+      The paths of what is left under $Root, relative; empty when $Root is gone.
+    #>
+    param([Parameter(Mandatory)][string]$Root)
+    if (-not (Test-Path -LiteralPath $Root)) { return @() }
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    if (Test-ReparsePoint $rootFull) { throw "$rootFull is a junction or symbolic link; not removing it" }
+    $inventory = Join-Path $rootFull $script:InventoryName
+    if (-not (Test-Path -LiteralPath $inventory -PathType Leaf)) {
+        throw "$rootFull has no $($script:InventoryName); bg-be-gone can't tell which of its files are its own"
+    }
+
+    $cache = @{}
+    $targets = New-Object System.Collections.Generic.List[string]
+    foreach ($rel in [IO.File]::ReadAllLines($inventory, $script:Utf8NoBom)) {
+        if (-not $rel) { continue }
+        if ([IO.Path]::IsPathRooted($rel) -or ($rel -split '[\\/]') -contains '..') {
+            throw "$inventory lists '$rel', which is not a path inside the folder"
+        }
+        $full = [IO.Path]::Combine($rootFull, $rel)
+        # Each folder once: an MSYS2 tree lists ~50,000 files in ~5,000 folders.
+        $dir = [IO.Path]::GetDirectoryName($full)
+        if (-not $cache.ContainsKey($dir)) { Assert-NoReparseBelow -Root $rootFull -Path $dir -Cache $cache }
+        $targets.Add($full)
+    }
+
+    # .NET calls rather than cmdlets in these loops: per file, Test-Path and
+    # Remove-Item take minutes on a tree that size.
+    $dirs = @{}
+    foreach ($full in $targets) {
+        if ([IO.File]::Exists($full)) {
+            $attributes = [IO.File]::GetAttributes($full)
+            if ($attributes -band [IO.FileAttributes]::ReadOnly) {
+                [IO.File]::SetAttributes($full, $attributes -bxor [IO.FileAttributes]::ReadOnly)
+            }
+            [IO.File]::Delete($full)
+        }
+        for ($d = [IO.Path]::GetDirectoryName($full); $d.Length -gt $rootFull.Length -and -not $dirs.ContainsKey($d);
+             $d = [IO.Path]::GetDirectoryName($d)) {
+            $dirs[$d] = $true
+        }
+    }
+    # Deepest first, so a parent is only looked at once its children are done.
+    foreach ($d in ($dirs.Keys | Sort-Object Length -Descending)) {
+        if ([IO.Directory]::Exists($d) -and -not [IO.Directory]::EnumerateFileSystemEntries($d).GetEnumerator().MoveNext()) {
+            [IO.Directory]::Delete($d)
+        }
+    }
+    if (-not [IO.Directory]::EnumerateFileSystemEntries($rootFull).GetEnumerator().MoveNext()) {
+        [IO.Directory]::Delete($rootFull)
+        return @()
+    }
+    @(Get-TreeFiles $rootFull)
+}
+
+function Remove-CacheTree {
+    <#
+    .SYNOPSIS
+      Delete a cache bg-be-gone fills at run time (models, kernels), refusing
+      any reparse point at $Path or inside it before deleting anything.
+    #>
+    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    Assert-NoReparseBelow -Root $Root -Path $Path
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        $null = Get-TreeFiles $Path   # throws on a reparse point inside
+    }
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+}
+
+# ---------------------------------------------------------------------------
+# The worker
+# ---------------------------------------------------------------------------
+function Get-WorkerPython {
+    <# The interpreter inside a worker folder. #>
+    param([Parameter(Mandatory)][string]$WorkerDir)
+    Join-Path $WorkerDir 'python.exe'
+}
+
+function New-WorkerPython {
+    <#
+    .SYNOPSIS
+      Put a fresh standalone CPython at $Dest (which must not exist yet).
+    #>
+    param([Parameter(Mandatory)][string]$Dest)
+    if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+        throw "uv not found on PATH. Install it (winget install astral-sh.uv) and retry."
+    }
+    if (Test-Path -LiteralPath $Dest) { throw "$Dest already exists" }
+
+    # Unpacked in a folder of its own next to $Dest, so the move below stays
+    # on one volume. No registry entry and no python.exe shim: this copy is
+    # the worker's alone.
+    $unpack = New-UniqueName $Dest '.python'
+    & uv python install $script:PythonVersion --install-dir $unpack --no-registry --no-bin
+    if ($LASTEXITCODE -ne 0) { throw "uv python install $($script:PythonVersion) failed" }
+    try {
+        $tree = Get-ChildItem -LiteralPath $unpack -Directory |
+            Where-Object { $_.Name -like "cpython-$($script:PythonVersion)-*" -and -not $_.LinkType } |
+            Select-Object -First 1
+        if (-not $tree) { throw "uv put no cpython-$($script:PythonVersion) folder in $unpack" }
+        Move-Item -LiteralPath $tree.FullName $Dest -ErrorAction Stop
+    } finally {
+        # Left: uv's lock file and a cpython-3.12-... junction to the folder
+        # just moved. Each entry goes on its own, so the junction is unlinked,
+        # never followed.
+        foreach ($entry in Get-ChildItem -LiteralPath $unpack -Force) {
+            if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { $entry.Delete() }
+            else { Remove-Item -LiteralPath $entry.FullName -Recurse -Force }
+        }
+        Remove-Item -LiteralPath $unpack -Force
+    }
+
+    # python-build-standalone marks itself as managed by the tool that
+    # installed it. This copy belongs to the worker, which installs into it.
+    Remove-Item -LiteralPath (Join-Path $Dest 'Lib\EXTERNALLY-MANAGED') -Force -ErrorAction SilentlyContinue
+}
+
+function Install-LockedPackage {
+    <#
+    .SYNOPSIS
+      Install a lock file's exact files into a worker, nothing more.
+
+    .DESCRIPTION
+      --no-deps with --require-hashes: every package and its hash comes from
+      the lock, so nothing resolves at install time. uv is used where it
+      exists (builds, source installs); the worker's own pip on a user's PC.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$WorkerDir,
+        [Parameter(Mandatory)][string]$Lock,
+        [string]$IndexUrl
+    )
+    $py = Get-WorkerPython $WorkerDir
+    if (Get-Command uv -ErrorAction SilentlyContinue) {
+        $pipArgs = @('pip', 'install', '--python', $py, '--no-deps', '--require-hashes', '-r', $Lock)
+        if ($IndexUrl) { $pipArgs += @('--index-url', $IndexUrl) }
+        & uv @pipArgs
+    } else {
+        $pipArgs = @('-I', '-m', 'pip', 'install', '--no-deps', '--require-hashes',
+                     '--disable-pip-version-check', '--no-warn-script-location', '-r', $Lock)
+        if ($IndexUrl) { $pipArgs += @('--index-url', $IndexUrl) }
+        & $py @pipArgs
+    }
+    if ($LASTEXITCODE -ne 0) { throw "Installing $Lock into $WorkerDir failed" }
+}
+
+function New-WorkerStartInfo {
+    <#
+    .SYNOPSIS
+      A ProcessStartInfo that runs $Arguments on the worker's interpreter with
+      the environment the frontend gives the worker.
+
+    .DESCRIPTION
+      It goes through `python -I plat\windows.py`, which applies the one
+      worker-environment policy (plat/windows.py worker_env) and runs the
+      rest. $AppDir is the folder holding plat\ and worker.py.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$WorkerDir,
+        [Parameter(Mandatory)][string]$AppDir,
+        [string[]]$Arguments
+    )
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = Get-WorkerPython $WorkerDir
+    $all = @('-I', (Join-Path $AppDir 'plat\windows.py')) + $Arguments
+    # Windows paths hold no double quote, so quoting each argument is enough,
+    # once a trailing backslash is doubled (else it escapes the closing quote).
+    $psi.Arguments = ($all | ForEach-Object { '"' + ($_ -replace '(\\+)$', '$1$1') + '"' }) -join ' '
+    $psi.UseShellExecute = $false
+    $psi
+}
+
+function Invoke-WorkerPython {
+    <# Run a script on the worker's interpreter in this console; return its exit code. #>
+    param(
+        [Parameter(Mandatory)][string]$WorkerDir,
+        [Parameter(Mandatory)][string]$AppDir,
+        [string[]]$Arguments
+    )
+    $proc = [Diagnostics.Process]::Start((New-WorkerStartInfo -WorkerDir $WorkerDir -AppDir $AppDir -Arguments $Arguments))
+    try {
+        $proc.WaitForExit()
+        $proc.ExitCode
+    } finally {
+        $proc.Dispose()
+    }
+}
+
+function Stop-ProcessTree {
+    <# The runner's child outlives a plain Kill, so end the whole tree. #>
+    param([Parameter(Mandatory)][Diagnostics.Process]$Process)
+    if (-not $Process.HasExited) { & taskkill.exe /F /T /PID $Process.Id 2>&1 | Out-Null }
+}
+
+function Test-Worker {
+    <#
+    .SYNOPSIS
+      Start worker.py on a worker's interpreter and return its "ready" message.
+
+    .DESCRIPTION
+      Runs with the frontend's environment for the worker, and with
+      BGBG_NO_TORCH, so the probe never initialises a GPU. Throws when the
+      worker exits or stays silent instead of answering.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$WorkerDir,
+        [Parameter(Mandatory)][string]$AppDir,
+        [int]$TimeoutSeconds = 300
+    )
+    $psi = New-WorkerStartInfo -WorkerDir $WorkerDir -AppDir $AppDir -Arguments @((Join-Path $AppDir 'worker.py'))
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $psi.CreateNoWindow = $true
+    $psi.EnvironmentVariables['BGBG_NO_TORCH'] = '1'
+
+    $proc = [Diagnostics.Process]::Start($psi)
+    try {
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        while ($true) {
+            $left = [int]($deadline - (Get-Date)).TotalMilliseconds
+            $read = $proc.StandardOutput.ReadLineAsync()
+            if ($left -le 0 -or -not $read.Wait($left)) {
+                throw "The worker in $WorkerDir sent no ready within $TimeoutSeconds s"
+            }
+            $line = $read.Result
+            if ($null -eq $line) { throw "The worker in $WorkerDir exited before it was ready" }
+            try { $msg = $line | ConvertFrom-Json } catch { continue }
+            if ($msg.type -eq 'ready') { break }
+        }
+        $proc.StandardInput.WriteLine('{"op":"shutdown"}')
+        $proc.StandardInput.Close()
+        if (-not $proc.WaitForExit(15000)) { Stop-ProcessTree $proc }
+        return $msg
+    } finally {
+        Stop-ProcessTree $proc
+        $proc.Dispose()
+    }
+}
+
+function Write-WorkerRecord {
+    <#
+    .SYNOPSIS
+      Write profile.json and versions.json into a worker folder.
+
+    .DESCRIPTION
+      profile.json tells the worker which engine runs BiRefNet. It sits in the
+      interpreter's sys.prefix: {"engine": "ort"|"torch", "variant": ...,
+      "gfx": ...}, gfx only for torch on AMD. No file means ort.
+
+      versions.json records what this worker was built from, so a bug report
+      or a release asset says which onnxruntime, torch and Python it ran.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$WorkerDir,
+        [Parameter(Mandatory)][ValidateSet('ort', 'torch')][string]$Engine,
+        [Parameter(Mandatory)][string]$Variant,
+        [string]$GfxArch
+    )
+    $engineProfile = [ordered]@{ engine = $Engine; variant = $Variant }
+    if ($GfxArch) { $engineProfile.gfx = $GfxArch }
+    Write-Utf8File (Join-Path $WorkerDir 'profile.json') ($engineProfile | ConvertTo-Json)
+
+    # importlib.metadata reads the installed dist-infos, so this is what is
+    # there, not what a lock asked for. Single quotes only: PowerShell 5.1
+    # does not escape double quotes inside a native command's argument.
+    $query = @'
+import json, platform
+from importlib import metadata
+names = ('onnxruntime', 'onnxruntime-directml', 'onnxruntime-gpu', 'rembg',
+         'numpy', 'pi-heif', 'torch', 'torchvision')
+pkgs = {}
+for n in names:
+    try:
+        pkgs[n] = metadata.version(n)
+    except metadata.PackageNotFoundError:
+        pass
+print(json.dumps({'python': platform.python_version(), 'packages': pkgs}))
+'@
+    $versions = & (Get-WorkerPython $WorkerDir) -I -c $query
+    if ($LASTEXITCODE -ne 0) { throw "Could not read the package versions in $WorkerDir" }
+    Write-Utf8File (Join-Path $WorkerDir 'versions.json') $versions
+}
+
+function Complete-Worker {
+    <#
+    .SYNOPSIS
+      Compile the worker's bytecode, then write its inventory.
+
+    .DESCRIPTION
+      Compiled now, the .pyc files are in the inventory, and the worker never
+      writes files of its own beside its code at run time.
+    #>
+    param([Parameter(Mandatory)][string]$WorkerDir)
+    # Lib\ only: the stdlib and site-packages. tcl\ ships a .py data file that
+    # isn't valid Python 3 and is never imported.
+    & (Get-WorkerPython $WorkerDir) -I -m compileall -q -j 0 (Join-Path $WorkerDir 'Lib') | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Compiling the worker's bytecode failed" }
+    Write-Inventory $WorkerDir
+}
+
+function Switch-Worker {
+    <#
+    .SYNOPSIS
+      Put the probed worker at $Staged in place of $WorkerDir.
+
+    .DESCRIPTION
+      The old worker is renamed aside first and removed by its inventory only
+      once the new one is in place, so at every step one complete worker
+      exists. Files someone added to the old worker stay, in the renamed
+      folder, and are reported.
+    #>
+    param([Parameter(Mandatory)][string]$WorkerDir, [Parameter(Mandatory)][string]$Staged)
+    $old = $null
+    if (Test-Path -LiteralPath $WorkerDir) {
+        if (-not (Test-Inventory $WorkerDir)) {
+            throw "$WorkerDir has no $($script:InventoryName), so it may not be bg-be-gone's; not replacing it"
+        }
+        $old = New-UniqueName $WorkerDir '.old'
+        Rename-Item -LiteralPath $WorkerDir (Split-Path -Leaf $old) -ErrorAction Stop
+    }
+    try {
+        Rename-Item -LiteralPath $Staged (Split-Path -Leaf $WorkerDir) -ErrorAction Stop
+    } catch {
+        if ($old) { Rename-Item -LiteralPath $old (Split-Path -Leaf $WorkerDir) }
+        throw "Could not move the new worker into place (is bg-be-gone still running?): $_"
+    }
+    if ($old) {
+        $left = @(Remove-Inventory $old)
+        if ($left.Count) {
+            Write-Warning "Kept $($left.Count) file(s) in $old that the old worker's inventory doesn't list"
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Launcher and icon
+# ---------------------------------------------------------------------------
+function Get-LaunchCommand {
+    <#
+    .SYNOPSIS
+      The program and arguments that start bg-be-gone: the one place that
+      decides how it is launched.
+
+    .DESCRIPTION
+      MSYS2's windowless pythonw.exe runs src\bgbg\plat\winlaunch.py, which
+      tells the app where its worker is and runs it in the same process.
+
+      The shell expands %VAR% in a shortcut's arguments, so -Mode Module
+      passes no path at all: `-m bg_be_gone_launch`, a module in the
+      interpreter's own site-packages that holds the paths (see
+      Install-LaunchModule). -Mode Paths names them on the command line, for
+      an MSYS2 that isn't bg-be-gone's to write into; a path holding a '%'
+      then can't be launched from a shortcut.
+
+    .OUTPUTS
+      @{ Program = <pythonw.exe>; Arguments = <string[]> }
+    #>
+    param(
+        [Parameter(Mandatory)][string]$GtkRoot,
+        [Parameter(Mandatory)][ValidateSet('Module', 'Paths')][string]$Mode,
+        [string]$AppDir,
+        [string]$Install
+    )
+    if ($Mode -eq 'Module') {
+        $arguments = @('-m', 'bg_be_gone_launch')
+    } else {
+        $arguments = @(Join-Path $AppDir 'plat\winlaunch.py')
+        if ($Install) { $arguments += "--install=$Install" }
+    }
+    @{ Program = (Join-Path $GtkRoot 'bin\pythonw.exe'); Arguments = $arguments }
+}
+
+function Install-LaunchModule {
+    <#
+    .SYNOPSIS
+      Put bg_be_gone_launch.py in the frontend interpreter's site-packages.
+
+    .DESCRIPTION
+      Without -AppDir it is the release bundle's copy, which finds the app
+      from its own location. A source install passes its checkout's src\bgbg
+      and its install folder, written into the file as Python strings.
+
+    .OUTPUTS
+      The file written.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$GtkRoot,
+        [string]$AppDir,
+        [string]$Install
+    )
+    $site = Get-ChildItem -LiteralPath (Join-Path $GtkRoot 'lib') -Directory -Filter 'python3.*' |
+        ForEach-Object { Join-Path $_.FullName 'site-packages' } |
+        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $site) { throw "No python3.x\site-packages under $GtkRoot\lib" }
+    $text = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'bg_be_gone_launch.py') -Raw
+    # r"..." holds any Windows path: none ends in a backslash or holds a quote.
+    if ($AppDir) { $text = $text.Replace('APP_DIR = None   # @APP_DIR@', "APP_DIR = r`"$AppDir`"") }
+    if ($Install) { $text = $text.Replace('INSTALL = None   # @INSTALL@', "INSTALL = r`"$Install`"") }
+    $path = Join-Path $site 'bg_be_gone_launch.py'
+    Write-Utf8File $path $text
+    # Compiled now, so its .pyc is part of the tree's inventory instead of a
+    # file the first start leaves behind.
+    & (Join-Path $GtkRoot 'bin\python.exe') -I -m py_compile $path
+    if ($LASTEXITCODE -ne 0) { throw "Compiling $path failed" }
+    $path
+}
+
+function ConvertTo-CommandLine {
+    <# Quote arguments for CreateProcess: each in quotes, a trailing backslash doubled. #>
+    param([string[]]$Arguments)
+    ($Arguments | ForEach-Object { '"' + ($_ -replace '(\\+)$', '$1$1') + '"' }) -join ' '
+}
+
+function New-AppShortcut {
+    <#
+    .SYNOPSIS
+      A shortcut at $Path that runs the launch command, with the app's icon.
+
+    .DESCRIPTION
+      No working folder: the shell expands %VAR% in it too, and the app needs
+      none. The icon is shown as stored, without expansion (ShellLink.cs).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][hashtable]$Command,
+        [Parameter(Mandatory)][string]$Icon
+    )
+    Import-ShellLink
+    [BgBeGone.ShellLink]::Save($Path, $Command.Program, (ConvertTo-CommandLine $Command.Arguments),
+        '', $Icon, 'Local image background remover and object segmenter')
+}
+
+function Read-AppShortcut {
+    <# A shortcut's target and arguments as stored: @{ Target; Arguments }. #>
+    param([Parameter(Mandatory)][string]$Path)
+    Import-ShellLink
+    $target, $arguments = [BgBeGone.ShellLink]::Read($Path)
+    @{ Target = $target; Arguments = $arguments }
+}
+
+function Import-ShellLink {
+    <# Compile ShellLink.cs once per session (see its header for why not WScript.Shell). #>
+    if (-not ('BgBeGone.ShellLink' -as [type])) {
+        Add-Type -Path (Join-Path $PSScriptRoot 'ShellLink.cs') -ErrorAction Stop
+    }
+}
+
+function New-AppIcon {
+    <#
+    .SYNOPSIS
+      Wrap the app's 512 px PNG in an .ico container for shortcuts and Setup.
+
+    .DESCRIPTION
+      Windows Vista and later read PNG-compressed icon entries, so the .ico is
+      one ICONDIR header, one entry and the PNG bytes unchanged.
+    #>
+    param([Parameter(Mandatory)][string]$Png, [Parameter(Mandatory)][string]$Ico)
+    $bytes = [IO.File]::ReadAllBytes($Png)
+    $ms = New-Object IO.MemoryStream
+    $bw = New-Object IO.BinaryWriter($ms)
+    # ICONDIR: reserved 0, type 1 (icon), 1 image.
+    foreach ($v in @([UInt16]0, [UInt16]1, [UInt16]1)) { $bw.Write($v) }
+    # ICONDIRENTRY: width and height 0 mean 256 or more; no palette; reserved.
+    $bw.Write([Byte]0); $bw.Write([Byte]0); $bw.Write([Byte]0); $bw.Write([Byte]0)
+    $bw.Write([UInt16]1); $bw.Write([UInt16]32)                   # planes, bits per pixel
+    $bw.Write([UInt32]$bytes.Length); $bw.Write([UInt32]22)       # image size, offset (6 + 16)
+    $bw.Write($bytes); $bw.Flush()
+    [IO.File]::WriteAllBytes($Ico, $ms.ToArray())
+    $bw.Dispose(); $ms.Dispose()
+}
+
+Export-ModuleMember -Function Write-Utf8File, New-UniqueName, New-PrivateTempDir,
+    Test-ReparsePoint, Assert-NoReparseBelow, Get-TreeFiles, Write-Inventory, Test-Inventory,
+    Read-Inventory, Update-Inventory, Test-LegacyInstall,
+    Remove-Inventory, Remove-CacheTree, Get-WorkerPython, New-WorkerPython,
+    Install-LockedPackage, New-WorkerStartInfo, Invoke-WorkerPython, Test-Worker,
+    Write-WorkerRecord, Complete-Worker, Switch-Worker, Get-LaunchCommand, Install-LaunchModule,
+    ConvertTo-CommandLine,
+    New-AppShortcut, Read-AppShortcut, New-AppIcon
