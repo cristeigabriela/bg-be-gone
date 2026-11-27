@@ -5,13 +5,18 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# Actions are pinned by commit, with the tag they were at as a comment, so a
+# moved tag can't change what runs for the same source.
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
@@ -29,7 +34,7 @@ jobs:
           sudo apt-get install -y -qq shellcheck desktop-file-utils appstream
 
       - name: Shell scripts
-        run: shellcheck install.sh uninstall.sh bin/bg-be-gone packaging/build-appimage.sh
+        run: shellcheck install.sh uninstall.sh bin/bg-be-gone packaging/build-appimage.sh packaging/lock-windows-gtk.sh
 
       - name: Desktop entry
         run: desktop-file-validate data/io.github.cristeigabriela.BgBeGone.desktop
@@ -42,9 +47,9 @@ jobs:
     env:
       U2NET_HOME: ${{ github.workspace }}/.u2net
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
@@ -52,10 +57,167 @@ jobs:
         run: python -m pip install --quiet "rembg[cpu]" pi-heif pytest
 
       # The tests download rembg's smallest model (u2netp, ~5 MB) on first use.
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: .u2net
           key: u2net-u2netp
 
       - name: Tests
         run: python -m pytest tests -q
+
+  windows-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Syntax check
+        run: python -m compileall -q src
+
+      - name: Lint PowerShell (PSScriptAnalyzer)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Force -Scope CurrentUser
+          $issues = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
+          $issues | Format-Table -AutoSize
+          if ($issues) { throw "PSScriptAnalyzer found $($issues.Count) error(s)" }
+
+      # Windows PowerShell 5.1 reads a BOM-less script in the ANSI code page and
+      # cmd.exe a batch file in the OEM one, so one stray non-ASCII character
+      # changes what they run. Paths with accents come from variables instead.
+      - name: Windows scripts are ASCII
+        shell: pwsh
+        run: |
+          # Latin-1 maps every byte to one character, so any byte over 0x7F shows.
+          $bad = Get-ChildItem -Recurse -File -Include *.ps1, *.psm1, *.cmd, *.iss |
+            Where-Object { [IO.File]::ReadAllText($_.FullName, [Text.Encoding]::Latin1) -match '[^\x00-\x7F]' }
+          $bad | ForEach-Object { Write-Host "::error file=$($_.FullName)::non-ASCII character" }
+          if ($bad) { throw "$($bad.Count) Windows script(s) hold non-ASCII text" }
+
+  windows-unit:
+    runs-on: windows-latest
+    env:
+      U2NET_HOME: ${{ github.workspace }}\.u2net
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the cpu worker's pinned packages
+        run: |
+          python -m pip install --quiet --no-deps --require-hashes -r packaging/locks/windows-worker-cpu.txt
+          python -m pip install --quiet pytest
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .u2net
+          key: u2net-u2netp
+
+      - name: Tests
+        run: python -m pytest tests -q
+
+  # The worker as releases build it: a standalone CPython from the real script,
+  # probed for "ready" before it is kept.
+  windows-worker:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cpu, seg]
+    env:
+      U2NET_HOME: ${{ github.workspace }}\.u2net
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          version: "0.12.7"
+          enable-cache: true
+          cache-dependency-glob: packaging/locks/*.txt
+
+      - name: Build the ${{ matrix.variant }} worker
+        shell: pwsh
+        run: ./packaging/build-windows-worker.ps1 -Variant ${{ matrix.variant }} -Dest "$env:RUNNER_TEMP\worker"
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        if: matrix.variant == 'cpu'
+        with:
+          path: .u2net
+          key: u2net-u2netp
+
+      - name: One CPU cutout on the built worker
+        if: matrix.variant == 'cpu'
+        shell: pwsh
+        run: |
+          $py = "$env:RUNNER_TEMP\worker\python.exe"
+          uv pip install --quiet --python $py pytest
+          & $py -m pytest "tests/test_worker.py::test_a_single_cutout_succeeds" -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # A source install end to end, for a user named José whose install folder
+  # holds a literal %TEMP%: bg-be-gone's own pinned MSYS2, the worker, the
+  # shortcut, a real start (and one with a file to open), then an uninstall
+  # that must leave files it does not own.
+  windows-frontend:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          version: "0.12.7"
+          enable-cache: true
+          cache-dependency-glob: packaging/locks/*.txt
+
+      - name: Install (seg) for a user named José
+        shell: pwsh
+        run: |
+          $user = Join-Path $env:RUNNER_TEMP 'Users\José Tester'
+          $env:LOCALAPPDATA = Join-Path $user 'AppData\Local'
+          $env:APPDATA = Join-Path $user 'AppData\Roaming'
+          $prefix = Join-Path $user '%TEMP%\bg-be-gone'
+          ./install.ps1 -Variant seg -Prefix $prefix -ShortcutName 'bg-be-gone (ci)' -SkipModelDownload
+          "LOCALAPPDATA=$env:LOCALAPPDATA" >> $env:GITHUB_ENV
+          "APPDATA=$env:APPDATA" >> $env:GITHUB_ENV
+          "BGBG_PREFIX=$prefix" >> $env:GITHUB_ENV
+          "BGBG_LNK=$env:APPDATA\Microsoft\Windows\Start Menu\Programs\bg-be-gone (ci).lnk" >> $env:GITHUB_ENV
+
+      - name: Start it from its shortcut
+        shell: pwsh
+        run: ./packaging/test-windows-launch.ps1 -Shortcut $env:BGBG_LNK -Expect seg
+
+      # As dropping a photo on the shortcut does. Not under a "%TEMP%" folder:
+      # the shell expands %VAR% in what it hands a shortcut, before the app runs.
+      - name: Start it with a file to open
+        shell: pwsh
+        run: |
+          $photos = Join-Path $env:RUNNER_TEMP 'Fotos de José'
+          New-Item -ItemType Directory -Force $photos | Out-Null
+          $photo = Join-Path $photos 'retrato é.png'
+          Copy-Item tests/testdata/subject.png $photo
+          ./packaging/test-windows-launch.ps1 -Shortcut $env:BGBG_LNK -Open $photo -Expect seg
+
+      - name: Uninstall removes only what it installed
+        shell: pwsh
+        run: |
+          $mine = Join-Path $env:BGBG_PREFIX 'not-bg-be-gone.txt'
+          $shared = Join-Path $env:BGBG_PREFIX 'share\other-app\keep.txt'
+          $inWorker = Join-Path $env:BGBG_PREFIX 'worker\added-later.txt'
+          New-Item -ItemType Directory -Force (Split-Path $shared) | Out-Null
+          'unrelated' | Set-Content -LiteralPath $mine, $shared, $inWorker
+          ./uninstall.ps1 -Prefix $env:BGBG_PREFIX
+          foreach ($f in $mine, $shared, $inWorker) { if (-not (Test-Path -LiteralPath $f)) { throw "uninstall deleted $f" } }
+          foreach ($f in 'msys64', 'worker\python.exe', 'bg-be-gone-install.json') {
+            if (Test-Path -LiteralPath (Join-Path $env:BGBG_PREFIX $f)) { throw "uninstall left $f" }
+          }
+          if (Test-Path -LiteralPath $env:BGBG_LNK) { throw "uninstall left the shortcut" }
+
+      - name: Worker log
+        if: failure()
+        shell: pwsh
+        run: Get-Content "$env:LOCALAPPDATA\bg-be-gone\bg-be-gone-worker.log" -ErrorAction SilentlyContinue
