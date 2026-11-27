@@ -243,3 +243,31 @@ def probe_vram():
     except Exception:
         pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# The frontend's side
+# ---------------------------------------------------------------------------
+def default_worker_python():
+    """The worker interpreter install.sh builds; the launcher normally names it."""
+    return os.path.expanduser("~/.local/share/bg-be-gone/venv/bin/python")
+
+
+def worker_log_path():
+    """Where the worker's stderr goes: GLib's user cache folder."""
+    from gi.repository import GLib   # the frontend's; the worker never asks
+    return os.path.join(GLib.get_user_cache_dir(), "bg-be-gone-worker.log")
+
+
+def subprocess_flags():
+    """Popen creation flags: none on Linux."""
+    return 0
+
+
+def worker_env(environ=None):
+    """The worker inherits the frontend's environment as it is: None, for Popen."""
+    return None
+
+
+def frontend_started(app_id):
+    """Called once GTK is up. The .desktop file names the window icon on Linux."""
