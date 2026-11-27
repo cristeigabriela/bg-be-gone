@@ -13,6 +13,10 @@ import tempfile
 import threading
 import subprocess
 
+if os.name == "nt":
+    import wincompose
+    wincompose.request_gpu_rendering()     # before GTK initialises
+
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
@@ -399,6 +403,9 @@ class Window(Adw.ApplicationWindow):
         super().__init__(application=app)
         self.set_title("bg-be-gone")
         self.set_default_size(1300, 820)
+        if os.name == "nt":
+            # GTK's GL window exists once the first window maps (see wincompose).
+            self.connect("map", lambda *_: wincompose.enable_gl_window_alpha())
 
         self.tmpdir = os.environ.get("BGBG_TMPDIR") or tempfile.mkdtemp(
             prefix="bg-be-gone-")
