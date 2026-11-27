@@ -935,7 +935,8 @@ class Window(Adw.ApplicationWindow):
             # Track this load so a reply that lands after we've left/unloaded
             # can be ignored instead of wrongly re-marking the model as resident.
             self._seg_load_rid = self.worker.send(
-                {"op": "seg_load", "input": inp, "model": self._seg_model_choice()})
+                {"op": "seg_load", "input": inp, "model": self._seg_model_choice(),
+                 "maskdir": os.path.join(self.tmpdir, "segmasks")})
 
         def failed(e):
             self._seg_set_busy(False)

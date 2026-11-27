@@ -18,7 +18,8 @@ Requests (one JSON object per line on stdin):
    "rot":0..3,"fh":bool,"fv":bool,"id":N}   # per-frame background removal
   {"op":"cancel"}                            # stop single/batch/gif in progress
   {"op":"models"}
-  {"op":"seg_load","input":P,"model":"auto|large|base_plus|small|tiny|mobile","id":N}
+  {"op":"seg_load","input":P,"model":"auto|large|base_plus|small|tiny|mobile",
+   "maskdir":D,"id":N}
   {"op":"seg_everything","points_per_side":int?,"id":N}
   {"op":"seg_point","points":[[x,y,label],...],"use_prev":bool,"id":N}
   {"op":"seg_extract","ids":[...]|"mask":P,"bg":BG,"blur":int,"output":P,"id":N}
@@ -711,7 +712,8 @@ def handle_seg_load(req):
     path = req["input"]
     want = req.get("model", "auto")
     pil = Image.open(path).convert("RGB")
-    maskdir = os.path.join(os.path.dirname(os.path.abspath(path)), "segmasks")
+    # The input can be the user's own photo, so the masks never go next to it.
+    maskdir = req.get("maskdir") or tempfile.mkdtemp(prefix="bg-be-gone-masks-")
     os.makedirs(maskdir, exist_ok=True)
 
     def on_step(rung, exc):
