@@ -1,8 +1,22 @@
 """The shared format list, src/bgbg/formats.py, without the worker or GTK."""
+import configparser
+from pathlib import Path
+
 import pytest
 
 import formats
 from formats import JPEG, PNG, WEBP, Alpha, SuffixChange
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def test_the_desktop_entry_offers_exactly_the_formats_the_app_reads():
+    """Open with lists bg-be-gone for these; a missing one hides it, an extra one fails."""
+    entry = configparser.ConfigParser(interpolation=None)
+    entry.read(REPO / "data" / "io.github.cristeigabriela.BgBeGone.desktop", encoding="utf-8")
+    advertised = {m for m in entry["Desktop Entry"]["MimeType"].split(";") if m}
+    assert advertised == set(formats.MIME_TYPES)
+
 
 TRANSPARENT = formats.save_formats(Alpha.TRANSPARENT)
 FLATTENED = formats.save_formats(Alpha.FLATTENED)

@@ -14,6 +14,8 @@ gi.require_version("Graphene", "1.0")
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gtk, Gdk, Gsk, Graphene, GdkPixbuf, Gio, GLib  # noqa: E402
 
+import formats  # noqa: E402
+
 MIN_ZOOM = 0.05
 MAX_ZOOM = 40.0
 _CELL = 16
@@ -116,7 +118,7 @@ class ImageView(Gtk.Widget):
 
         self.pixbuf = None
         self._texture = None
-        self._anim = None        # GdkPixbuf.PixbufAnimation for animated GIFs
+        self._anim = None        # GdkPixbuf.PixbufAnimation for an animated GIF or WebP
         self._anim_iter = None
         self._anim_timer = 0     # GLib timeout id driving frame advance
         self.zoom = 1.0          # 1.0 == fit to widget
@@ -250,7 +252,7 @@ class ImageView(Gtk.Widget):
     def load_file(self, path, keep_transform=False):
         self._stop_animation()
         anim = self._open_animation(path)
-        if anim is not None:               # animated GIF: play it back
+        if anim is not None:               # animated GIF or WebP: play it back
             self._anim = anim
             self._anim_iter = anim.get_iter(None)
             self.pixbuf = self._anim_iter.get_pixbuf()
@@ -273,9 +275,10 @@ class ImageView(Gtk.Widget):
         return True
 
     def _open_animation(self, path):
-        """Return a PixbufAnimation if `path` is an animated GIF we should play
-        (not on the Segment view, which needs a stable frame), else None."""
-        if self._seg_mode is not None or not path.lower().endswith(".gif"):
+        """Return a PixbufAnimation if `path` is an animated GIF or WebP we
+        should play (not on the Segment view, which needs a stable frame), else
+        None. WebP plays only where GdkPixbuf has its loader."""
+        if self._seg_mode is not None or not formats.can_animate(path):
             return None
         try:
             anim = GdkPixbuf.PixbufAnimation.new_from_file(path)

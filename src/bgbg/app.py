@@ -66,6 +66,15 @@ def _run_off_main(work, done):
 
 
 @dataclass
+class _PendingOpen:
+    """A source the worker is decoding or probing before the app adopts it."""
+
+    rid: int
+    path: str
+    preview: Optional[str]   # what GdkPixbuf already shows, or None until the worker's PNG
+
+
+@dataclass
 class _PendingSave:
     """A result the worker is writing as WebP or JPEG."""
 
@@ -139,8 +148,6 @@ SEG_FOCUS = [
     ("Normal", 1600),
     ("Relaxed", 2600),
 ]
-IMG_PATTERNS = ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp", "*.tif", "*.tiff",
-                "*.gif"]
 PROVIDER_LABELS = {
     "CUDAExecutionProvider": "NVIDIA (CUDA)",
     "ROCMExecutionProvider": "AMD (ROCm)",
@@ -442,7 +449,7 @@ class Window(Adw.ApplicationWindow):
             prefix="bg-be-gone-")
         os.makedirs(self.tmpdir, exist_ok=True)
         self.source_path = None
-        self._source_is_gif = False
+        self._source_animation = formats.Animation.STILL
         self.result_output = None
         # Whether the shown result's pixels are transparent, which decides if
         # JPEG is offered. Recorded per request (id -> Alpha) and adopted with
@@ -450,6 +457,10 @@ class Window(Adw.ApplicationWindow):
         self._result_alpha = formats.Alpha.TRANSPARENT
         self._generating_alpha = {}
         self._seg_export_alpha = {}
+        # The source the worker is decoding or probing (a _PendingOpen), and
+        # every open request id still out, so a superseded reply is dropped.
+        self._open = None
+        self._open_rids = set()
         # Results the worker is writing as WebP or JPEG: id -> _PendingSave.
         self._pending_saves = {}
         self.busy = False
@@ -978,7 +989,7 @@ class Window(Adw.ApplicationWindow):
                                                "model": self._seg_model_choice()})
 
     def _on_seg_everything(self):
-        if self.seg_busy:
+        if self.seg_busy or self._open is not None:
             return
         self._ensure_seg_loaded(self._do_seg_everything)
 
@@ -997,7 +1008,7 @@ class Window(Adw.ApplicationWindow):
         if kind == "toggle":
             self._update_seg_selection_ui()
         else:  # point mode
-            if self.seg_busy:
+            if self.seg_busy or self._open is not None:
                 return
             self.seg_points.append([ix, iy, value])
             self._ensure_seg_loaded(self._do_seg_point)
@@ -1103,7 +1114,7 @@ class Window(Adw.ApplicationWindow):
 
     def _on_seg_save(self):
         """Render the final PNG in the worker, then offer a save dialog."""
-        if self.seg_busy:
+        if self.seg_busy or self._open is not None:
             return
         if not self._seg_has_selection():
             self._toast("Pick at least one object first.")
@@ -1262,8 +1273,9 @@ class Window(Adw.ApplicationWindow):
     def _image_filters(self):
         store = Gio.ListStore.new(Gtk.FileFilter)
         f = Gtk.FileFilter(name="Images")
-        for p in IMG_PATTERNS:
-            f.add_pattern(p)
+        # Suffixes, unlike patterns, match in any case: cameras write .JPG.
+        for suffix in formats.READ_SUFFIXES:
+            f.add_suffix(suffix[1:])
         store.append(f)
         return store
 
@@ -1290,33 +1302,115 @@ class Window(Adw.ApplicationWindow):
             return True
         return False
 
-    def _is_animated_gif(self, path):
-        if not path.lower().endswith(".gif"):
-            return False
+    def _animation_of(self, path):
+        if not formats.can_animate(path):
+            return formats.Animation.STILL
         try:
             anim = GdkPixbuf.PixbufAnimation.new_from_file(path)
         except GLib.Error:
-            return False
-        return not anim.is_static_image()
+            return formats.Animation.STILL
+        if anim.is_static_image():
+            return formats.Animation.STILL
+        return formats.Animation.ANIMATED
 
     def _load_source(self, path):
+        """Open a source image.
+
+        GdkPixbuf previews it when it has a loader for the format; otherwise
+        the worker decodes it into a PNG to show. A WebP is adopted only once
+        the worker has counted its frames: a WebP loader may decode stills only.
+        """
         if not path:
             return
-        if not self.src_panel.view.load_file(path):
-            self._toast("Could not open that image.")
+        if self._open is not None:         # this open wins over one in flight
+            self._open = None
+            self._release_source_actions()
+        name = os.path.basename(path)
+        if self.src_panel.view.load_file(path):
+            if formats.format_of(path) is formats.WEBP:
+                self._request_open(path, {"op": "frames", "input": path}, preview=path)
+                return
+            self._show_source(path, path, self._animation_of(path))
             return
+        if not formats.is_readable(path):
+            _log.warning("can't open %s: not a format bg-be-gone reads", path)
+            self._toast("Can't open %s: not a format bg-be-gone reads." % name)
+            return
+        # Typically HEIC or AVIF, which few systems have GdkPixbuf loaders for.
+        _log.info("no GdkPixbuf loader decoded %s; asking the worker", path)
+        self._request_open(path, {"op": "convert", "input": path,
+                                  "output": os.path.join(self.tmpdir, "source.png")},
+                           preview=None)
+
+    def _request_open(self, path, req, preview):
+        """Send the worker the convert or frames request that opening `path` waits on."""
+        rid = self.worker.send(req)
+        if rid == -1:
+            _log.warning("can't open %s: the worker isn't running", path)
+            if preview is not None:        # shown already; it just can't animate
+                self._show_source(path, preview, formats.Animation.STILL)
+                return
+            self._toast("Can't open %s: the worker isn't running." % os.path.basename(path))
+            return
+        self._open = _PendingOpen(rid, path, preview)
+        self._open_rids.add(rid)
+        self._hold_source_actions()
+        self.status.set_text("Opening %s…" % os.path.basename(path))
+
+    def _hold_source_actions(self):
+        """While an open is pending, nothing may run on the old source."""
+        for button in (self.gen_btn, self.save_btn, self.seg_everything_btn,
+                       self.seg_save_btn):
+            button.set_sensitive(False)
+
+    def _release_source_actions(self):
+        self.gen_btn.set_sensitive(not self.busy and self.src_panel.view.has_image())
+        self.save_btn.set_sensitive(self.result_output is not None)
+        self.seg_everything_btn.set_sensitive(not self.seg_busy)
+        self.seg_save_btn.set_sensitive(self.seg_result_output is not None)
+
+    def _on_open_reply(self, msg):
+        """The worker's answer to the open in flight: frames, converted or error."""
+        pending, self._open = self._open, None
+        self._release_source_actions()
+        name = os.path.basename(pending.path)
+        if msg["type"] == "error":
+            first = msg["message"].splitlines()[0]
+            _log.warning("can't open %s: %s", pending.path, first)
+            if pending.preview is not None:   # GdkPixbuf shows it, so it works as a still
+                self._show_source(pending.path, pending.preview, formats.Animation.STILL)
+                return
+            self.status.set_text("Error: " + first)
+            self._toast("Error: " + first)
+            return
+        preview = pending.preview or msg["output"]
+        if pending.preview is None and not self.src_panel.view.load_file(preview):
+            _log.warning("can't show %s, decoded by the worker to %s", pending.path, preview)
+            self._toast("Can't open %s." % name)
+            return
+        # A multi-page TIFF or multi-image HEIC has frames too, but isn't an animation.
+        if formats.can_animate(pending.path) and msg.get("frames", 1) > 1:
+            animation = formats.Animation.ANIMATED
+        else:
+            animation = formats.Animation.STILL
+        self._show_source(pending.path, preview, animation)
+
+    def _show_source(self, path, preview, animation):
+        """Adopt `path` as the source; `preview` is the file the views show."""
         self.source_path = path
-        self._source_is_gif = self._is_animated_gif(path)
+        self._source_animation = animation
         self.res_panel.view.clear()
         self.result_output = None
         self.save_btn.set_sensitive(False)
         self.gen_btn.set_sensitive(True)
-        tail = " — animated GIF, press Generate." if self._source_is_gif \
-            else " — press Generate."
+        if animation is formats.Animation.ANIMATED:
+            tail = " — animated %s, press Generate." % formats.format_of(path).name
+        else:
+            tail = " — press Generate."
         self.status.set_text(os.path.basename(path) + tail)
         # Mirror into the Segment page and reset its state for the new image.
         if getattr(self, "seg_panel", None) is not None:
-            self.seg_panel.view.load_file(path)
+            self.seg_panel.view.load_file(preview)
             self.seg_res_panel.view.clear()
             self._seg_clear_overlays()
             self.seg_loaded_for = None
@@ -1325,6 +1419,8 @@ class Window(Adw.ApplicationWindow):
             self.seg_status.set_text(os.path.basename(path) + " — Segment.")
 
     def _on_save(self):
+        if self._open is not None:
+            return
         # An animated result is the worker's file itself (all frames), saved in
         # its own format; a still result is the current pixbuf.
         result = self.result_output
@@ -1495,11 +1591,11 @@ class Window(Adw.ApplicationWindow):
             self.status.set_text("Settings changed — press Generate to update.")
 
     def _on_generate(self):
-        if self.busy or not self.src_panel.view.has_image():
+        if self.busy or self._open is not None or not self.src_panel.view.has_image():
             return
         model, bg, alpha, blur = self.get_settings()
-        if self._source_is_gif:
-            self._generate_gif(model, bg, alpha, blur)
+        if self._source_animation is formats.Animation.ANIMATED:
+            self._generate_animation(model, bg, alpha, blur)
             return
         inp = os.path.join(self.tmpdir, "input.png")
         try:
@@ -1515,15 +1611,17 @@ class Window(Adw.ApplicationWindow):
                                 "model": model, "alpha": alpha, "bg": bg, "blur": blur})
         self._generating_alpha[rid] = _alpha_of(bg)
 
-    def _generate_gif(self, model, bg, alpha, blur):
+    def _generate_animation(self, model, bg, alpha, blur):
         # Same options as a still; the worker processes each frame and reports
         # per-frame progress. Pass the current rotate/flip so it bakes in like a
         # still would; process the original file (all frames) not the preview.
-        out = os.path.join(self.tmpdir, "result.gif")
+        # The result keeps the source's format: a WebP keeps soft alpha edges.
+        fmt = formats.format_of(self.source_path)
+        out = os.path.join(self.tmpdir, "result" + fmt.suffix)
         v = self.src_panel.view
         self._set_busy(True, cancel=True)
         self.src_panel.view.set_scanning(True)
-        self.status.set_text("Removing background from GIF…")
+        self.status.set_text("Removing background from %s…" % fmt.name)
         rid = self.worker.send({"op": "gif", "input": self.source_path, "output": out,
                                 "model": model, "alpha": alpha, "bg": bg, "blur": blur,
                                 "rot": v.rot, "fh": v.fh, "fv": v.fv})
@@ -1557,6 +1655,13 @@ class Window(Adw.ApplicationWindow):
     def _on_worker_message(self, msg):
         t = msg.get("type")
         rid = msg.get("id")
+        if rid in self._open_rids:
+            # Only the current open is answered. A superseded one's reply,
+            # success or error, is dropped without touching any other state.
+            self._open_rids.discard(rid)
+            if self._open is not None and rid == self._open.rid:
+                self._on_open_reply(msg)
+            return False
         if rid in self._pending_saves and t in ("converted", "error"):
             self._on_save_reply(msg)
             return False
@@ -1604,12 +1709,16 @@ class Window(Adw.ApplicationWindow):
                 self.status.set_text("Removing background — frame %d / %d"
                                      % (msg["done"], msg["total"]))
         elif t == "gif_done":
-            self.res_panel.view.load_file(msg["output"])   # first-frame preview
+            # The animation plays where GdkPixbuf has a loader for it (always
+            # for GIF); otherwise the worker's first-frame PNG stands in.
+            if not self.res_panel.view.load_file(msg["output"]):
+                self.res_panel.view.load_file(msg["preview"])
             self.result_output = msg["output"]
             self._result_alpha = self._generating_alpha.pop(rid, formats.Alpha.TRANSPARENT)
             self.save_btn.set_sensitive(True)
-            self.status.set_text("Done: %d frames in %.1fs — Save the GIF."
-                                 % (msg["frames"], msg["seconds"]))
+            self.status.set_text("Done: %d frames in %.1fs — Save the %s."
+                                 % (msg["frames"], msg["seconds"],
+                                    formats.format_of(msg["output"]).name))
             self._set_busy(False)
         elif t == "canceled":
             self._generating_alpha.pop(rid, None)
