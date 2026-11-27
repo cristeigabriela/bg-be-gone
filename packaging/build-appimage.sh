@@ -121,14 +121,19 @@ esac
 # pillow) with no rembg/BiRefNet — a much smaller AppImage. SAM weights are not
 # bundled (downloaded on first use), keeping the image small and the Apache
 # weights out of the MIT artifact.
+#
+# pi-heif (libheif's decode-only build) lets the worker read HEIC; Pillow reads
+# the other formats itself. It goes in with the rest so one resolve sees rembg's
+# Pillow range.
+CODECS=(pi-heif)
 case "$VARIANT" in
   cuda)
     uv pip install --python "$VPY" --target "$SITE_DST" --quiet "rembg[gpu]" \
-      "numba>=0.60" "llvmlite>=0.43" nvidia-cuda-runtime nvidia-cublas \
+      "numba>=0.60" "llvmlite>=0.43" "${CODECS[@]}" nvidia-cuda-runtime nvidia-cublas \
       nvidia-cufft nvidia-curand nvidia-cudnn-cu13 ;;
   rocm|rocm-gfx1031)
     uv pip install --python "$VPY" --target "$SITE_DST" --quiet "rembg[cpu]" \
-      "numba>=0.60" "llvmlite>=0.43"
+      "numba>=0.60" "llvmlite>=0.43" "${CODECS[@]}"
     # Every onnxruntime flavour owns the same package dir, so clear the CPU one
     # before unpacking the ROCm build over the top.
     rm -rf "$SITE_DST/onnxruntime" "$SITE_DST"/onnxruntime-[0-9]*.dist-info
@@ -136,16 +141,18 @@ case "$VARIANT" in
       "$ROCM_WHEEL" coloredlogs sympy ;;
   seg-cuda)
     uv pip install --python "$VPY" --target "$SITE_DST" --quiet \
-      onnxruntime-gpu numpy pillow nvidia-cuda-runtime nvidia-cublas \
+      onnxruntime-gpu numpy pillow "${CODECS[@]}" nvidia-cuda-runtime nvidia-cublas \
       nvidia-cufft nvidia-curand nvidia-cudnn-cu13 ;;
   seg-rocm|seg-rocm-gfx1031)
     uv pip install --python "$VPY" --target "$SITE_DST" --quiet \
-      numpy pillow "$ROCM_WHEEL" flatbuffers packaging protobuf coloredlogs sympy ;;
+      numpy pillow "${CODECS[@]}" "$ROCM_WHEEL" flatbuffers packaging protobuf \
+      coloredlogs sympy ;;
   seg)
-    uv pip install --python "$VPY" --target "$SITE_DST" --quiet onnxruntime numpy pillow ;;
+    uv pip install --python "$VPY" --target "$SITE_DST" --quiet onnxruntime numpy pillow \
+      "${CODECS[@]}" ;;
   *)
     uv pip install --python "$VPY" --target "$SITE_DST" --quiet "rembg[cpu]" \
-      "numba>=0.60" "llvmlite>=0.43" ;;
+      "numba>=0.60" "llvmlite>=0.43" "${CODECS[@]}" ;;
 esac
 
 OUT="bg-be-gone-${VERSION}-${VARIANT}-${ARCH}.AppImage"

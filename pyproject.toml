@@ -11,10 +11,10 @@ dependencies = []
 
 [project.optional-dependencies]
 # Background removal (BiRefNet / rembg). rembg already pulls onnxruntime, numpy
-# and pillow, so this also satisfies segmentation.
-bgremove = ["rembg", "onnxruntime", "numba>=0.60", "llvmlite>=0.43"]
+# and pillow, so this also satisfies segmentation. pi-heif reads HEIC photos.
+bgremove = ["rembg", "onnxruntime", "numba>=0.60", "llvmlite>=0.43", "pi-heif"]
 # Segmentation only (Segment Anything via ONNX) — no rembg, no torch.
-seg = ["onnxruntime", "numpy", "pillow"]
+seg = ["onnxruntime", "numpy", "pillow", "pi-heif"]
 full = ["bg-be-gone[bgremove]"]
 # Swap the CPU onnxruntime for the CUDA build.
 gpu = ["onnxruntime-gpu"]

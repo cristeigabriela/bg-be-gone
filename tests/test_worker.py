@@ -6,6 +6,7 @@ U2NET_HOME; CI caches it.
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -194,3 +195,75 @@ def test_subject_fixture_matches_the_pixels_the_tests_check():
     image = np.asarray(Image.open(TESTDATA / "subject.png").convert("L"))
     assert image[SUBJECT_PIXEL[1], SUBJECT_PIXEL[0]] < 100, "the subject pixel is on the disc"
     assert image[BACKGROUND_PIXEL[1], BACKGROUND_PIXEL[0]] > 200, "the background pixel is not"
+
+
+# subject.png saved in each format the worker reads (make_format_fixtures.py).
+FORMAT_FIXTURES = pytest.mark.parametrize("fixture", [
+    "subject.png",
+    "subject.jpg",
+    "subject.webp",
+    # AVIF: Pillow's own plugin, no extra package.
+    "subject.avif",
+    # HEIC: needs pi-heif; Pillow alone can't read it.
+    "subject.heic",
+    "subject.tif",
+    # 16-bit greyscale: Pillow's own conversion clips it to white.
+    "subject16.tif",
+    # A two-colour palette BMP, not RGB: its preview must still come out RGB.
+    "subject.bmp",
+    "subject.gif",
+], ids=["png", "jpeg", "webp", "avif", "heic", "tiff", "tiff-16-bit-grey", "bmp", "gif"])
+
+
+def assert_cut_out(path):
+    alpha = Image.open(path).convert("RGBA").getchannel("A")
+    assert alpha.getpixel(SUBJECT_PIXEL) > 224, "the subject stays opaque"
+    assert alpha.getpixel(BACKGROUND_PIXEL) < 32, "the background becomes transparent"
+
+
+@FORMAT_FIXTURES
+def test_a_cutout_succeeds_for_every_format_the_worker_reads(worker, tmp_path, fixture):
+    out = tmp_path / "cutout.png"
+    reply, _ = worker.ask(
+        {"op": "single", "model": "u2netp", "id": 1,
+         "input": str(TESTDATA / fixture), "output": str(out)},
+        until={"done_single", "error"})
+    assert reply["type"] == "done_single", "the cutout must succeed: %s" % reply.get("message")
+    assert_cut_out(out)
+
+
+def test_batch_cuts_out_every_still_format_and_skips_gifs_and_other_files(worker, tmp_path):
+    """A GIF in batch would lose all but its first frame, so batch leaves it out."""
+    inp, outdir = tmp_path / "in", tmp_path / "out"
+    inp.mkdir()
+    stills = ["subject.png", "subject.jpg", "subject.webp", "subject.avif",
+              "subject.heic", "subject.tif", "subject.bmp"]
+    for name in stills + ["subject.gif"]:
+        # Named after the format, so no two outputs collide; upper case, as
+        # cameras write them, so the scan must ignore case.
+        suffix = name.rsplit(".", 1)[1]
+        shutil.copyfile(TESTDATA / name, inp / f"{suffix}.{suffix.upper()}")
+    (inp / "notes.txt").write_text("not an image\n")
+    reply, _ = worker.ask(
+        {"op": "batch", "model": "u2netp", "id": 1,
+         "input_dir": str(inp), "output_dir": str(outdir)},
+        until={"done_batch", "error"})
+    assert reply["type"] == "done_batch", "the batch must succeed: %s" % reply.get("message")
+    want = {name.rsplit(".", 1)[1] + "_nobg.png" for name in stills}
+    assert {p.name for p in outdir.iterdir()} == want, \
+        "every still format is cut out; the GIF and the text file are not"
+    for out in outdir.iterdir():
+        assert_cut_out(out)
+
+
+def test_an_unreadable_image_is_named_in_the_error_and_the_log(worker, tmp_path):
+    bad = TESTDATA / "not_an_image.webp"
+    reply, _ = worker.ask(
+        {"op": "single", "model": "u2netp", "id": 1,
+         "input": str(bad), "output": str(tmp_path / "x.png")},
+        until={"done_single", "error"})
+    assert reply["type"] == "error", "a text file can't be decoded"
+    assert reply["message"].startswith("can't read not_an_image.webp: "), \
+        "the error's first line, which the frontend shows, names the file"
+    assert str(bad) in (tmp_path / "worker.log").read_text(), \
+        "the worker log has the file's full path"

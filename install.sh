@@ -253,6 +253,8 @@ deps_present() {
   # In segment-only mode there is no rembg, so probe onnxruntime instead.
   local pkg="rembg"; [ "$SEGMENT_ONLY" = 1 ] && pkg="onnxruntime"
   have_module "$pkg" || return 1
+  # A venv from before HEIC support gets pi-heif added on a re-run.
+  have_module pi_heif || return 1
   # A venv built before GPU support (or on other hardware) has the wrong
   # runtime; the vendor wheel is what makes it worth reusing.
   case "$VENDOR" in
@@ -319,6 +321,10 @@ make_venv() {
   # onnxruntime pulls in. A locally built wheel needs the same.
   local ORT_AMD_DEPS=(numpy flatbuffers packaging protobuf coloredlogs sympy)
   local ORT_AMD_WHEEL=""
+  # Pillow reads the other formats itself; HEIC needs libheif, and pi-heif is
+  # its decode-only build. Installed with the rest so one resolve sees rembg's
+  # Pillow range.
+  local CODECS=(pi-heif)
   if [ "$VENDOR" = amd ]; then
     ORT_AMD_WHEEL="$(amd_wheel_source)"
     case "$ORT_AMD_WHEEL" in
@@ -331,31 +337,31 @@ make_venv() {
     msg "Segmentation-only venv (no rembg/BiRefNet)"
     case "$VENDOR" in
       nvidia)
-        "${PIP[@]}" onnxruntime-gpu numpy pillow \
+        "${PIP[@]}" onnxruntime-gpu numpy pillow "${CODECS[@]}" \
           nvidia-cuda-runtime nvidia-cublas nvidia-cufft nvidia-curand nvidia-cudnn-cu13
         ;;
       amd)
-        "${PIP[@]}" "$ORT_AMD_WHEEL" "${ORT_AMD_DEPS[@]}" pillow
+        "${PIP[@]}" "$ORT_AMD_WHEEL" "${ORT_AMD_DEPS[@]}" pillow "${CODECS[@]}"
         ;;
       *)
-        "${PIP[@]}" onnxruntime numpy pillow
+        "${PIP[@]}" onnxruntime numpy pillow "${CODECS[@]}"
         ;;
     esac
     return
   fi
   case "$VENDOR" in
     nvidia)
-      "${PIP[@]}" "rembg[gpu]" "numba>=0.60" "llvmlite>=0.43" \
+      "${PIP[@]}" "rembg[gpu]" "numba>=0.60" "llvmlite>=0.43" "${CODECS[@]}" \
         nvidia-cuda-runtime nvidia-cublas nvidia-cufft nvidia-curand nvidia-cudnn-cu13
       ;;
     amd)
       # Plain "rembg", not rembg[rocm]: that extra pins its own onnxruntime-rocm
       # from PyPI, which would clobber a wheel built for this card.
-      "${PIP[@]}" rembg "numba>=0.60" "llvmlite>=0.43" \
+      "${PIP[@]}" rembg "numba>=0.60" "llvmlite>=0.43" "${CODECS[@]}" \
         "$ORT_AMD_WHEEL" "${ORT_AMD_DEPS[@]}"
       ;;
     *)
-      "${PIP[@]}" "rembg[cpu]" "numba>=0.60" "llvmlite>=0.43"
+      "${PIP[@]}" "rembg[cpu]" "numba>=0.60" "llvmlite>=0.43" "${CODECS[@]}"
       ;;
   esac
 }

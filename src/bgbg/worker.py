@@ -70,10 +70,19 @@ import threading  # noqa: E402
 import traceback  # noqa: E402
 import warnings  # noqa: E402
 
-from PIL import Image, ImageFilter  # noqa: E402
+from PIL import Image, ImageFilter, UnidentifiedImageError  # noqa: E402
 # Imports onnxruntime, then rembg when it is installed.
 from engines import ort as ort_engine  # noqa: E402
 from engines import selection  # noqa: E402
+import formats  # noqa: E402
+
+# HEIC/HEIF (phone photos) needs libheif; pi-heif is its decode-only build.
+try:
+    from pi_heif import register_heif_opener
+    register_heif_opener()
+    _HAVE_HEIF = True
+except ImportError:
+    _HAVE_HEIF = False
 
 # Segmentation is optional too (needs the extra numpy dependency + weights).
 try:
@@ -168,8 +177,56 @@ def _checkerboard(size, cell=24):
     return board
 
 
+class UnreadableImageError(OSError):
+    def __init__(self, path, reason):
+        super().__init__(f"can't read {os.path.basename(path)}: {reason}")
+        self.path = path
+        self.reason = reason
+
+
+def open_image(path):
+    """Open and decode an image, or raise UnreadableImageError naming the file.
+
+    Decoding here (Image.open alone only reads the header) makes a truncated
+    file fail with its name, not later in the middle of a cut-out. Failures go
+    to the worker log too, with the full path.
+    """
+    try:
+        im = Image.open(path)
+        im.load()
+        return im
+    except UnidentifiedImageError as e:
+        if formats.format_of(path) is formats.HEIF and not _HAVE_HEIF:
+            reason = "HEIC/HEIF support (pi-heif) isn't installed; re-run the installer"
+        else:
+            reason = "not an image format bg-be-gone reads"
+        err = UnreadableImageError(path, reason)
+        cause = e
+    except OSError as e:
+        err = UnreadableImageError(path, str(e))
+        cause = e
+    print(f"decode failed: {path}: {cause}", file=sys.stderr, flush=True)
+    raise err from cause
+
+
+def _plain(im):
+    """The image as 8-bit RGB, or RGBA when it has transparency.
+
+    Sources come in many modes (CMYK TIFF, palette GIF and BMP, greyscale);
+    the cut-out and every encoder take these two.
+
+    16-bit greyscale is scaled to 8 bits first. Pillow's own conversion clips
+    it, so mid grey (32768) and white (65535) would both come out white.
+    """
+    if im.mode == "I" or im.mode.startswith("I;16"):
+        im = im.convert("I").point(lambda v: v * (1 / 256)).convert("L")
+    has_alpha = im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info
+    mode = "RGBA" if has_alpha else "RGB"
+    return im if im.mode == mode else im.convert(mode)
+
+
 def process_one(model, req_id, src, dst, alpha, bg, blur=20, want_preview=False):
-    img = Image.open(src)
+    img = _plain(open_image(src))
     res = _remove_resilient(model, req_id, img, alpha).convert("RGBA")
 
     preview_path = None
@@ -213,16 +270,14 @@ def handle_single(req):
          "seconds": round(time.time() - t, 2), "id": rid})
 
 
-IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
-
-
 def handle_batch(req):
     rid = req.get("id")
     indir = req["input_dir"]
     outdir = req["output_dir"]
     os.makedirs(outdir, exist_ok=True)
     files = sorted(f for f in glob.glob(os.path.join(indir, "*"))
-                   if f.lower().endswith(IMG_EXTS) and os.path.isfile(f))
+                   if f.lower().endswith(formats.BATCH_SUFFIXES)
+                   and os.path.isfile(f))
     total = len(files)
     if total == 0:
         out({"type": "error", "message": "No images found in input folder.",
@@ -324,7 +379,7 @@ def handle_gif(req):
     blur = int(req.get("blur", 20))
     rot = int(req.get("rot", 0))
     fh, fv = bool(req.get("fh")), bool(req.get("fv"))
-    im = Image.open(src)
+    im = open_image(src)
     n = getattr(im, "n_frames", 1)
     loop = im.info.get("loop", 0)
     # Report 0/N up front so the progress bar appears immediately — the model
@@ -378,7 +433,7 @@ def handle_seg_load(req):
     rid = req.get("id")
     path = req["input"]
     want = req.get("model", "auto")
-    pil = Image.open(path).convert("RGB")
+    pil = open_image(path).convert("RGB")
     maskdir = os.path.join(os.path.dirname(os.path.abspath(path)), "segmasks")
     os.makedirs(maskdir, exist_ok=True)
 
