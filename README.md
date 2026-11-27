@@ -30,7 +30,10 @@ Everything runs on your machine. No images are uploaded.
 
 ## Features
 
-- Single-image, animated GIF, and batch background removal.
+- Single-image, animated GIF and WebP, and batch background removal.
+- **Formats:** opens PNG, JPEG, WebP, AVIF, HEIC/HEIF, TIFF, BMP and GIF; saves
+  PNG or WebP, which keep the transparency, or JPEG once the background is
+  flattened. JPEG XL isn't supported yet.
 - **Animated GIFs:** open one like any other image. Every frame is processed with
   the model kept loaded, progress is reported per frame, and the frames are
   rebuilt into an animated GIF. Source and result panels play it back.
@@ -120,14 +123,21 @@ without the download size — and see
 - **Single:** open or drop an image, choose settings, click **Generate**, then
   **Save result**. Right-click either panel (or use the toolbar icons) to rotate,
   flip, reset the view, or zoom to actual size. Scroll to zoom, drag to pan.
-- **Animated GIF:** open one on the Single page and press **Generate** — nothing
-  else changes. The status bar counts the frames as they are processed, **Cancel**
-  stops between frames, and **Save result** writes an animated GIF. Note that GIF
-  only supports on/off transparency, so a transparent background gives hard edges;
-  choose a solid colour or blur to avoid that.
+- **Animated GIF or WebP:** open one on the Single page and press **Generate** —
+  nothing else changes. The status bar counts the frames as they are processed,
+  **Cancel** stops between frames, and **Save result** writes an animation in the
+  source's format. Note that GIF only supports on/off transparency, so a
+  transparent background gives hard edges; choose a solid colour or blur to avoid
+  that. Animated WebP keeps soft edges.
+- **Saving:** the save dialog offers PNG and WebP, plus JPEG when the background
+  is a colour or blur. The name you type picks the format; it starts as the
+  source's format when that can hold the result. A name in a format the result
+  can't use, such as `.jpg` for a transparent cut-out, saves as the default
+  instead, and the notice says so.
 - **Batch:** choose an input folder and an output folder, set a rename pattern
   (`{name}` = original filename, `{n}` = index), and click **Run batch**. Output
-  is PNG.
+  is PNG. Batch takes every still format above; animated GIFs and WebPs go
+  through the Single page.
 - **Segment:** open an image and pick a **Mode** in the sidebar. In *Everything*,
   click **Segment everything** to detect objects as tinted layers, click the ones
   to keep (the rest dim), then **Extract selection**. Hovering highlights the whole

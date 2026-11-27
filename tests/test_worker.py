@@ -6,6 +6,7 @@ U2NET_HOME; CI caches it.
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -194,3 +195,178 @@ def test_subject_fixture_matches_the_pixels_the_tests_check():
     image = np.asarray(Image.open(TESTDATA / "subject.png").convert("L"))
     assert image[SUBJECT_PIXEL[1], SUBJECT_PIXEL[0]] < 100, "the subject pixel is on the disc"
     assert image[BACKGROUND_PIXEL[1], BACKGROUND_PIXEL[0]] > 200, "the background pixel is not"
+
+
+# subject.png saved in each format the worker reads (make_format_fixtures.py).
+FORMAT_FIXTURES = pytest.mark.parametrize("fixture", [
+    "subject.png",
+    "subject.jpg",
+    "subject.webp",
+    # AVIF: Pillow's own plugin, no extra package.
+    "subject.avif",
+    # HEIC: needs pi-heif; Pillow alone can't read it.
+    "subject.heic",
+    "subject.tif",
+    # 16-bit greyscale: Pillow's own conversion clips it to white.
+    "subject16.tif",
+    # A two-colour palette BMP, not RGB: its preview must still come out RGB.
+    "subject.bmp",
+    "subject.gif",
+], ids=["png", "jpeg", "webp", "avif", "heic", "tiff", "tiff-16-bit-grey", "bmp", "gif"])
+
+
+def assert_cut_out(path):
+    alpha = Image.open(path).convert("RGBA").getchannel("A")
+    assert alpha.getpixel(SUBJECT_PIXEL) > 224, "the subject stays opaque"
+    assert alpha.getpixel(BACKGROUND_PIXEL) < 32, "the background becomes transparent"
+
+
+@FORMAT_FIXTURES
+def test_a_cutout_succeeds_for_every_format_the_worker_reads(worker, tmp_path, fixture):
+    out = tmp_path / "cutout.png"
+    reply, _ = worker.ask(
+        {"op": "single", "model": "u2netp", "id": 1,
+         "input": str(TESTDATA / fixture), "output": str(out)},
+        until={"done_single", "error"})
+    assert reply["type"] == "done_single", "the cutout must succeed: %s" % reply.get("message")
+    assert_cut_out(out)
+
+
+@FORMAT_FIXTURES
+def test_convert_decodes_every_readable_format_into_a_png_to_preview(
+        worker, tmp_path, fixture):
+    """The frontend's fallback when GdkPixbuf has no loader for the format."""
+    out = tmp_path / "preview.png"
+    reply, _ = worker.ask(
+        {"op": "convert", "id": 1, "input": str(TESTDATA / fixture), "output": str(out)},
+        until={"converted", "error"})
+    assert reply["type"] == "converted", "the worker reads it: %s" % reply.get("message")
+    assert reply["frames"] == 1, "a still image has one frame"
+    preview = Image.open(out)
+    assert preview.format == "PNG", "the preview is a PNG, whatever the source"
+    assert preview.mode in ("RGB", "RGBA"), "GdkPixbuf reads 8-bit RGB(A)"
+    assert preview.size == (256, 256), "the preview is the source's full size"
+    grey = preview.convert("L")
+    assert grey.getpixel(SUBJECT_PIXEL) < 100, "the dark subject stays dark"
+    assert grey.getpixel(BACKGROUND_PIXEL) < 250, "the light grey background isn't clipped to white"
+
+
+def test_batch_cuts_out_every_still_format_and_skips_gifs_and_other_files(worker, tmp_path):
+    """A GIF in batch would lose all but its first frame, so batch leaves it out."""
+    inp, outdir = tmp_path / "in", tmp_path / "out"
+    inp.mkdir()
+    stills = ["subject.png", "subject.jpg", "subject.webp", "subject.avif",
+              "subject.heic", "subject.tif", "subject.bmp"]
+    for name in stills + ["subject.gif"]:
+        # Named after the format, so no two outputs collide; upper case, as
+        # cameras write them, so the scan must ignore case.
+        suffix = name.rsplit(".", 1)[1]
+        shutil.copyfile(TESTDATA / name, inp / f"{suffix}.{suffix.upper()}")
+    (inp / "notes.txt").write_text("not an image\n")
+    reply, _ = worker.ask(
+        {"op": "batch", "model": "u2netp", "id": 1,
+         "input_dir": str(inp), "output_dir": str(outdir)},
+        until={"done_batch", "error"})
+    assert reply["type"] == "done_batch", "the batch must succeed: %s" % reply.get("message")
+    want = {name.rsplit(".", 1)[1] + "_nobg.png" for name in stills}
+    assert {p.name for p in outdir.iterdir()} == want, \
+        "every still format is cut out; the GIF and the text file are not"
+    for out in outdir.iterdir():
+        assert_cut_out(out)
+
+
+def test_batch_skips_an_animated_webp_and_says_where_it_goes(worker, tmp_path):
+    """Batch would keep only its first frame, as with a GIF."""
+    inp, outdir = tmp_path / "in", tmp_path / "out"
+    inp.mkdir()
+    shutil.copyfile(TESTDATA / "subject.webp", inp / "still.webp")
+    shutil.copyfile(TESTDATA / "animated.webp", inp / "moving.webp")
+    reply, seen = worker.ask(
+        {"op": "batch", "model": "u2netp", "id": 1,
+         "input_dir": str(inp), "output_dir": str(outdir)},
+        until={"done_batch", "error"})
+    assert reply["type"] == "done_batch", "the still WebP is still processed: %s" \
+        % reply.get("message")
+    assert [p.name for p in outdir.iterdir()] == ["still_nobg.png"], \
+        "the animation is skipped, not cut down to one frame"
+    notices = [r["message"] for r in seen if r.get("type") == "notice"]
+    assert any("moving.webp" in n and "Single" in n for n in notices), \
+        "the user is told which file was skipped and where to open it: %s" % notices
+
+
+@pytest.mark.parametrize("fixture, frames", [
+    ("animated.webp", 3),
+    # The odd one out: a still WebP is one frame.
+    ("subject.webp", 1),
+], ids=["animated", "still"])
+def test_frames_counts_a_webp_from_the_file_itself(worker, fixture, frames):
+    """The frontend asks this, not GdkPixbuf, whose WebP loader may decode stills only."""
+    reply, _ = worker.ask({"op": "frames", "id": 1, "input": str(TESTDATA / fixture)},
+                          until={"frames", "error"})
+    assert reply.get("frames") == frames, reply
+
+
+@pytest.fixture
+def cutout(worker, tmp_path):
+    """A transparent cut-out of subject.png, as the frontend would save it."""
+    out = tmp_path / "cutout.png"
+    reply, _ = worker.ask(
+        {"op": "single", "model": "u2netp", "id": 1,
+         "input": str(TESTDATA / "subject.png"), "output": str(out)},
+        until={"done_single", "error"})
+    assert reply["type"] == "done_single", reply.get("message")
+    return out
+
+
+def test_a_cutout_saved_as_webp_keeps_its_transparency(worker, tmp_path, cutout):
+    saved = tmp_path / "saved.webp"
+    reply, _ = worker.ask({"op": "convert", "id": 2, "input": str(cutout), "output": str(saved)},
+                          until={"converted", "error"})
+    assert reply["type"] == "converted", reply.get("message")
+    assert Image.open(saved).format == "WEBP", "the suffix picks the format"
+    assert_cut_out(saved)
+
+
+def test_a_result_with_an_alpha_channel_still_saves_as_jpeg(worker, tmp_path, cutout):
+    """JPEG has no alpha channel; the worker drops it rather than fail."""
+    saved = tmp_path / "saved.jpg"
+    reply, _ = worker.ask({"op": "convert", "id": 2, "input": str(cutout), "output": str(saved)},
+                          until={"converted", "error"})
+    assert reply["type"] == "converted", reply.get("message")
+    assert Image.open(saved).format == "JPEG", "the suffix picks the format"
+
+
+def test_an_unreadable_image_is_named_in_the_error_and_the_log(worker, tmp_path):
+    bad = TESTDATA / "not_an_image.webp"
+    reply, _ = worker.ask(
+        {"op": "single", "model": "u2netp", "id": 1,
+         "input": str(bad), "output": str(tmp_path / "x.png")},
+        until={"done_single", "error"})
+    assert reply["type"] == "error", "a text file can't be decoded"
+    assert reply["message"].startswith("can't read not_an_image.webp: "), \
+        "the error's first line, which the frontend shows, names the file"
+    assert str(bad) in (tmp_path / "worker.log").read_text(), \
+        "the worker log has the file's full path"
+
+
+def test_an_animated_webp_comes_back_animated_with_its_timing(worker, tmp_path):
+    """Animated WebP goes through the GIF pipeline but stays a WebP, with full alpha."""
+    out = tmp_path / "result.webp"
+    reply, _ = worker.ask(
+        {"op": "gif", "model": "u2netp", "id": 1,
+         "input": str(TESTDATA / "animated.webp"), "output": str(out)},
+        until={"gif_done", "error"})
+    assert reply["type"] == "gif_done", "the animation must succeed: %s" % reply.get("message")
+    result = Image.open(out)
+    assert result.format == "WEBP", "the result keeps the source's format"
+    assert result.n_frames == 3, "every frame is kept"
+    durations = []
+    for i in range(result.n_frames):
+        result.seek(i)
+        alpha = result.convert("RGBA").getchannel("A")
+        durations.append(result.info["duration"])
+        assert alpha.getpixel(SUBJECT_PIXEL) > 224, "every frame keeps the subject"
+        assert alpha.getpixel(BACKGROUND_PIXEL) < 32, "every frame drops the background"
+    assert durations == [80, 120, 160], "each frame keeps its own duration"
+    assert Image.open(reply["preview"]).format == "PNG", \
+        "a PNG first frame stands in where GdkPixbuf has no WebP loader"

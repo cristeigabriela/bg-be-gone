@@ -15,7 +15,10 @@ Requests (one JSON object per line on stdin):
   {"op":"batch","input_dir":D,"output_dir":D,"model":M,"alpha":bool,"bg":BG,
    "pattern":"{name}_nobg","id":N}
   {"op":"gif","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":int,
-   "rot":0..3,"fh":bool,"fv":bool,"id":N}   # per-frame background removal
+   "rot":0..3,"fh":bool,"fv":bool,"id":N}   # per-frame background removal;
+                                             # GIF or WebP (animated) by output
+  {"op":"convert","input":P,"output":P,"id":N}   # re-encode as output's format
+  {"op":"frames","input":P,"id":N}           # count an image's frames
   {"op":"cancel"}                            # stop single/batch/gif in progress
   {"op":"models"}
   {"op":"seg_load","input":P,"model":"auto|large|base_plus|small|tiny|mobile","id":N}
@@ -36,7 +39,9 @@ Responses (one JSON object per line on stdout):
   {"type":"done_single","output":P,"preview":P,"seconds":f,"id":N}
   {"type":"done_batch","count":n,"seconds":f,"outdir":P,"id":N}
   {"type":"gif_progress","done":i,"total":n,"id":N}
-  {"type":"gif_done","output":P,"frames":n,"seconds":f,"id":N}
+  {"type":"gif_done","output":P,"preview":P,"frames":n,"seconds":f,"id":N}
+  {"type":"converted","output":P,"frames":n,"id":N}
+  {"type":"frames","frames":n,"id":N}
   {"type":"canceled","scope":"single|batch|gif","id":N}
   {"type":"seg_download","done":i,"total":n,"id":N}
   {"type":"seg_step","rung":R,"message":str,"id":N}
@@ -70,10 +75,19 @@ import threading  # noqa: E402
 import traceback  # noqa: E402
 import warnings  # noqa: E402
 
-from PIL import Image, ImageFilter  # noqa: E402
+from PIL import Image, ImageFilter, UnidentifiedImageError  # noqa: E402
 # Imports onnxruntime, then rembg when it is installed.
 from engines import ort as ort_engine  # noqa: E402
 from engines import selection  # noqa: E402
+import formats  # noqa: E402
+
+# HEIC/HEIF (phone photos) needs libheif; pi-heif is its decode-only build.
+try:
+    from pi_heif import register_heif_opener
+    register_heif_opener()
+    _HAVE_HEIF = True
+except ImportError:
+    _HAVE_HEIF = False
 
 # Segmentation is optional too (needs the extra numpy dependency + weights).
 try:
@@ -168,8 +182,104 @@ def _checkerboard(size, cell=24):
     return board
 
 
+class UnreadableImageError(OSError):
+    def __init__(self, path, reason):
+        super().__init__(f"can't read {os.path.basename(path)}: {reason}")
+        self.path = path
+        self.reason = reason
+
+
+class UnsupportedOutputError(ValueError):
+    def __init__(self, path):
+        super().__init__(f"can't save as {os.path.basename(path)}: "
+                         "bg-be-gone writes PNG, WebP or JPEG")
+        self.path = path
+
+
+def open_image(path):
+    """Open and decode an image, or raise UnreadableImageError naming the file.
+
+    Decoding here (Image.open alone only reads the header) makes a truncated
+    file fail with its name, not later in the middle of a cut-out. Failures go
+    to the worker log too, with the full path.
+    """
+    try:
+        im = Image.open(path)
+        im.load()
+        return im
+    except UnidentifiedImageError as e:
+        if formats.format_of(path) is formats.HEIF and not _HAVE_HEIF:
+            reason = "HEIC/HEIF support (pi-heif) isn't installed; re-run the installer"
+        else:
+            reason = "not an image format bg-be-gone reads"
+        err = UnreadableImageError(path, reason)
+        cause = e
+    except OSError as e:
+        err = UnreadableImageError(path, str(e))
+        cause = e
+    print(f"decode failed: {path}: {cause}", file=sys.stderr, flush=True)
+    raise err from cause
+
+
+# Encoder settings per format we write. WebP keeps its alpha lossless by default
+# (alpha_quality=100), so only the colour is lossy.
+_SAVE_OPTIONS = {
+    formats.PNG: {},
+    formats.WEBP: {"quality": 90},
+    formats.JPEG: {"quality": 92},
+}
+
+
+def _plain(im):
+    """The image as 8-bit RGB, or RGBA when it has transparency.
+
+    Sources come in many modes (CMYK TIFF, palette GIF and BMP, greyscale);
+    the cut-out and every encoder take these two.
+
+    16-bit greyscale is scaled to 8 bits first. Pillow's own conversion clips
+    it, so mid grey (32768) and white (65535) would both come out white.
+    """
+    if im.mode == "I" or im.mode.startswith("I;16"):
+        im = im.convert("I").point(lambda v: v * (1 / 256)).convert("L")
+    has_alpha = im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info
+    mode = "RGBA" if has_alpha else "RGB"
+    return im if im.mode == mode else im.convert(mode)
+
+
+def save_image(im, dst):
+    """Save the current frame of `im` in the format `dst`'s suffix names."""
+    fmt = formats.format_of(dst)
+    if fmt not in _SAVE_OPTIONS:
+        raise UnsupportedOutputError(dst)
+    im = _plain(im)
+    if fmt is formats.JPEG:
+        im = im.convert("RGB")
+    im.save(dst, **_SAVE_OPTIONS[fmt])
+
+
+def handle_convert(req):
+    """Re-encode an image into the format its output path names.
+
+    The frontend uses it to preview a source GdkPixbuf can't decode (no loader
+    for HEIC or AVIF, say) and to save a result as WebP or JPEG. Only the first
+    frame is written; "frames" tells the frontend whether the source animates.
+    """
+    im = open_image(req["input"])
+    save_image(im, req["output"])
+    out({"type": "converted", "output": req["output"],
+         "frames": getattr(im, "n_frames", 1), "id": req.get("id")})
+
+
+def handle_frames(req):
+    """Count a source's frames, so the frontend can tell an animated WebP from
+    a still. GdkPixbuf can't be asked: a WebP loader that decodes only stills
+    reports an animation as one frame."""
+    im = open_image(req["input"])
+    out({"type": "frames", "frames": getattr(im, "n_frames", 1), "id": req.get("id")})
+
+
 def process_one(model, req_id, src, dst, alpha, bg, blur=20, want_preview=False):
-    img = Image.open(src)
+    img = _plain(open_image(src))
     res = _remove_resilient(model, req_id, img, alpha).convert("RGBA")
 
     preview_path = None
@@ -213,7 +323,19 @@ def handle_single(req):
          "seconds": round(time.time() - t, 2), "id": rid})
 
 
-IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
+def _webp_frames(path):
+    """How many frames a WebP holds, from its header; 1 for any other format.
+
+    A file that won't open counts as one frame, so process_one reports it with
+    its name like any other unreadable image.
+    """
+    if formats.format_of(path) is not formats.WEBP:
+        return 1
+    try:
+        with Image.open(path) as im:
+            return getattr(im, "n_frames", 1)
+    except (UnidentifiedImageError, OSError):
+        return 1
 
 
 def handle_batch(req):
@@ -222,7 +344,15 @@ def handle_batch(req):
     outdir = req["output_dir"]
     os.makedirs(outdir, exist_ok=True)
     files = sorted(f for f in glob.glob(os.path.join(indir, "*"))
-                   if f.lower().endswith(IMG_EXTS) and os.path.isfile(f))
+                   if f.lower().endswith(formats.BATCH_SUFFIXES)
+                   and os.path.isfile(f))
+    # Batch would keep only an animation's first frame, as with GIFs.
+    animated = [f for f in files if _webp_frames(f) > 1]
+    files = [f for f in files if f not in animated]
+    if animated:
+        out({"type": "notice", "id": rid, "message":
+             "Skipped %d animated WebP (%s): open them on the Single page."
+             % (len(animated), ", ".join(os.path.basename(f) for f in animated))})
     total = len(files)
     if total == 0:
         out({"type": "error", "message": "No images found in input folder.",
@@ -311,12 +441,22 @@ def _frames_to_gif(paths, dst, durations, loop, transparent):
     first.save(dst, **kw)
 
 
+def _frames_to_webp(paths, dst, durations, loop):
+    """Assemble frame PNGs into an animated WebP, streamed like _frames_to_gif.
+    WebP keeps the full alpha channel, so cut-out edges stay soft."""
+    first = Image.open(paths[0])
+    rest = (Image.open(p) for p in paths[1:])
+    first.save(dst, save_all=True, append_images=rest, duration=durations,
+               loop=loop, **_SAVE_OPTIONS[formats.WEBP])
+
+
 def handle_gif(req):
-    """Split an animated GIF into frames, remove each frame's background, and
-    reassemble. The model is loaded once and reused for every frame. Each
-    finished frame is written to disk (not held in RAM) so a long GIF stays
-    memory-bounded during the slow per-frame inference. Progress is per frame;
-    cancellable between frames."""
+    """Split an animated GIF or WebP into frames, remove each frame's
+    background, and reassemble into the format the output path names. The
+    model is loaded once and reused for every frame. Each finished frame is
+    written to disk (not held in RAM) so a long animation stays memory-bounded
+    during the slow per-frame inference. Progress is per frame; cancellable
+    between frames."""
     rid = req.get("id")
     src, dst, model = req["input"], req["output"], req["model"]
     alpha = req.get("alpha", False)
@@ -324,7 +464,7 @@ def handle_gif(req):
     blur = int(req.get("blur", 20))
     rot = int(req.get("rot", 0))
     fh, fv = bool(req.get("fh")), bool(req.get("fv"))
-    im = Image.open(src)
+    im = open_image(src)
     n = getattr(im, "n_frames", 1)
     loop = im.info.get("loop", 0)
     # Report 0/N up front so the progress bar appears immediately — the model
@@ -340,8 +480,9 @@ def handle_gif(req):
                 out({"type": "canceled", "scope": "gif", "id": rid})
                 return
             im.seek(i)
-            durations.append(im.info.get("duration", 100))
             frame = _apply_transform(im.convert("RGBA"), rot, fh, fv)
+            # After decoding: a WebP frame's duration is set only once it loads.
+            durations.append(im.info.get("duration", 100))
             cut = _remove_resilient(model, rid, frame, alpha).convert("RGBA")
             fp = os.path.join(framedir, "f%05d.png" % i)
             _compose_frame(frame, cut, bg, blur).save(fp)
@@ -350,8 +491,14 @@ def handle_gif(req):
         if _cancel.is_set():
             out({"type": "canceled", "scope": "gif", "id": rid})
             return
-        _frames_to_gif(paths, dst, durations, loop, bg == "transparent")
-        out({"type": "gif_done", "output": dst, "frames": n,
+        if formats.format_of(dst) is formats.WEBP:
+            _frames_to_webp(paths, dst, durations, loop)
+        else:
+            _frames_to_gif(paths, dst, durations, loop, bg == "transparent")
+        # For a frontend whose GdkPixbuf has no loader for the animation.
+        preview = dst + ".preview.png"
+        shutil.copyfile(paths[0], preview)
+        out({"type": "gif_done", "output": dst, "preview": preview, "frames": n,
              "seconds": round(time.time() - t, 2), "id": rid})
     finally:
         shutil.rmtree(framedir, ignore_errors=True)
@@ -378,7 +525,7 @@ def handle_seg_load(req):
     rid = req.get("id")
     path = req["input"]
     want = req.get("model", "auto")
-    pil = Image.open(path).convert("RGB")
+    pil = open_image(path).convert("RGB")
     maskdir = os.path.join(os.path.dirname(os.path.abspath(path)), "segmasks")
     os.makedirs(maskdir, exist_ok=True)
 
@@ -511,6 +658,8 @@ _HANDLERS = {
     "single": handle_single,
     "batch": handle_batch,
     "gif": handle_gif,
+    "convert": handle_convert,
+    "frames": handle_frames,
     "seg_load": handle_seg_load,
     "seg_everything": handle_seg_everything,
     "seg_point": handle_seg_point,
