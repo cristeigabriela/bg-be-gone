@@ -53,150 +53,11 @@ import os
 import sys
 import glob
 
+import plat
 
-_rocm_unsafe = False       # provider has no code for this card — skip ROCm
-
-
-def _gfx_arch():
-    """The AMD GPU's LLVM target (``"gfx1031"``) via amdkfd, or None.
-
-    The driver packs it as major*10000 + minor*100 + step, with minor and step
-    as nibbles in the name, so 100301 is gfx1031 and 90010 is gfx90a.
-    """
-    for props in sorted(glob.glob("/sys/class/kfd/kfd/topology/nodes/*/properties")):
-        try:
-            with open(props) as f:
-                for line in f:
-                    if line.startswith("gfx_target_version"):
-                        v = int(line.split()[1])
-                        if v:
-                            return "gfx%d%x%x" % (v // 10000, v // 100 % 100, v % 100)
-        except (OSError, ValueError, IndexError):
-            continue
-    return None
-
-
-def _rocm_ep_path():
-    """Path to the installed ROCm execution provider, or None.
-
-    Located on disk rather than through ``ort.get_available_providers()``,
-    because this has to run before onnxruntime is imported.
-    """
-    venv = os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
-    found = glob.glob(os.path.join(
-        venv, "lib", "python*", "site-packages", "onnxruntime", "capi",
-        "libonnxruntime_providers_rocm.so"))
-    return found[0] if found else None
-
-
-def _have_rocm_ep():
-    return _rocm_ep_path() is not None
-
-
-def _rocm_ep_has_arch(arch):
-    """True if the ROCm provider carries device code for `arch`.
-
-    hipcc tags each embedded offload bundle with its target triple, so the
-    binary is asked directly rather than matched against a list of what some
-    wheel is assumed to ship — which is what lets a provider built locally for
-    this exact card be recognised as usable.
-    """
-    path = _rocm_ep_path()
-    if not path:
-        return False
-    needle = ("amdgcn-amd-amdhsa--" + arch).encode()
-    try:
-        with open(path, "rb") as f:
-            overlap = b""
-            while True:
-                block = f.read(8 << 20)
-                if not block:
-                    return False
-                if needle in overlap + block:
-                    return True
-                overlap = block[-len(needle):]
-    except OSError:
-        return False
-
-
-def _check_rocm_arch():
-    """Drop the ROCm provider unless it has device code for this card.
-
-    install.sh settles this at install time; this is the backstop for a venv
-    that predates it, a card swapped since, or the AppImage.
-
-    Deliberately no HSA_OVERRIDE_GFX_VERSION fallback. Making a card run a
-    sibling's kernels is the usual advice for GPUs ROCm does not support, and it
-    is not safe: mismatched kernels decode as garbage on the shader core, page
-    fault, time out the graphics ring and force a GPU reset that takes the
-    compositor with it. The CPU is slower but correct.
-    """
-    global _rocm_unsafe
-    # Kill switch, for taking ROCm out of the picture without rebuilding.
-    if os.environ.get("BGBG_NO_ROCM"):
-        _rocm_unsafe = True
-        return
-    if not _have_rocm_ep():
-        return
-    arch = _gfx_arch()
-    if arch is not None and not _rocm_ep_has_arch(arch):
-        _rocm_unsafe = True
-
-
-def _load_gpu_env():
-    """Apply the GPU settings install.sh recorded in ``gpu.env``.
-
-    Tuning the GPU stack reads only at process start, so it has to land before
-    onnxruntime is imported. Kept out of the user's global environment on
-    purpose — it would affect every other ROCm app too. Anything already set
-    wins, so it stays overridable per-launch.
-    """
-    venv = os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
-    for path in (os.environ.get("BGBG_GPU_ENV"),
-                 os.path.join(os.path.dirname(venv), "gpu.env"),
-                 os.path.join(os.environ.get("XDG_DATA_HOME",
-                                             os.path.expanduser("~/.local/share")),
-                              "bg-be-gone", "gpu.env")):
-        if not path:
-            continue
-        try:
-            with open(path) as f:
-                lines = f.readlines()
-        except OSError:
-            continue
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            os.environ.setdefault(key.strip(), val.strip())
-        return
-
-
-def _ensure_gpu_libs():
-    """Put any venv-bundled NVIDIA CUDA/cuDNN libs on LD_LIBRARY_PATH.
-
-    onnxruntime-gpu links libcudart.so.* which ship inside the pip wheels; the
-    dynamic loader needs them on the path before import, so we set the env and
-    re-exec once if necessary. AMD/ROCm libs come from the system loader path,
-    so nothing to do there.
-    """
-    venv = os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
-    libdirs = glob.glob(os.path.join(
-        venv, "lib", "python*", "site-packages", "nvidia", "*", "lib"))
-    if not libdirs:
-        return
-    cur = os.environ.get("LD_LIBRARY_PATH", "")
-    parts = cur.split(os.pathsep) if cur else []
-    if all(d in parts for d in libdirs):
-        return
-    os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(libdirs + parts)
-    os.execv(sys.executable, [sys.executable] + sys.argv)
-
-
-_load_gpu_env()
-_check_rocm_arch()
-_ensure_gpu_libs()
+# Before onnxruntime is imported anywhere: the GPU stack reads its settings
+# only at start-up, and a provider with no code for this card can reset the GPU.
+plat.prepare_process()
 
 import gc  # noqa: E402
 import json  # noqa: E402
@@ -267,8 +128,7 @@ def _name(p):
 
 def preferred_providers():
     avail = set(ort.get_available_providers())
-    if _rocm_unsafe:
-        avail -= {"ROCMExecutionProvider", "MIGraphXExecutionProvider"}
+    avail -= plat.unusable_providers()
     chosen = []
     for p in _PROVIDER_ORDER:
         if p not in avail:

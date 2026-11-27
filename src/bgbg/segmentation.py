@@ -18,7 +18,6 @@ import zlib
 import json
 import colorsys
 import zipfile
-import subprocess
 import urllib.request
 from collections import deque
 
@@ -26,13 +25,13 @@ import numpy as np
 from PIL import Image, ImageFilter
 import onnxruntime as ort
 
+from plat import config_dir, models_dir, probe_vram
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-_CACHE_HOME = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-_CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-MODELS_DIR = os.path.join(_CACHE_HOME, "bg-be-gone", "models")
-CONFIG_DIR = os.path.join(_CONFIG_HOME, "bg-be-gone")
+MODELS_DIR = models_dir()
+CONFIG_DIR = config_dir()
 CONFIG_PATH = os.path.join(CONFIG_DIR, "seg.json")
 
 _HF = "https://huggingface.co"
@@ -112,61 +111,6 @@ def save_config(**kw):
         os.replace(tmp, CONFIG_PATH)
     except Exception:
         pass
-
-
-# ---------------------------------------------------------------------------
-# VRAM probing
-# ---------------------------------------------------------------------------
-def probe_vram():
-    """Return ``{"total":MiB, "free":MiB, "gpu":True}`` or ``None``.
-
-    NVIDIA via ``nvidia-smi``; AMD via ``rocm-smi`` or the DRM sysfs nodes. Best
-    effort — any failure returns ``None`` and the caller treats the host as CPU.
-    """
-    try:
-        r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total,memory.free",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=6)
-        if r.returncode == 0 and r.stdout.strip():
-            total, free = (int(x) for x in r.stdout.strip().splitlines()[0].split(","))
-            return {"total": total, "free": free, "gpu": True}
-    except Exception:
-        pass
-    try:
-        r = subprocess.run(["rocm-smi", "--showmeminfo", "vram", "--csv"],
-                           capture_output=True, text=True, timeout=6)
-        if r.returncode == 0:
-            total = used = None
-            for line in r.stdout.splitlines():
-                cells = line.split(",")
-                for i, c in enumerate(cells):
-                    if "vram total memory" in c.lower():
-                        total = int(cells[i + 1]) // (1024 * 1024)
-                    if "vram total used memory" in c.lower():
-                        used = int(cells[i + 1]) // (1024 * 1024)
-            if total:
-                free = total - (used or 0)
-                return {"total": total, "free": free, "gpu": True}
-    except Exception:
-        pass
-    # DRM sysfs (AMD)
-    try:
-        import glob as _glob
-        for base in _glob.glob("/sys/class/drm/card*/device"):
-            tot = os.path.join(base, "mem_info_vram_total")
-            usd = os.path.join(base, "mem_info_vram_used")
-            if os.path.exists(tot):
-                with open(tot) as f:
-                    total = int(f.read()) // (1024 * 1024)
-                used = 0
-                if os.path.exists(usd):
-                    with open(usd) as f:
-                        used = int(f.read()) // (1024 * 1024)
-                return {"total": total, "free": total - used, "gpu": True}
-    except Exception:
-        pass
-    return None
 
 
 def rung_for_vram(free_mb, gpu):
