@@ -39,8 +39,12 @@ $Ort = '1.24.4'
 $Codecs = @('pi-heif')
 $Common = @('rembg==2.0.76', 'numba', 'llvmlite') + $Codecs
 $Variants = [ordered]@{
-    cpu = $Common + @("onnxruntime==$Ort")
-    seg = @("onnxruntime==$Ort", 'numpy', 'pillow') + $Codecs
+    cpu      = $Common + @("onnxruntime==$Ort")
+    directml = $Common + @("onnxruntime-directml==$Ort")
+    cuda     = $Common + @("onnxruntime-gpu==$Ort",
+                           'nvidia-cuda-runtime-cu12', 'nvidia-cublas-cu12', 'nvidia-cufft-cu12',
+                           'nvidia-curand-cu12', 'nvidia-cudnn-cu12')
+    seg      = @("onnxruntime==$Ort", 'numpy', 'pillow') + $Codecs
 }
 
 function Invoke-Compile {
