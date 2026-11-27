@@ -141,7 +141,8 @@ if (Test-Path -LiteralPath $Prefix) {
 } else {
     New-Item -ItemType Directory -Path $Prefix -ErrorAction Stop | Out-Null
 }
-if ($legacy) { Write-Inventory $WorkerDir }   # the worker gets replaced below
+# The worker gets replaced below; only files its package records prove ours go.
+if ($legacy) { Write-LegacyInventory -WorkerDir $WorkerDir -LockDir (Join-Path $Packaging 'locks') }
 
 function Add-Owned { param([string[]]$Paths) foreach ($p in $Paths) { if (-not $owned.Contains($p)) { $owned.Add($p) } } }
 

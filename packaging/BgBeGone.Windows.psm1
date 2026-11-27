@@ -210,6 +210,60 @@ function Test-LegacyInstall {
     [bool](Get-ChildItem -LiteralPath (Join-Path $worker 'Lib\site-packages') -Filter 'onnxruntime*.dist-info' -Directory -ErrorAction SilentlyContinue)
 }
 
+function Write-LegacyInventory {
+    <#
+    .SYNOPSIS
+      Give a pre-manifest install's worker venv an inventory of only the
+      files bg-be-gone provably put there.
+
+    .DESCRIPTION
+      Proof is a package's own record: the RECORD file in each
+      site-packages\*.dist-info of a package bg-be-gone's locks name, plus
+      the bytecode Python compiled next to a recorded .py, plus the files
+      python -m venv writes. Anything else (a file the user added, a package
+      they installed into the venv) stays.
+    #>
+    param([Parameter(Mandatory)][string]$WorkerDir, [Parameter(Mandatory)][string]$LockDir)
+    function ConvertTo-PackageKey([string]$Name) { ($Name -replace '[-_.]+', '_').ToLowerInvariant() }
+    $ours = @{}
+    foreach ($lock in Get-ChildItem -LiteralPath $LockDir -Filter 'windows-*.txt' -File) {
+        foreach ($line in [IO.File]::ReadAllLines($lock.FullName)) {
+            if ($line -match '^([A-Za-z0-9_.-]+)==') { $ours[(ConvertTo-PackageKey $Matches[1])] = $true }
+        }
+    }
+    $root = [IO.Path]::GetFullPath($WorkerDir).TrimEnd('\')
+    $site = Join-Path $root 'Lib\site-packages'
+    $files = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    # What python -m venv itself writes.
+    foreach ($rel in 'pyvenv.cfg', 'Scripts\python.exe', 'Scripts\pythonw.exe', 'Scripts\activate',
+                     'Scripts\activate.bat', 'Scripts\Activate.ps1', 'Scripts\deactivate.bat', '.gitignore') {
+        if ([IO.File]::Exists((Join-Path $root $rel))) { [void]$files.Add($rel) }
+    }
+    foreach ($info in Get-ChildItem -LiteralPath $site -Directory -Filter '*.dist-info' -ErrorAction SilentlyContinue) {
+        if ($info.Name -notmatch '^(.+?)-[^-]+\.dist-info$' -or -not $ours.ContainsKey((ConvertTo-PackageKey $Matches[1]))) { continue }
+        $record = Join-Path $info.FullName 'RECORD'
+        if (-not [IO.File]::Exists($record)) { continue }
+        foreach ($line in [IO.File]::ReadAllLines($record)) {
+            # path,hash,size: a path holding a comma is quoted.
+            $rel = if ($line.StartsWith('"')) { $line.Substring(1, $line.IndexOf('"', 1) - 1) } else { ($line -split ',', 2)[0] }
+            if (-not $rel) { continue }
+            $full = [IO.Path]::GetFullPath((Join-Path $site $rel))
+            if (-not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if (-not [IO.File]::Exists($full)) { continue }
+            [void]$files.Add($full.Substring($root.Length + 1))
+            if ($full.EndsWith('.py', [StringComparison]::OrdinalIgnoreCase)) {
+                $cache = Join-Path ([IO.Path]::GetDirectoryName($full)) '__pycache__'
+                $stem = [IO.Path]::GetFileNameWithoutExtension($full)
+                if ([IO.Directory]::Exists($cache)) {
+                    foreach ($pyc in [IO.Directory]::GetFiles($cache, "$stem.*.pyc")) { [void]$files.Add($pyc.Substring($root.Length + 1)) }
+                }
+            }
+        }
+    }
+    $list = @($files | Sort-Object) + $script:InventoryName
+    Write-Utf8File (Join-Path $root $script:InventoryName) (($list -join "`r`n") + "`r`n")
+}
+
 function Remove-Inventory {
     <#
     .SYNOPSIS
@@ -698,7 +752,7 @@ function New-AppIcon {
 Export-ModuleMember -Function Write-Utf8File, New-UniqueName, New-PrivateTempDir,
     Test-ReparsePoint, Assert-NoReparseBelow, Get-TreeFiles, Write-Inventory, Test-Inventory,
     Read-Inventory, Update-Inventory, Test-LegacyInstall,
-    Remove-Inventory, Remove-CacheTree, Get-WorkerPython, New-WorkerPython,
+    Remove-Inventory, Write-LegacyInventory, Remove-CacheTree, Get-WorkerPython, New-WorkerPython,
     Install-LockedPackage, New-WorkerStartInfo, Invoke-WorkerPython, Test-Worker,
     Write-WorkerRecord, Complete-Worker, Switch-Worker, Get-LaunchCommand, Install-LaunchModule,
     ConvertTo-CommandLine,
