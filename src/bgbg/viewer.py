@@ -14,6 +14,8 @@ gi.require_version("Graphene", "1.0")
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gtk, Gdk, Gsk, Graphene, GdkPixbuf, Gio, GLib  # noqa: E402
 
+import offmain  # noqa: E402
+
 MIN_ZOOM = 0.05
 MAX_ZOOM = 40.0
 _CELL = 16
@@ -116,6 +118,10 @@ class ImageView(Gtk.Widget):
 
         self.pixbuf = None
         self._texture = None
+        # Bumped by every load/clear (and every seg-layer load/clear), so a
+        # background decode that finishes after a newer one started is dropped.
+        self._load_gen = 0
+        self._seg_gen = 0
         self._anim = None        # GdkPixbuf.PixbufAnimation for animated GIFs
         self._anim_iter = None
         self._anim_timer = 0     # GLib timeout id driving frame advance
@@ -248,6 +254,7 @@ class ImageView(Gtk.Widget):
 
     # ---------- public API ----------
     def load_file(self, path, keep_transform=False):
+        self._load_gen += 1
         self._stop_animation()
         anim = self._open_animation(path)
         if anim is not None:               # animated GIF: play it back
@@ -259,6 +266,25 @@ class ImageView(Gtk.Widget):
                 self.pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
             except GLib.Error:
                 return False
+        self._show_loaded(keep_transform)
+        return True
+
+    def load_file_async(self, path, keep_transform=False):
+        """load_file for a still image, decoded on a background thread (a 4K PNG
+        took ~240 ms of the UI thread). A newer load or clear() wins."""
+        self._load_gen += 1
+        gen = self._load_gen
+
+        def show(pixbuf):
+            if gen != self._load_gen or isinstance(pixbuf, Exception):
+                return
+            self._stop_animation()
+            self.pixbuf = pixbuf
+            self._show_loaded(keep_transform)
+
+        offmain.run(lambda: GdkPixbuf.Pixbuf.new_from_file(path), show)
+
+    def _show_loaded(self, keep_transform):
         self._texture = None
         self._clip_active = False
         if keep_transform:                 # keep the user's flip/zoom on reload
@@ -270,7 +296,6 @@ class ImageView(Gtk.Widget):
         self._changed()
         if self._anim is not None:
             self._schedule_frame()
-        return True
 
     def _open_animation(self, path):
         """Return a PixbufAnimation if `path` is an animated GIF we should play
@@ -329,6 +354,7 @@ class ImageView(Gtk.Widget):
         self._changed()
 
     def clear(self):
+        self._load_gen += 1
         self._stop_animation()
         self.pixbuf = None
         self._texture = None
@@ -390,43 +416,75 @@ class ImageView(Gtk.Widget):
                 pb.get_width(), pb.get_height())
 
     def set_seg_layers(self, objects, labelmap_path, general_path=None,
-                       depth_path=None):
+                       depth_path=None, done=None):
         """Load per-object mask textures + the lookup maps (specific/general id
-        per pixel + overlap depth), build marching-ants paths, play the reveal."""
-        self.clear_seg(keep_mode=True)
-        for o in objects:
-            oid = o["id"]
-            try:
-                tex = Gdk.Texture.new_from_filename(o["mask"])
-            except GLib.Error:
-                continue
-            self._seg_masks[oid] = tex
-            c = Gdk.RGBA()
-            c.parse(o["color"])
-            self._seg_colors[oid] = c
-            contours = o.get("contour") or []
-            self._seg_paths[oid] = self._path_from_contours(contours)
-            bx, by, bw, bh = o.get("bbox", (0, 0, 0, 0))
-            self._seg_centroids[oid] = (bx + bw / 2.0, by + bh / 2.0)
-            self._seg_radius[oid] = 0.6 * max(bw, bh, 8)
-            # canonical outline ring (largest polygon) for the focus morph; the
-            # remaining polygons (holes / extra parts) crossfade during a switch.
-            if contours:
-                largest = max(contours, key=_polygon_area_abs)
-                self._seg_morph[oid] = _align_ring(
-                    _resample_closed(largest, _MORPH_N))
-                rest = [poly for poly in contours if poly is not largest]
-                self._seg_sec_paths[oid] = (
-                    self._path_from_contours(rest) if rest else None)
-        (self._lm_pixels, self._lm_rs, self._lm_nc,
-         self._lm_w, self._lm_h) = self._load_map(labelmap_path)
-        self._lmg_pixels, self._lmg_rs, self._lmg_nc, _, _ = \
-            self._load_map(general_path)
-        self._depth_pixels, self._depth_rs, self._depth_nc, _, _ = \
-            self._load_map(depth_path)
-        self._begin_reveal()
-        self._start_anim()
-        self.queue_draw()
+        per pixel + overlap depth), build marching-ants paths, play the reveal.
+
+        The decoding runs on a background thread: on a 4K photo it held the UI
+        thread for ~650 ms. The old layers stay up until the new ones are ready;
+        a newer load or clear_seg() wins. done() runs once they are shown.
+        """
+        self._seg_gen += 1
+        gen = self._seg_gen
+
+        def build():
+            layers = {"masks": {}, "colors": {}, "paths": {}, "centroids": {},
+                      "radius": {}, "morph": {}, "sec_paths": {}}
+            for o in objects:
+                oid = o["id"]
+                try:
+                    tex = Gdk.Texture.new_from_filename(o["mask"])
+                except GLib.Error:
+                    continue
+                layers["masks"][oid] = tex
+                c = Gdk.RGBA()
+                c.parse(o["color"])
+                layers["colors"][oid] = c
+                contours = o.get("contour") or []
+                layers["paths"][oid] = self._path_from_contours(contours)
+                bx, by, bw, bh = o.get("bbox", (0, 0, 0, 0))
+                layers["centroids"][oid] = (bx + bw / 2.0, by + bh / 2.0)
+                layers["radius"][oid] = 0.6 * max(bw, bh, 8)
+                # canonical outline ring (largest polygon) for the focus morph; the
+                # remaining polygons (holes / extra parts) crossfade during a switch.
+                if contours:
+                    largest = max(contours, key=_polygon_area_abs)
+                    layers["morph"][oid] = _align_ring(
+                        _resample_closed(largest, _MORPH_N))
+                    rest = [poly for poly in contours if poly is not largest]
+                    layers["sec_paths"][oid] = (
+                        self._path_from_contours(rest) if rest else None)
+            layers["labelmap"] = self._load_map(labelmap_path)
+            layers["general"] = self._load_map(general_path)
+            layers["depth"] = self._load_map(depth_path)
+            return layers
+
+        def show(layers):
+            if gen != self._seg_gen:
+                return
+            if isinstance(layers, Exception):
+                if done:
+                    done()
+                raise layers
+            self.clear_seg(keep_mode=True)
+            self._seg_masks = layers["masks"]
+            self._seg_colors = layers["colors"]
+            self._seg_paths = layers["paths"]
+            self._seg_centroids = layers["centroids"]
+            self._seg_radius = layers["radius"]
+            self._seg_morph = layers["morph"]
+            self._seg_sec_paths = layers["sec_paths"]
+            (self._lm_pixels, self._lm_rs, self._lm_nc,
+             self._lm_w, self._lm_h) = layers["labelmap"]
+            self._lmg_pixels, self._lmg_rs, self._lmg_nc, _, _ = layers["general"]
+            self._depth_pixels, self._depth_rs, self._depth_nc, _, _ = layers["depth"]
+            self._begin_reveal()
+            self._start_anim()
+            self.queue_draw()
+            if done:
+                done()
+
+        offmain.run(build, show)
 
     def set_seg_selection(self, ids):
         self._seg_selected = set(ids)
@@ -477,6 +535,7 @@ class ImageView(Gtk.Widget):
         self.queue_draw()
 
     def clear_seg(self, keep_mode=False):
+        self._seg_gen += 1
         self._seg_masks = {}
         self._seg_colors = {}
         self._seg_selected = set()

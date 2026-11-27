@@ -25,6 +25,10 @@ gi.require_version("Adw", "1")
 from gi.repository import Gtk, Gdk, GdkPixbuf, Gio, GLib, Adw  # noqa: E402
 
 from viewer import ImageView  # noqa: E402
+import offmain  # noqa: E402
+
+# Formats the worker opens itself (worker.IMG_EXTS); other sources are re-encoded.
+_WORKER_READS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 
 APP_ID = "io.github.cristeigabriela.BgBeGone"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -921,19 +925,44 @@ class Window(Adw.ApplicationWindow):
             return
         if self.seg_busy:
             return
-        inp = os.path.join(self.tmpdir, "seg_input.png")
-        try:
-            self.seg_panel.view.export_pixbuf().savev(inp, "png", [], [])
-        except Exception as e:
-            self._toast("Could not prepare image: %s" % e)
-            return
         self.seg_pending = cb
         self._seg_set_busy(True, cancel=True)
         self.seg_status.set_text("Preparing segmentation model…")
-        # Track this load so a reply that lands after we've left/unloaded (below)
-        # can be ignored instead of wrongly re-marking the model as resident.
-        self._seg_load_rid = self.worker.send({"op": "seg_load", "input": inp,
-                                               "model": self._seg_model_choice()})
+
+        def send(inp):
+            if not self.seg_busy:           # cancelled while the image was prepared
+                return
+            # Track this load so a reply that lands after we've left/unloaded
+            # can be ignored instead of wrongly re-marking the model as resident.
+            self._seg_load_rid = self.worker.send(
+                {"op": "seg_load", "input": inp, "model": self._seg_model_choice()})
+
+        def failed(e):
+            self._seg_set_busy(False)
+            self._toast("Could not prepare image: %s" % e)
+
+        self._prepare_input(self.seg_panel.view,
+                            os.path.join(self.tmpdir, "seg_input.png"), send, failed)
+
+    def _prepare_input(self, view, dst, send, failed):
+        """Hand the worker a file of what `view` shows, then call send(path).
+
+        The source file itself when the worker can read it and it isn't rotated
+        or flipped; otherwise a PNG encoded on a background thread. Encoding a
+        4K photo on the UI thread froze the window for ~3 s before each run.
+        """
+        src = self.source_path
+        if src and not view.is_transformed() and src.lower().endswith(_WORKER_READS):
+            send(src)
+            return
+        pixbuf = view.export_pixbuf()
+
+        def encode():
+            # Fast compression: the file is a temporary hand-off, read once.
+            pixbuf.savev(dst, "png", ["compression"], ["1"])
+            return dst
+
+        offmain.run(encode, lambda r: failed(r) if isinstance(r, Exception) else send(r))
 
     def _on_seg_everything(self):
         if self.seg_busy:
@@ -1381,18 +1410,24 @@ class Window(Adw.ApplicationWindow):
         if self._source_is_gif:
             self._generate_gif(model, bg, alpha, blur)
             return
-        inp = os.path.join(self.tmpdir, "input.png")
-        try:
-            self.src_panel.view.export_pixbuf().savev(inp, "png", [], [])
-        except Exception as e:
-            self._toast("Could not prepare image: %s" % e)
-            return
         out = os.path.join(self.tmpdir, "result.png")
         self._set_busy(True, cancel=True)
         self.src_panel.view.set_scanning(True)      # scan shimmer over the source
         self.status.set_text("Generating…")
-        self.worker.send({"op": "single", "input": inp, "output": out,
-                          "model": model, "alpha": alpha, "bg": bg, "blur": blur})
+
+        def send(inp):
+            if not self.busy:               # cancelled while the image was prepared
+                return
+            self.worker.send({"op": "single", "input": inp, "output": out,
+                              "model": model, "alpha": alpha, "bg": bg, "blur": blur})
+
+        def failed(e):
+            self.src_panel.view.set_scanning(False)
+            self._set_busy(False)
+            self._toast("Could not prepare image: %s" % e)
+
+        self._prepare_input(self.src_panel.view,
+                            os.path.join(self.tmpdir, "input.png"), send, failed)
 
     def _generate_gif(self, model, bg, alpha, blur):
         # Same options as a still; the worker processes each frame and reports
@@ -1463,7 +1498,7 @@ class Window(Adw.ApplicationWindow):
                 self._toast("%s ready — the first run optimises GPU kernels and "
                             "is slower; later runs are fast." % msg["label"])
         elif t == "done_single":
-            self.res_panel.view.load_file(msg["output"])
+            self.res_panel.view.load_file_async(msg["output"])
             self.result_output = msg["output"]
             self.save_btn.set_sensitive(True)
             self.status.set_text("Done in %.2fs." % msg["seconds"])
@@ -1539,15 +1574,20 @@ class Window(Adw.ApplicationWindow):
             self.seg_status.set_text("Finding objects…")
             self._footer_progress(msg["done"], msg["total"])
         elif t == "seg_objects":
-            self._seg_set_busy(False)
             self.seg_objects = msg["objects"]
+            status = "%d objects — hover to highlight, click to keep." % msg["count"]
+
+            def shown():
+                # Busy until the layers are on screen, so nothing is clicked
+                # before there is anything to click.
+                self._seg_set_busy(False)
+                self._update_seg_preview()
+                self._seg_base_status = status
+                self.seg_status.set_text(status)
+
             self.seg_panel.view.set_seg_layers(
                 msg["objects"], msg["label_map"],
-                msg.get("general_map"), msg.get("depth_map"))
-            self._update_seg_preview()
-            self._seg_base_status = (
-                "%d objects — hover to highlight, click to keep." % msg["count"])
-            self.seg_status.set_text(self._seg_base_status)
+                msg.get("general_map"), msg.get("depth_map"), done=shown)
         elif t == "seg_mask":
             self._seg_set_busy(False)
             self.seg_point_mask = msg["mask"]
@@ -1564,7 +1604,7 @@ class Window(Adw.ApplicationWindow):
                 if (msg.get("id") != getattr(self, "_seg_preview_rid", None)
                         or not self._seg_has_selection()):
                     return False
-                self.seg_res_panel.view.load_file(out, keep_transform=True)
+                self.seg_res_panel.view.load_file_async(out, keep_transform=True)
                 self.seg_result_output = out
                 self.seg_save_btn.set_sensitive(True)
             else:                                    # explicit Save → file dialog
