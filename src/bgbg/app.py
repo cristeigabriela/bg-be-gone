@@ -103,6 +103,25 @@ def _saved_notice(target, choices):
     return "Saved %s as %s: %s." % (name, target.format.name, reason)
 
 
+# Start-up check for CI: with BGBG_SELFTEST set to a file path, the app writes
+# the worker's "ready" message (or why it never came) there as JSON, then quits.
+SELFTEST = os.environ.get("BGBG_SELFTEST")
+# The app is single-instance per application id, so a test launch with the
+# real id would open its window inside a bg-be-gone the user already runs.
+# BGBG_APP_ID gives a test its own instance; the icon keeps APP_ID.
+INSTANCE_ID = os.environ.get("BGBG_APP_ID", APP_ID)
+_SELFTEST_TIMEOUT_S = 300   # generous: ready took 9 s locally; CI runners are slower
+
+
+def _finish_selftest(win, result):
+    result = dict(result, opened=win.get_application().opened)
+    # Written aside and renamed, so a watcher never reads half a file.
+    with open(SELFTEST + ".part", "w", encoding="utf-8") as f:
+        json.dump(result, f)
+    os.replace(SELFTEST + ".part", SELFTEST)
+    win.close()        # close-request shuts the worker down, then the app exits
+    return False       # one-shot when used as a GLib timeout
+
 SUBJECTS = [
     ("General (objects, scenes)", "birefnet-general"),
     ("Person / portrait", "birefnet-portrait"),
@@ -1688,6 +1707,8 @@ class Window(Adw.ApplicationWindow):
                 if self._seg_available:
                     self.stack.set_visible_child_name("segment")
             self._sync_sidebar_page()
+            if SELFTEST:
+                _finish_selftest(self, {"ok": True, "ready": msg})
         elif t == "loading":
             self.status.set_text(
                 "Loading %s… (the first run is slower)" % msg["model"])
@@ -1893,9 +1914,13 @@ class Window(Adw.ApplicationWindow):
 
 class App(Adw.Application):
     def __init__(self):
-        super().__init__(application_id=APP_ID,
-                         flags=Gio.ApplicationFlags.HANDLES_OPEN)
+        flags = Gio.ApplicationFlags.HANDLES_OPEN
+        if SELFTEST:
+            # A self-test never registers with, or hands off to, another instance.
+            flags |= Gio.ApplicationFlags.NON_UNIQUE
+        super().__init__(application_id=INSTANCE_ID, flags=flags)
         self._pending_open = None
+        self.opened = None             # the last file handed in to open; the self-test reports it
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -1924,13 +1949,19 @@ class App(Adw.Application):
             win._load_source(self._pending_open)
             self._pending_open = None
         win.present()
+        if SELFTEST:
+            if not win.worker.ok:
+                _finish_selftest(win, {"ok": False, "error": win.worker.error})
+            else:
+                GLib.timeout_add_seconds(_SELFTEST_TIMEOUT_S, _finish_selftest, win,
+                                         {"ok": False, "error": "no ready from the worker"})
         # Env-gated demo helper: auto-run Generate once, for screenshots/tests.
         if os.environ.get("BGBG_AUTOGEN") and win.src_panel.view.has_image():
             GLib.timeout_add(1400, lambda: (win._on_generate(), False)[1])
 
     def do_open(self, files, n, hint):
         if files:
-            self._pending_open = files[0].get_path()
+            self._pending_open = self.opened = files[0].get_path()
         self.do_activate()
 
     def _on_about(self, *_):
