@@ -232,6 +232,25 @@ def test_a_cutout_succeeds_for_every_format_the_worker_reads(worker, tmp_path, f
     assert_cut_out(out)
 
 
+@FORMAT_FIXTURES
+def test_convert_decodes_every_readable_format_into_a_png_to_preview(
+        worker, tmp_path, fixture):
+    """The frontend's fallback when GdkPixbuf has no loader for the format."""
+    out = tmp_path / "preview.png"
+    reply, _ = worker.ask(
+        {"op": "convert", "id": 1, "input": str(TESTDATA / fixture), "output": str(out)},
+        until={"converted", "error"})
+    assert reply["type"] == "converted", "the worker reads it: %s" % reply.get("message")
+    assert reply["frames"] == 1, "a still image has one frame"
+    preview = Image.open(out)
+    assert preview.format == "PNG", "the preview is a PNG, whatever the source"
+    assert preview.mode in ("RGB", "RGBA"), "GdkPixbuf reads 8-bit RGB(A)"
+    assert preview.size == (256, 256), "the preview is the source's full size"
+    grey = preview.convert("L")
+    assert grey.getpixel(SUBJECT_PIXEL) < 100, "the dark subject stays dark"
+    assert grey.getpixel(BACKGROUND_PIXEL) < 250, "the light grey background isn't clipped to white"
+
+
 def test_batch_cuts_out_every_still_format_and_skips_gifs_and_other_files(worker, tmp_path):
     """A GIF in batch would lose all but its first frame, so batch leaves it out."""
     inp, outdir = tmp_path / "in", tmp_path / "out"
@@ -254,6 +273,36 @@ def test_batch_cuts_out_every_still_format_and_skips_gifs_and_other_files(worker
         "every still format is cut out; the GIF and the text file are not"
     for out in outdir.iterdir():
         assert_cut_out(out)
+
+
+@pytest.fixture
+def cutout(worker, tmp_path):
+    """A transparent cut-out of subject.png, as the frontend would save it."""
+    out = tmp_path / "cutout.png"
+    reply, _ = worker.ask(
+        {"op": "single", "model": "u2netp", "id": 1,
+         "input": str(TESTDATA / "subject.png"), "output": str(out)},
+        until={"done_single", "error"})
+    assert reply["type"] == "done_single", reply.get("message")
+    return out
+
+
+def test_a_cutout_saved_as_webp_keeps_its_transparency(worker, tmp_path, cutout):
+    saved = tmp_path / "saved.webp"
+    reply, _ = worker.ask({"op": "convert", "id": 2, "input": str(cutout), "output": str(saved)},
+                          until={"converted", "error"})
+    assert reply["type"] == "converted", reply.get("message")
+    assert Image.open(saved).format == "WEBP", "the suffix picks the format"
+    assert_cut_out(saved)
+
+
+def test_a_result_with_an_alpha_channel_still_saves_as_jpeg(worker, tmp_path, cutout):
+    """JPEG has no alpha channel; the worker drops it rather than fail."""
+    saved = tmp_path / "saved.jpg"
+    reply, _ = worker.ask({"op": "convert", "id": 2, "input": str(cutout), "output": str(saved)},
+                          until={"converted", "error"})
+    assert reply["type"] == "converted", reply.get("message")
+    assert Image.open(saved).format == "JPEG", "the suffix picks the format"
 
 
 def test_an_unreadable_image_is_named_in_the_error_and_the_log(worker, tmp_path):

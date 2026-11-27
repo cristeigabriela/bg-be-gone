@@ -16,6 +16,7 @@ Requests (one JSON object per line on stdin):
    "pattern":"{name}_nobg","id":N}
   {"op":"gif","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":int,
    "rot":0..3,"fh":bool,"fv":bool,"id":N}   # per-frame background removal
+  {"op":"convert","input":P,"output":P,"id":N}   # re-encode as output's format
   {"op":"cancel"}                            # stop single/batch/gif in progress
   {"op":"models"}
   {"op":"seg_load","input":P,"model":"auto|large|base_plus|small|tiny|mobile","id":N}
@@ -37,6 +38,7 @@ Responses (one JSON object per line on stdout):
   {"type":"done_batch","count":n,"seconds":f,"outdir":P,"id":N}
   {"type":"gif_progress","done":i,"total":n,"id":N}
   {"type":"gif_done","output":P,"frames":n,"seconds":f,"id":N}
+  {"type":"converted","output":P,"frames":n,"id":N}
   {"type":"canceled","scope":"single|batch|gif","id":N}
   {"type":"seg_download","done":i,"total":n,"id":N}
   {"type":"seg_step","rung":R,"message":str,"id":N}
@@ -184,6 +186,13 @@ class UnreadableImageError(OSError):
         self.reason = reason
 
 
+class UnsupportedOutputError(ValueError):
+    def __init__(self, path):
+        super().__init__(f"can't save as {os.path.basename(path)}: "
+                         "bg-be-gone writes PNG, WebP or JPEG")
+        self.path = path
+
+
 def open_image(path):
     """Open and decode an image, or raise UnreadableImageError naming the file.
 
@@ -209,6 +218,15 @@ def open_image(path):
     raise err from cause
 
 
+# Encoder settings per format we write. WebP keeps its alpha lossless by default
+# (alpha_quality=100), so only the colour is lossy.
+_SAVE_OPTIONS = {
+    formats.PNG: {},
+    formats.WEBP: {"quality": 90},
+    formats.JPEG: {"quality": 92},
+}
+
+
 def _plain(im):
     """The image as 8-bit RGB, or RGBA when it has transparency.
 
@@ -223,6 +241,30 @@ def _plain(im):
     has_alpha = im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info
     mode = "RGBA" if has_alpha else "RGB"
     return im if im.mode == mode else im.convert(mode)
+
+
+def save_image(im, dst):
+    """Save the current frame of `im` in the format `dst`'s suffix names."""
+    fmt = formats.format_of(dst)
+    if fmt not in _SAVE_OPTIONS:
+        raise UnsupportedOutputError(dst)
+    im = _plain(im)
+    if fmt is formats.JPEG:
+        im = im.convert("RGB")
+    im.save(dst, **_SAVE_OPTIONS[fmt])
+
+
+def handle_convert(req):
+    """Re-encode an image into the format its output path names.
+
+    The frontend uses it to preview a source GdkPixbuf can't decode (no loader
+    for HEIC or AVIF, say) and to save a result as WebP or JPEG. Only the first
+    frame is written; "frames" tells the frontend whether the source animates.
+    """
+    im = open_image(req["input"])
+    save_image(im, req["output"])
+    out({"type": "converted", "output": req["output"],
+         "frames": getattr(im, "n_frames", 1), "id": req.get("id")})
 
 
 def process_one(model, req_id, src, dst, alpha, bg, blur=20, want_preview=False):
@@ -566,6 +608,7 @@ _HANDLERS = {
     "single": handle_single,
     "batch": handle_batch,
     "gif": handle_gif,
+    "convert": handle_convert,
     "seg_load": handle_seg_load,
     "seg_everything": handle_seg_everything,
     "seg_point": handle_seg_point,
