@@ -21,7 +21,7 @@ jobs:
       - name: Lint (ruff)
         run: |
           python -m pip install --quiet ruff
-          ruff check src
+          ruff check src tests
 
       - name: Install validators
         run: |
@@ -36,3 +36,26 @@ jobs:
 
       - name: AppStream metadata
         run: appstreamcli validate --no-net data/io.github.cristeigabriela.BgBeGone.metainfo.xml
+
+  tests:
+    runs-on: ubuntu-latest
+    env:
+      U2NET_HOME: ${{ github.workspace }}/.u2net
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the worker's CPU stack
+        run: python -m pip install --quiet "rembg[cpu]" pytest
+
+      # The tests download rembg's smallest model (u2netp, ~5 MB) on first use.
+      - uses: actions/cache@v4
+        with:
+          path: .u2net
+          key: u2net-u2netp
+
+      - name: Tests
+        run: python -m pytest tests -q
