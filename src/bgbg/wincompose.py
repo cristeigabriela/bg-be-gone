@@ -15,9 +15,11 @@ rounded corners into came out black. enable_gl_window_alpha() makes the same
 DwmEnableBlurBehindWindow call GTK MR !10153 proposed (closed unmerged), with an
 empty blur region, so DWM uses the window's alpha and nothing is blurred.
 
-GTK recreates the GL window when a surface re-attaches, so the call is made on
-every map. The Vulkan renderer uses its own window class (GdkWin32Vulkan) and is
-not covered: it isn't GTK's default under dcomp, and the fix is untested there.
+Every surface (each window, menu, popover and tooltip) gets its own GL window,
+and GTK recreates it when the surface re-attaches, so watch_gl_windows() fixes
+each one as it is created. The Vulkan renderer uses its own window class
+(GdkWin32Vulkan) and is not covered: it isn't GTK's default under dcomp, and
+the fix is untested there.
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -60,14 +62,50 @@ def _gl_windows():
     return found
 
 
-def enable_gl_window_alpha():
-    """Let DWM compose GTK's GL window with its alpha. Safe to call repeatedly;
-    a no-op when GTK renders without that window (Cairo, Vulkan)."""
+def _enable_alpha(hwnd):
     dwmapi = ctypes.WinDLL("dwmapi")
     gdi32 = ctypes.WinDLL("gdi32")
     gdi32.CreateRectRgn.restype = wt.HANDLE
+    empty = gdi32.CreateRectRgn(0, 0, -1, -1)
+    blur = _DwmBlurBehind(_DWM_BB_ENABLE | _DWM_BB_BLURREGION, True, empty, False)
+    dwmapi.DwmEnableBlurBehindWindow(wt.HWND(hwnd), ctypes.byref(blur))
+    gdi32.DeleteObject(wt.HANDLE(empty))
+
+
+# winuser.h; Python ships no binding for these.
+_EVENT_OBJECT_CREATE = 0x8000
+_WINEVENT_OUTOFCONTEXT = 0x0000
+_OBJID_WINDOW = 0
+_WINEVENTPROC = ctypes.WINFUNCTYPE(None, wt.HANDLE, wt.DWORD, wt.HWND, wt.LONG, wt.LONG,
+                                   wt.DWORD, wt.DWORD)
+_hook = None        # (hook handle, callback): kept alive for the process's lifetime
+
+
+def watch_gl_windows():
+    """Fix every GL window GTK creates from now on, and the ones it already has.
+
+    Each popup surface (menus, popovers, tooltips, dialogs) gets its own GL
+    window when it attaches, so hooking only the main window left their corners
+    black. An out-of-context WinEvent hook on window creation, filtered to this
+    process, is delivered through the GTK main thread's message loop.
+    """
+    global _hook
+    if _hook is not None:
+        return
+    user32 = ctypes.WinDLL("user32")
+    user32.SetWinEventHook.restype = wt.HANDLE
+
+    def on_create(_hook_handle, _event, hwnd, id_object, _id_child, _thread, _time):
+        if id_object != _OBJID_WINDOW or not hwnd:
+            return
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, cls, len(cls))
+        if cls.value == _GL_WINDOW_CLASS:
+            _enable_alpha(hwnd)
+
+    callback = _WINEVENTPROC(on_create)
+    handle = user32.SetWinEventHook(_EVENT_OBJECT_CREATE, _EVENT_OBJECT_CREATE, None,
+                                    callback, os.getpid(), 0, _WINEVENT_OUTOFCONTEXT)
+    _hook = (handle, callback)
     for hwnd in _gl_windows():
-        empty = gdi32.CreateRectRgn(0, 0, -1, -1)
-        blur = _DwmBlurBehind(_DWM_BB_ENABLE | _DWM_BB_BLURREGION, True, empty, False)
-        dwmapi.DwmEnableBlurBehindWindow(wt.HWND(hwnd), ctypes.byref(blur))
-        gdi32.DeleteObject(wt.HANDLE(empty))
+        _enable_alpha(hwnd)

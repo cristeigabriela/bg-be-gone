@@ -403,9 +403,6 @@ class Window(Adw.ApplicationWindow):
         super().__init__(application=app)
         self.set_title("bg-be-gone")
         self.set_default_size(1300, 820)
-        if os.name == "nt":
-            # GTK's GL window exists once the first window maps (see wincompose).
-            self.connect("map", lambda *_: wincompose.enable_gl_window_alpha())
 
         self.tmpdir = os.environ.get("BGBG_TMPDIR") or tempfile.mkdtemp(
             prefix="bg-be-gone-")
@@ -1663,6 +1660,7 @@ class App(Adw.Application):
             # Windows has no .desktop file to name the window icon, so the
             # taskbar showed Python's. install.ps1 puts the icon in a theme dir.
             Gtk.Window.set_default_icon_name(APP_ID)
+            wincompose.watch_gl_windows()   # transparent corners on every surface
         about = Gio.SimpleAction.new("about", None)
         about.connect("activate", self._on_about)
         self.add_action(about)
