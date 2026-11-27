@@ -130,9 +130,18 @@ def save_config(**kw):
 def probe_vram():
     """Return ``{"total":MiB, "free":MiB, "gpu":True}`` or ``None``.
 
-    NVIDIA via ``nvidia-smi``; AMD via ``rocm-smi`` or the DRM sysfs nodes. Best
-    effort — any failure returns ``None`` and the caller treats the host as CPU.
+    Windows via DXGI and the GPU memory counters (any vendor); NVIDIA via
+    ``nvidia-smi``; AMD via ``rocm-smi`` or the DRM sysfs nodes. Best effort —
+    any failure returns ``None`` and the caller treats the host as CPU.
     """
+    if os.name == "nt":
+        try:
+            import winvram
+            info = winvram.probe()
+            if info:
+                return {k: info[k] for k in ("total", "free", "gpu")}
+        except Exception:
+            pass
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total,memory.free",
