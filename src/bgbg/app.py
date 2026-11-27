@@ -8,10 +8,13 @@ resident on the GPU. Frontend and worker talk over line-delimited JSON.
 import os
 import sys
 import json
+import logging
 import shutil
 import tempfile
 import threading
 import subprocess
+from dataclasses import dataclass
+from typing import Optional
 
 import gi
 gi.require_version("Gtk", "4.0")
@@ -21,6 +24,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Gtk, Gdk, GdkPixbuf, Gio, GLib, Adw  # noqa: E402
 
 from viewer import ImageView  # noqa: E402
+import formats  # noqa: E402
 
 APP_ID = "io.github.cristeigabriela.BgBeGone"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -29,6 +33,66 @@ VENV_PY = (os.environ.get("BGBG_VENV_PYTHON")
 WORKER = os.environ.get("BGBG_WORKER", os.path.join(APP_DIR, "worker.py"))
 LOG = os.path.join(GLib.get_user_cache_dir(), "bg-be-gone-worker.log")
 APP_VERSION = os.environ.get("BGBG_VERSION", "1.1.0")
+_log = logging.getLogger("bgbg")
+
+
+def _alpha_of(bg):
+    """Whether a result made with background setting `bg` is transparent."""
+    if bg == "transparent":
+        return formats.Alpha.TRANSPARENT
+    return formats.Alpha.FLATTENED
+
+
+def _run_off_main(work, done):
+    """Call work() on a thread, then done(error) on the GTK thread.
+
+    `error` is the GLib.Error work() raised, or None. Encoding a full-size
+    snapshot to PNG on the GTK thread froze the window while it ran.
+    """
+    def thread():
+        try:
+            work()
+            error = None
+        except GLib.Error as e:
+            error = e
+
+        def deliver():
+            done(error)
+            return False                    # once
+        # Above redraw priority, so a running animation can't starve it.
+        GLib.idle_add(deliver, priority=GLib.PRIORITY_DEFAULT)
+
+    threading.Thread(target=thread, daemon=True).start()
+
+
+@dataclass
+class _PendingSave:
+    """A result the worker is writing as WebP or JPEG."""
+
+    target: formats.SaveTarget
+    choices: tuple
+    staging: Optional[str]   # our temporary PNG to delete afterwards, if any
+
+
+def _remove_quietly(path):
+    """Delete a temporary file of ours; one already gone is fine."""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def _saved_notice(target, choices):
+    """The toast after a save, saying why when the typed format wasn't used."""
+    name = os.path.basename(target.path)
+    if target.change is not formats.SuffixChange.REPLACED:
+        return "Saved " + name
+    if target.typed is formats.JPEG and choices == formats.save_formats(formats.Alpha.TRANSPARENT):
+        reason = "JPEG can't keep the transparency"
+    else:
+        reason = "this result can't be saved as %s" % target.typed.name
+    return "Saved %s as %s: %s." % (name, target.format.name, reason)
+
 
 SUBJECTS = [
     ("General (objects, scenes)", "birefnet-general"),
@@ -380,6 +444,14 @@ class Window(Adw.ApplicationWindow):
         self.source_path = None
         self._source_is_gif = False
         self.result_output = None
+        # Whether the shown result's pixels are transparent, which decides if
+        # JPEG is offered. Recorded per request (id -> Alpha) and adopted with
+        # the result, never read from the settings at save time.
+        self._result_alpha = formats.Alpha.TRANSPARENT
+        self._generating_alpha = {}
+        self._seg_export_alpha = {}
+        # Results the worker is writing as WebP or JPEG: id -> _PendingSave.
+        self._pending_saves = {}
         self.busy = False
         self.batch_input = None
         self.batch_output = None
@@ -1038,28 +1110,18 @@ class Window(Adw.ApplicationWindow):
             return
         self._seg_set_busy(True)
         self.seg_status.set_text("Preparing export…")
-        self.worker.send(self._seg_extract_req(
-            os.path.join(self.tmpdir, "seg_result.png")))
+        req = self._seg_extract_req(os.path.join(self.tmpdir, "seg_result.png"))
+        rid = self.worker.send(req)
+        self._seg_export_alpha[rid] = _alpha_of(req["bg"])
 
-    def _seg_save_file(self, src):
-        dlg = Gtk.FileDialog(title="Save result")
-        base = os.path.splitext(os.path.basename(self.source_path or "image"))[0]
-        dlg.set_initial_name(base + "_object.png")
-
-        def done(d, res):
-            try:
-                f = d.save_finish(res)
-            except GLib.Error:
-                return
-            path = f.get_path()
-            if not path.lower().endswith(".png"):
-                path += ".png"
-            try:
-                shutil.copyfile(src, path)
-                self._toast("Saved " + os.path.basename(path))
-            except Exception as e:
-                self._toast("Save failed: %s" % e)
-        dlg.save(self, None, done)
+    def _seg_save_file(self, src, alpha):
+        """Offer the export at `src`, whose background `alpha` describes."""
+        def save(target, choices):
+            if target.format is formats.PNG:
+                self._save_copy(src, target, choices)
+            else:
+                self._save_via_worker(src, target, choices, staging=None)
+        self._ask_save_path("_object", formats.save_formats(alpha), save)
 
     def _on_seg_cancel(self):
         self.worker.send({"op": "seg_cancel"})
@@ -1263,35 +1325,123 @@ class Window(Adw.ApplicationWindow):
             self.seg_status.set_text(os.path.basename(path) + " — Segment.")
 
     def _on_save(self):
-        # A GIF result is the animated file itself (all frames); a still result
-        # is the current pixbuf.
-        is_gif = bool(self.result_output
-                      and self.result_output.lower().endswith(".gif"))
-        pb = None if is_gif else self.res_panel.view.export_pixbuf()
-        if not is_gif and pb is None:
+        # An animated result is the worker's file itself (all frames), saved in
+        # its own format; a still result is the current pixbuf.
+        result = self.result_output
+        if result and formats.can_animate(result):
+            self._ask_save_path("_nobg", (formats.format_of(result),),
+                                lambda target, choices: self._save_copy(result, target, choices))
             return
-        ext = ".gif" if is_gif else ".png"
+        pb = self.res_panel.view.export_pixbuf()
+        if pb is None:
+            return
+
+        def save(target, choices):
+            if target.format is formats.PNG:
+                try:
+                    pb.savev(target.path, "png", [], [])
+                except GLib.Error as e:
+                    self._toast("Save failed: %s" % e.message)
+                    return
+                self._toast(_saved_notice(target, choices))
+                return
+            # Pillow encodes WebP and JPEG on every platform; GdkPixbuf needs a
+            # loader for WebP. Hand the worker a lossless copy to re-encode,
+            # written off the GTK thread: a full-size PNG froze the window.
+            fd, staging = tempfile.mkstemp(suffix=".png", dir=self.tmpdir)
+            os.close(fd)
+
+            def staged(error):
+                if error is not None:
+                    _remove_quietly(staging)
+                    self._toast("Save failed: %s" % error.message)
+                    return
+                self._save_via_worker(staging, target, choices, staging=staging)
+            _run_off_main(lambda: pb.savev(staging, "png", ["compression"], ["1"]), staged)
+        self._ask_save_path("_nobg", formats.save_formats(self._result_alpha), save)
+
+    def _ask_save_path(self, stem_suffix, choices, save):
+        """Ask where to save, offering `choices`, then call save(target, choices).
+
+        The name's suffix picks the format. The default is the source's own
+        format when it is one of the choices, so a WebP comes back as a WebP.
+        """
+        default = formats.default_save_format(self.source_path, choices)
         dlg = Gtk.FileDialog(title="Save result")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        for fmt in choices:
+            f = Gtk.FileFilter(name=fmt.name)
+            for suffix in fmt.suffixes:
+                f.add_suffix(suffix[1:])
+            filters.append(f)
+            if fmt is default:
+                dlg.set_default_filter(f)
+        dlg.set_filters(filters)
         base = os.path.splitext(os.path.basename(self.source_path or "image"))[0]
-        dlg.set_initial_name(base + "_nobg" + ext)
+        dlg.set_initial_name(base + stem_suffix + default.suffix)
 
         def done(d, res):
             try:
                 f = d.save_finish(res)
             except GLib.Error:
                 return
-            path = f.get_path()
-            if not path.lower().endswith(ext):
-                path += ext
-            try:
-                if is_gif:
-                    shutil.copyfile(self.result_output, path)
-                else:
-                    pb.savev(path, "png", [], [])
-                self._toast("Saved " + os.path.basename(path))
-            except Exception as e:
-                self._toast("Save failed: %s" % e)
+            target = formats.save_target(f.get_path(), choices, default)
+            if formats.overwrites_unasked(target):
+                self._confirm_overwrite(target, lambda: save(target, choices))
+            else:
+                save(target, choices)
         dlg.save(self, None, done)
+
+    def _confirm_overwrite(self, target, save):
+        """Ask before replacing a file the dialog never asked about.
+
+        The dialog confirmed the typed name; save_target then changed its
+        suffix, and the file under the new name already exists.
+        """
+        name = os.path.basename(target.path)
+        dlg = Adw.AlertDialog(
+            heading="Replace %s?" % name,
+            body="This result saves as %s, and %s already exists." % (target.format.name, name))
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("replace", "Replace")
+        dlg.set_response_appearance("replace", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+
+        def answered(_dlg, response):
+            if response == "replace":
+                save()
+        dlg.connect("response", answered)
+        dlg.present(self)
+
+    def _save_copy(self, src, target, choices):
+        try:
+            shutil.copyfile(src, target.path)
+        except OSError as e:
+            self._toast("Save failed: %s" % e)
+            return
+        self._toast(_saved_notice(target, choices))
+
+    def _save_via_worker(self, src, target, choices, staging):
+        """Have the worker re-encode `src` as `target`; `staging` is ours to delete."""
+        rid = self.worker.send({"op": "convert", "input": src, "output": target.path})
+        if rid == -1:
+            if staging is not None:
+                _remove_quietly(staging)
+            self._toast("Save failed: the worker isn't running.")
+            return
+        self._pending_saves[rid] = _PendingSave(target, choices, staging)
+
+    def _on_save_reply(self, msg):
+        pending = self._pending_saves.pop(msg["id"])
+        if pending.staging is not None:
+            _remove_quietly(pending.staging)
+        if msg["type"] == "error":
+            first = msg["message"].splitlines()[0]
+            _log.warning("saving %s failed: %s", pending.target.path, first)
+            self._toast("Save failed: " + first)
+            return
+        self._toast(_saved_notice(pending.target, pending.choices))
 
     def _on_pick_input(self, *_):
         dlg = Gtk.FileDialog(title="Input folder")
@@ -1361,8 +1511,9 @@ class Window(Adw.ApplicationWindow):
         self._set_busy(True, cancel=True)
         self.src_panel.view.set_scanning(True)      # scan shimmer over the source
         self.status.set_text("Generating…")
-        self.worker.send({"op": "single", "input": inp, "output": out,
-                          "model": model, "alpha": alpha, "bg": bg, "blur": blur})
+        rid = self.worker.send({"op": "single", "input": inp, "output": out,
+                                "model": model, "alpha": alpha, "bg": bg, "blur": blur})
+        self._generating_alpha[rid] = _alpha_of(bg)
 
     def _generate_gif(self, model, bg, alpha, blur):
         # Same options as a still; the worker processes each frame and reports
@@ -1373,9 +1524,10 @@ class Window(Adw.ApplicationWindow):
         self._set_busy(True, cancel=True)
         self.src_panel.view.set_scanning(True)
         self.status.set_text("Removing background from GIF…")
-        self.worker.send({"op": "gif", "input": self.source_path, "output": out,
-                          "model": model, "alpha": alpha, "bg": bg, "blur": blur,
-                          "rot": v.rot, "fh": v.fh, "fv": v.fv})
+        rid = self.worker.send({"op": "gif", "input": self.source_path, "output": out,
+                                "model": model, "alpha": alpha, "bg": bg, "blur": blur,
+                                "rot": v.rot, "fh": v.fh, "fv": v.fv})
+        self._generating_alpha[rid] = _alpha_of(bg)
 
     def _on_bg_cancel(self):
         if not self.busy:
@@ -1404,6 +1556,10 @@ class Window(Adw.ApplicationWindow):
     # ---------- worker replies ----------
     def _on_worker_message(self, msg):
         t = msg.get("type")
+        rid = msg.get("id")
+        if rid in self._pending_saves and t in ("converted", "error"):
+            self._on_save_reply(msg)
+            return False
         if t == "ready":
             provs = msg.get("providers") or []
             if provs:
@@ -1435,6 +1591,7 @@ class Window(Adw.ApplicationWindow):
         elif t == "done_single":
             self.res_panel.view.load_file(msg["output"])
             self.result_output = msg["output"]
+            self._result_alpha = self._generating_alpha.pop(rid, formats.Alpha.TRANSPARENT)
             self.save_btn.set_sensitive(True)
             self.status.set_text("Done in %.2fs." % msg["seconds"])
             self._set_busy(False)
@@ -1449,11 +1606,13 @@ class Window(Adw.ApplicationWindow):
         elif t == "gif_done":
             self.res_panel.view.load_file(msg["output"])   # first-frame preview
             self.result_output = msg["output"]
+            self._result_alpha = self._generating_alpha.pop(rid, formats.Alpha.TRANSPARENT)
             self.save_btn.set_sensitive(True)
             self.status.set_text("Done: %d frames in %.1fs — Save the GIF."
                                  % (msg["frames"], msg["seconds"]))
             self._set_busy(False)
         elif t == "canceled":
+            self._generating_alpha.pop(rid, None)
             self._set_busy(False, spin=(msg.get("scope") != "batch"))
             if msg.get("scope") == "batch":
                 self.progress.set_text("cancelled")
@@ -1540,12 +1699,15 @@ class Window(Adw.ApplicationWindow):
             else:                                    # explicit Save → file dialog
                 self._seg_set_busy(False)
                 self.seg_status.set_text("Ready — choose where to save.")
-                self._seg_save_file(out)
+                alpha = self._seg_export_alpha.pop(rid, formats.Alpha.TRANSPARENT)
+                self._seg_save_file(out, alpha)
         elif t == "seg_canceled":
             self._seg_set_busy(False)
             self._unload("seg")            # free the SAM model + cached encode
             self.seg_status.set_text("Cancelled.")
         elif t == "error":
+            self._generating_alpha.pop(rid, None)
+            self._seg_export_alpha.pop(rid, None)
             first = msg["message"].splitlines()[0]
             self.status.set_text("Error: " + first)
             self.batch_status.set_text("Error: " + first)
@@ -1592,7 +1754,7 @@ class Window(Adw.ApplicationWindow):
             ("input-mouse-symbolic", "Hold Space to pan",
              "Space + drag moves the image without selecting. Scroll to zoom."),
             ("document-save-symbolic", "Save selection",
-             "Your picks composite live on the right; Save exports a PNG."),
+             "Your picks composite live on the right; Save exports a PNG or WebP."),
         ])
         group("Keyboard &amp; mouse", None, [
             ("input-keyboard-symbolic", "Space", "Hold to pan the canvas."),
@@ -1669,6 +1831,9 @@ class App(Adw.Application):
 
 
 def main():
+    # Shares the worker's log file, so one file tells the whole story.
+    logging.basicConfig(filename=LOG, level=logging.INFO,
+                        format="%(asctime)s frontend %(levelname)s: %(message)s")
     return App().run(sys.argv)
 
 
