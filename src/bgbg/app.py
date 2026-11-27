@@ -1646,6 +1646,10 @@ class App(Adw.Application):
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        if os.name == "nt":
+            # Windows has no .desktop file to name the window icon, so the
+            # taskbar showed Python's. install.ps1 puts the icon in a theme dir.
+            Gtk.Window.set_default_icon_name(APP_ID)
         about = Gio.SimpleAction.new("about", None)
         about.connect("activate", self._on_about)
         self.add_action(about)

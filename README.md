@@ -90,6 +90,45 @@ For a lean install with **only** segmentation (no rembg/BiRefNet):
 
 Uninstall with `./uninstall.sh` (add `--purge` to also remove the environment).
 
+## Windows
+
+bg-be-gone runs on Windows 10/11. The GTK frontend uses the MSYS2 UCRT64
+GTK4/libadwaita runtime; the ML worker runs in a separate CPython 3.12 venv.
+GPU acceleration uses **ROCm** (AMD's [TheRock](https://github.com/ROCm/TheRock)
+PyTorch build) on the AMD GPUs it supports, and **DirectML** — any DirectX 12
+GPU (NVIDIA, AMD, or Intel) — elsewhere, with a CPU fallback.
+
+Requirements: [uv](https://docs.astral.sh/uv/) and git. MSYS2 is downloaded and
+unpacked to `C:\msys64` if it is missing; that needs no admin rights.
+
+```powershell
+git clone https://github.com/cristeigabriela/bg-be-gone
+cd bg-be-gone
+.\install.ps1
+```
+
+If PowerShell refuses with "running scripts is disabled on this system", run
+`powershell -ExecutionPolicy Bypass -File .\install.ps1` instead.
+
+`install.ps1` installs the GTK runtime via MSYS2, builds the worker venv, and
+adds a Start Menu shortcut. Options:
+
+- `-Variant rocm|directml|cpu|cuda|seg`: the default is `rocm` when it finds an
+  AMD GPU that TheRock builds PyTorch for (RX 5000 and newer), and `directml`
+  otherwise.
+- `-GfxArch gfx1031`: the GPU's gfx target for `rocm`, if detection misses it.
+- `-SegmentOnly`: same as `-Variant seg`.
+
+With `rocm`, the BiRefNet models run on PyTorch, from the same checkpoints
+rembg's ONNX files were exported from, so the cutouts match rembg's. On an RX
+6750 XT that is 0.45 s per photo, where DirectML cannot fit those ONNX exports
+in 12 GB of VRAM. Segment Anything and the other models run on DirectML.
+
+The `rocm` venv is about 4 GB. Uninstall with `.\uninstall.ps1` (add `-Purge`
+to also remove the venv, the ROCm kernel cache and downloaded models). Models
+download on first use to `%LOCALAPPDATA%\bg-be-gone` (BiRefNet ~1 GB; SAM
+~110–770 MB). MSYS2 stays installed; delete `C:\msys64` to remove it.
+
 ## AppImage
 
 Each [release](../../releases) attaches several AppImages — pick one for your
