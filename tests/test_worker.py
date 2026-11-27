@@ -29,11 +29,11 @@ REPLY_TIMEOUT_S = 180
 class Worker:
     """The worker process, spoken to the way the frontend does."""
 
-    def __init__(self, log_path):
+    def __init__(self, log_path, env=None, command=None):
         self._log = open(log_path, "w")
         self.proc = subprocess.Popen(
-            [sys.executable, str(WORKER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=self._log, text=True, bufsize=1)
+            command or [sys.executable, str(WORKER)], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=self._log, text=True, bufsize=1, env=env)
         # A reader thread, so a worker that stalls fails the test at the
         # deadline instead of blocking readline() forever.
         self._replies = queue.Queue()
@@ -83,6 +83,35 @@ def worker(tmp_path):
     w.close()
 
 
+@pytest.fixture
+def engine_env(tmp_path):
+    """An environment that names no engine anywhere, whatever this machine has set.
+
+    An empty config folder, no BGBG_ENGINE, a profile that isn't there, and a
+    gpu.env that sets nothing.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "BGBG_ENGINE"}
+    env["XDG_CONFIG_HOME"] = str(tmp_path / "config")
+    env["BGBG_PROFILE"] = str(tmp_path / "no-profile.json")
+    env["BGBG_GPU_ENV"] = str(TESTDATA / "gpu-env" / "empty.env")
+    return env
+
+
+@pytest.fixture
+def start_worker(tmp_path):
+    """Start workers with a given environment; every one is shut down after the test."""
+    started = []
+
+    def start(env, command=None):
+        w = Worker(tmp_path / f"worker-{len(started)}.log", env=env, command=command)
+        started.append(w)
+        return w
+
+    yield start
+    for w in started:
+        w.close()
+
+
 def test_a_single_cutout_succeeds(worker, tmp_path):
     """rembg 2.0.61+ rejected the worker's session options with a TypeError,
     so every background removal failed before a model loaded."""
@@ -97,6 +126,40 @@ def test_a_single_cutout_succeeds(worker, tmp_path):
     alpha = Image.open(out).getchannel("A")
     assert alpha.getpixel(SUBJECT_PIXEL) > 224, "the subject stays opaque"
     assert alpha.getpixel(BACKGROUND_PIXEL) < 32, "the background becomes transparent"
+
+
+def test_the_ready_message_carries_every_field_the_frontend_reads(worker):
+    assert set(worker.ready) == {"type", "models", "providers", "bgremove", "seg",
+                                 "seg_models"}, "the frontend reads each of these on start-up"
+    assert worker.ready["providers"][-1] == "CPUExecutionProvider", \
+        "the CPU is always the last provider, so the status bar always has one to show"
+    assert "u2netp" in worker.ready["models"], "rembg's models are listed"
+
+
+def test_with_no_engine_set_start_up_says_nothing_but_ready(start_worker, engine_env):
+    """Every install today has no engine setting, and must start as it always did."""
+    w = start_worker(engine_env)
+    # A second "ready" marks the end of whatever start-up sent after the first.
+    _, seen = w.ask({"op": "models"}, until={"ready"})
+    assert [r["type"] for r in seen] == ["ready"], "no notice or other message at start-up"
+
+
+def test_asking_for_pytorch_keeps_onnx_runtime_and_says_so(start_worker, engine_env, tmp_path):
+    """Only ONNX Runtime exists so far: a torch request must not break removal.
+
+    The worker sees only the CPU, so the provider that runs is known.
+    """
+    cpu_only = [sys.executable, str(TESTDATA / "cpu_only_worker.py"), str(WORKER.parent)]
+    w = start_worker(dict(engine_env, BGBG_ENGINE="torch"), command=cpu_only)
+    reply, seen = w.ask(
+        {"op": "single", "model": "u2netp", "id": 3,
+         "input": str(TESTDATA / "subject.png"), "output": str(tmp_path / "cutout.png")},
+        until={"done_single", "error"})
+    notices = [r["message"] for r in seen if r.get("type") == "notice"]
+    assert any("PyTorch" in m for m in notices), "the user learns PyTorch isn't used"
+    assert reply["type"] == "done_single", "the cutout still succeeds: %s" % reply.get("message")
+    devices = [r["provider"] for r in seen if r.get("type") == "device"]
+    assert devices == ["CPUExecutionProvider"], "the run goes through onnxruntime, on the CPU"
 
 
 def test_an_unknown_model_is_named_in_the_error(worker, tmp_path):

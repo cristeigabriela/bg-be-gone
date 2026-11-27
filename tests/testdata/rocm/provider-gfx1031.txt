@@ -1,0 +1,1 @@
+Stands in for the ROCm provider: one offload bundle, amdgcn-amd-amdhsa--gfx1031, and nothing else.
