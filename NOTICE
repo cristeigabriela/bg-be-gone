@@ -33,6 +33,19 @@ Background removal is provided by rembg (MIT) and the ONNX models it downloads
 (BiRefNet, IS-Net, U^2-Net, Silueta), each under their respective licenses.
   https://github.com/danielgatis/rembg
 
+On installs with a GPU build of PyTorch (the Windows "rocm" variant), the
+BiRefNet models run natively instead, from the same checkpoints rembg's ONNX
+files were exported from:
+  - BiRefNet model code, vendored in src/bgbg/birefnet/ (inference only)
+    Copyright (c) 2024 ZhengPeng. Licensed under the MIT License
+    (src/bgbg/birefnet/LICENSE).
+    https://github.com/ZhengPeng7/BiRefNet (revision d8c386b)
+  - Its Swin Transformer backbone
+    Copyright (c) 2021 Microsoft. Licensed under the MIT License.
+    https://github.com/microsoft/Swin-Transformer
+  - Weights: BiRefNet's v1 release checkpoints, downloaded on first use.
+    https://github.com/ZhengPeng7/BiRefNet/releases/tag/v1
+
 ================================================================================
 Icon
 ================================================================================

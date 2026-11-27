@@ -23,6 +23,9 @@ gpu = ["onnxruntime-gpu"]
 line-length = 100
 target-version = "py39"
 src = ["src"]
+# Upstream's file, kept verbatim (see its header) so it stays diffable against
+# the code the BiRefNet checkpoints were exported from.
+extend-exclude = ["src/bgbg/birefnet/swin_v1.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B", "UP"]

@@ -255,6 +255,56 @@ try:
 except Exception:  # noqa: BLE001
     _HAVE_SEG = False
 
+
+def _local_dir(*parts):
+    """Per-user data under %LOCALAPPDATA%\\bg-be-gone, or the XDG cache."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "bg-be-gone", *parts)
+
+
+# BiRefNet on PyTorch, when the venv has a GPU build of it (the Windows rocm
+# install): the same checkpoints rembg's ONNX files were exported from, run
+# natively, since DirectML cannot fit those exports in VRAM. Everything else,
+# and every fallback, stays on onnxruntime.
+#
+# Importing the ROCm build of torch takes ~3 s warm on Windows and up to ~40 s
+# right after install (antivirus scans its DLLs), so it loads on a background
+# thread: the UI comes up at once, and only a BiRefNet job waits for it.
+_torch_bir = None
+torch = None
+_torch_ready = threading.Event()
+
+
+def _load_torch():
+    global _torch_bir, torch
+    try:
+        import torch as _t
+        import birefnet as _bir
+        if _bir.gpu_available():
+            # No per-shape kernel search: it re-runs on every launch, and on
+            # RDNA2 MIOpen's exhaustive search is known to hang.
+            _t.backends.cudnn.benchmark = False
+            torch, _torch_bir = _t, _bir
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        _torch_ready.set()
+
+
+if os.environ.get("BGBG_NO_TORCH"):
+    _torch_ready.set()
+else:
+    # MIOpen compiles kernels on first use; keep its cache between launches.
+    os.environ.setdefault("MIOPEN_USER_DB_PATH", _local_dir("miopen", "db"))
+    os.environ.setdefault("MIOPEN_CUSTOM_CACHE_DIR", _local_dir("miopen", "cache"))
+    threading.Thread(target=_load_torch, name="torch-init", daemon=True).start()
+# fp32 reproduces rembg's masks exactly; fp16 is ~20% faster on a typical
+# photo, with a mean difference of 0.03/255.
+_TORCH_DTYPE = "float16" if os.environ.get("BGBG_TORCH_DTYPE") == "fp16" else "float32"
+
 # Preference order; the first one onnxruntime can actually initialise wins.
 _PROVIDER_ORDER = [
     "CUDAExecutionProvider",
@@ -344,7 +394,20 @@ def _new_session(model, providers):
     return cls(model, _session_options(), providers=providers)
 
 
+def _is_torch(session):
+    return _torch_bir is not None and isinstance(session, _torch_bir.TorchSession)
+
+
 def get_session(model, req_id):
+    if model not in _sessions and model.startswith("birefnet-"):
+        _torch_ready.wait()
+    if model not in _sessions and _torch_bir is not None and model in _torch_bir.MODELS:
+        out({"type": "loading", "model": model, "id": req_id})
+        _sessions[model] = _torch_bir.TorchSession(
+            model, _local_dir("models", "birefnet"), dtype=getattr(torch, _TORCH_DTYPE))
+        out({"type": "device", "provider": "PyTorch",
+             "label": "AMD (ROCm)" if torch.version.hip else "NVIDIA (CUDA)",
+             "gpu": True, "id": req_id})
     if model not in _sessions:
         out({"type": "loading", "model": model, "id": req_id})
         sess = _new_session(model, preferred_providers())
@@ -403,8 +466,12 @@ def _remove_resilient(model, req_id, img, alpha):
         _fallback_notified.discard(model)      # GPU healthy again
         return res
     except Exception as e:
-        if not _is_ort_runtime_error(e):
+        # On PyTorch any RuntimeError is a run failure: out of VRAM, a HIP/CUDA
+        # error, or the non-finite mask TorchSession refuses to return.
+        if not (_is_ort_runtime_error(e) or (_is_torch(session) and isinstance(e, RuntimeError))):
             raise
+        if _is_torch(session):
+            torch.cuda.empty_cache()
         if model not in _fallback_notified:
             _fallback_notified.add(model)
             out({"type": "notice",
@@ -766,6 +833,8 @@ def handle_unload(req):
         freed.append("seg")
     if freed:
         gc.collect()
+        if _torch_bir is not None:
+            torch.cuda.empty_cache()   # hand PyTorch's cached VRAM back to the system
     out({"type": "unloaded", "scope": freed, "id": rid})
 
 
