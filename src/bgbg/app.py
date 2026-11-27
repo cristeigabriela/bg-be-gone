@@ -25,13 +25,13 @@ from gi.repository import Gtk, Gdk, GdkPixbuf, Gio, GLib, Adw  # noqa: E402
 
 from viewer import ImageView  # noqa: E402
 import formats  # noqa: E402
+import plat  # noqa: E402
 
 APP_ID = "io.github.cristeigabriela.BgBeGone"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-VENV_PY = (os.environ.get("BGBG_VENV_PYTHON")
-           or os.path.expanduser("~/.local/share/bg-be-gone/venv/bin/python"))
+VENV_PY = os.environ.get("BGBG_VENV_PYTHON") or plat.default_worker_python()
 WORKER = os.environ.get("BGBG_WORKER", os.path.join(APP_DIR, "worker.py"))
-LOG = os.path.join(GLib.get_user_cache_dir(), "bg-be-gone-worker.log")
+LOG = plat.worker_log_path()
 APP_VERSION = os.environ.get("BGBG_VERSION", "1.1.0")
 _log = logging.getLogger("bgbg")
 
@@ -278,7 +278,8 @@ class Worker:
             self._logf = open(LOG, "a")
             self.proc = subprocess.Popen(
                 [VENV_PY, WORKER], stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=self._logf, text=True, bufsize=1)
+                stdout=subprocess.PIPE, stderr=self._logf, text=True, bufsize=1,
+                creationflags=plat.subprocess_flags(), env=plat.worker_env())
             threading.Thread(target=self._reader, daemon=True).start()
             self.ok = True
         except Exception as e:
@@ -1897,6 +1898,7 @@ class App(Adw.Application):
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        plat.frontend_started(APP_ID)
         about = Gio.SimpleAction.new("about", None)
         about.connect("activate", self._on_about)
         self.add_action(about)
@@ -1940,6 +1942,9 @@ class App(Adw.Application):
 
 
 def main():
+    # On Windows the log sits in the app's own data folder, which the first
+    # start has to make; GLib's cache folder on Linux already exists.
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
     # Shares the worker's log file, so one file tells the whole story.
     logging.basicConfig(filename=LOG, level=logging.INFO,
                         format="%(asctime)s frontend %(levelname)s: %(message)s")
