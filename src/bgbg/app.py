@@ -24,10 +24,28 @@ from viewer import ImageView  # noqa: E402
 
 APP_ID = "io.github.cristeigabriela.BgBeGone"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-VENV_PY = (os.environ.get("BGBG_VENV_PYTHON")
-           or os.path.expanduser("~/.local/share/bg-be-gone/venv/bin/python"))
+
+
+def _default_venv_python():
+    """Fallback worker interpreter when BGBG_VENV_PYTHON is unset. The launcher
+    normally sets it, so this only matters for a bare `python app.py`."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "bg-be-gone", "worker", "Scripts", "python.exe")
+    return os.path.expanduser("~/.local/share/bg-be-gone/venv/bin/python")
+
+
+VENV_PY = os.environ.get("BGBG_VENV_PYTHON") or _default_venv_python()
 WORKER = os.environ.get("BGBG_WORKER", os.path.join(APP_DIR, "worker.py"))
-LOG = os.path.join(GLib.get_user_cache_dir(), "bg-be-gone-worker.log")
+# Keep the worker's console hidden when the frontend runs under pythonw (Windows).
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+if os.name == "nt":
+    # GLib's user cache dir on Windows is the Internet Explorer cache
+    # (...\Microsoft\Windows\INetCache), so keep the log with the app's data.
+    LOG = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                       "bg-be-gone", "bg-be-gone-worker.log")
+else:
+    LOG = os.path.join(GLib.get_user_cache_dir(), "bg-be-gone-worker.log")
 APP_VERSION = os.environ.get("BGBG_VERSION", "1.1.0")
 
 SUBJECTS = [
@@ -204,10 +222,12 @@ class Worker:
         self.ok = False
         self.error = None
         try:
+            os.makedirs(os.path.dirname(LOG), exist_ok=True)
             self._logf = open(LOG, "a")
             self.proc = subprocess.Popen(
                 [VENV_PY, WORKER], stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=self._logf, text=True, bufsize=1)
+                stdout=subprocess.PIPE, stderr=self._logf, text=True, bufsize=1,
+                creationflags=_NO_WINDOW)
             threading.Thread(target=self._reader, daemon=True).start()
             self.ok = True
         except Exception as e:

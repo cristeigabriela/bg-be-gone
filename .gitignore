@@ -8,6 +8,7 @@ venv/
 # Build / packaging
 build/
 dist/
+dist-out/
 AppDir/
 *.AppImage
 *.AppImage.zsync

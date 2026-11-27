@@ -173,6 +173,25 @@ def _load_gpu_env():
         return
 
 
+def _ensure_gpu_libs_windows():
+    """Make venv-bundled NVIDIA CUDA/cuDNN DLLs importable on Windows.
+
+    The nvidia-*-cu12 pip wheels ship their DLLs under
+    ``Lib\\site-packages\\nvidia\\<component>\\bin``. Windows has no
+    LD_LIBRARY_PATH and os.execv doesn't re-exec in place, so instead we add
+    each directory to the DLL search path before onnxruntime is imported.
+    Harmless no-op for the CPU/DirectML builds (no ``nvidia`` package present).
+    """
+    site = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(sys.executable))),
+        "Lib", "site-packages")
+    for d in glob.glob(os.path.join(site, "nvidia", "*", "bin")):
+        try:
+            os.add_dll_directory(d)
+        except OSError:
+            pass
+
+
 def _ensure_gpu_libs():
     """Put any venv-bundled NVIDIA CUDA/cuDNN libs on LD_LIBRARY_PATH.
 
@@ -181,6 +200,9 @@ def _ensure_gpu_libs():
     re-exec once if necessary. AMD/ROCm libs come from the system loader path,
     so nothing to do there.
     """
+    if os.name == "nt":
+        _ensure_gpu_libs_windows()
+        return
     venv = os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
     libdirs = glob.glob(os.path.join(
         venv, "lib", "python*", "site-packages", "nvidia", "*", "lib"))
@@ -210,6 +232,12 @@ import warnings  # noqa: E402
 
 from PIL import Image, ImageFilter  # noqa: E402
 import onnxruntime as ort  # noqa: E402
+
+# Keep BiRefNet/U2Net weights under %LOCALAPPDATA% on Windows instead of
+# %USERPROFILE%\.u2net. Must precede the rembg import (rembg reads it at import).
+if os.name == "nt" and not os.environ.get("U2NET_HOME"):
+    _base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    os.environ["U2NET_HOME"] = os.path.join(_base, "bg-be-gone", "u2net")
 
 # Background removal is optional (a segmentation-only install ships without it).
 try:
@@ -287,7 +315,7 @@ def provider_names():
 # The first inference of a session still warms up (memory alloc, kernel load),
 # so the first generation is a little slower; the UI mentions this.
 _GPU_PROVIDERS = {"CUDAExecutionProvider", "ROCMExecutionProvider",
-                  "MIGraphXExecutionProvider"}
+                  "MIGraphXExecutionProvider", "DmlExecutionProvider"}
 
 
 def _session_options():
@@ -354,7 +382,8 @@ def _is_ort_runtime_error(e):
     m = str(e).lower()
     return ("onnxruntimeerror" in m or "non-zero status" in m
             or "out of memory" in m or "cuda" in m or "cudnn" in m
-            or "failed to allocate" in m or "hiperroroutofmemory" in m)
+            or "failed to allocate" in m or "hiperroroutofmemory" in m
+            or "dml" in m or "d3d12" in m or "directml" in m)
 
 
 def _remove_resilient(model, req_id, img, alpha):

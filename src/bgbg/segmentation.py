@@ -29,11 +29,21 @@ import onnxruntime as ort
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-_CACHE_HOME = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-_CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-MODELS_DIR = os.path.join(_CACHE_HOME, "bg-be-gone", "models")
-CONFIG_DIR = os.path.join(_CONFIG_HOME, "bg-be-gone")
+if os.name == "nt":
+    # Idiomatic Windows locations under %LOCALAPPDATA%\bg-be-gone.
+    _APPDATA = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    MODELS_DIR = os.path.join(_APPDATA, "bg-be-gone", "models")
+    CONFIG_DIR = os.path.join(_APPDATA, "bg-be-gone", "config")
+else:
+    _CACHE_HOME = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    _CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    MODELS_DIR = os.path.join(_CACHE_HOME, "bg-be-gone", "models")
+    CONFIG_DIR = os.path.join(_CONFIG_HOME, "bg-be-gone")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "seg.json")
+
+# Suppress console-window flashes from probe subprocesses when the frontend
+# runs under pythonw (Windows). No-op elsewhere.
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 _HF = "https://huggingface.co"
 
@@ -127,7 +137,8 @@ def probe_vram():
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total,memory.free",
              "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=6)
+            capture_output=True, text=True, timeout=6,
+            creationflags=_CREATE_NO_WINDOW)
         if r.returncode == 0 and r.stdout.strip():
             total, free = (int(x) for x in r.stdout.strip().splitlines()[0].split(","))
             return {"total": total, "free": free, "gpu": True}
@@ -135,7 +146,8 @@ def probe_vram():
         pass
     try:
         r = subprocess.run(["rocm-smi", "--showmeminfo", "vram", "--csv"],
-                           capture_output=True, text=True, timeout=6)
+                           capture_output=True, text=True, timeout=6,
+                           creationflags=_CREATE_NO_WINDOW)
         if r.returncode == 0:
             total = used = None
             for line in r.stdout.splitlines():
