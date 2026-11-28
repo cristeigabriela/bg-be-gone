@@ -11,10 +11,10 @@ Background removal needs ``rembg`` (imported lazily); segmentation needs only
 can be absent — a segmentation-only install ships without rembg.
 
 Requests (one JSON object per line on stdin):
-  {"op":"single","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"id":N}
+  {"op":"single","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":S,"id":N}
   {"op":"batch","input_dir":D,"output_dir":D,"model":M,"alpha":bool,"bg":BG,
    "pattern":"{name}_nobg","id":N}
-  {"op":"gif","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":int,
+  {"op":"gif","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":S,
    "rot":0..3,"fh":bool,"fv":bool,"id":N}   # per-frame background removal;
                                              # GIF or WebP (animated) by output
   {"op":"convert","input":P,"output":P,"id":N}   # re-encode as output's format
@@ -31,7 +31,8 @@ Requests (one JSON object per line on stdin):
   {"op":"engine_status","id":N}              # waits for PyTorch's start-up, if any
   {"op":"shutdown"}
 
-BG is "transparent", "blur" or "#rrggbb" to flatten onto.
+BG is "transparent", "blur" or "#rrggbb" to flatten onto. S is the blur
+strength, 1-100, relative to the picture's size (background.py).
 
 Responses (one JSON object per line on stdout):
   {"type":"ready","models":[...],"providers":[...],"seg":bool,"bgremove":bool,
@@ -92,11 +93,12 @@ import traceback  # noqa: E402
 import warnings  # noqa: E402
 import urllib.error  # noqa: E402
 
-from PIL import Image, ImageFilter, UnidentifiedImageError  # noqa: E402
+from PIL import Image, UnidentifiedImageError  # noqa: E402
 # Imports onnxruntime, then rembg when it is installed.
 from engines import ort as ort_engine  # noqa: E402
 from engines import selection  # noqa: E402
 from engines import torch_birefnet  # noqa: E402  (imports no torch itself)
+import background  # noqa: E402
 import batchnames  # noqa: E402
 import formats  # noqa: E402
 
@@ -320,6 +322,22 @@ def _remove_resilient(model, req_id, img, alpha):
         return res
 
 
+def _straight_cutout(img, cut, alpha_matting):
+    """The cut-out with the picture's own colours under its alpha.
+
+    Without alpha matting, rembg blends the picture with transparent black
+    by the mask, so a soft edge's colours are darkened by its own alpha:
+    a dark rim on whatever background it's put onto. Alpha matting's
+    cut-out already holds the estimated foreground colours, so it's kept.
+    """
+    cut = cut.convert("RGBA")
+    if alpha_matting:
+        return cut
+    straight = img.convert("RGB").convert("RGBA")
+    straight.putalpha(cut.getchannel("A"))
+    return straight
+
+
 def _hex_to_rgb(s):
     s = s.lstrip("#")
     return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
@@ -521,33 +539,31 @@ def handle_frames(req):
     out({"type": "frames", "frames": getattr(im, "n_frames", 1), "id": req.get("id")})
 
 
-def process_one(model, req_id, src, dst, alpha, bg, blur=20, want_preview=False):
+def process_one(model, req_id, src, dst, alpha, bg, blur=background.STRENGTH_DEFAULT,
+                want_preview=False):
     img = _plain(open_image(src))
-    res = _remove_resilient(model, req_id, img, alpha).convert("RGBA")
+    res = _straight_cutout(img, _remove_resilient(model, req_id, img, alpha), alpha)
+    return _write_result(img, res, dst, bg, blur, want_preview)
 
-    preview_path = None
-    if bg == "transparent":
-        res.save(dst)
-        if want_preview:
-            board = _checkerboard(res.size).convert("RGBA")
-            board.alpha_composite(res)
-            preview_path = dst + ".preview.png"
-            board.convert("RGB").save(preview_path)
-    elif bg == "blur":
-        # Keep the picture, blur only the background: sharp foreground (the
-        # model's cutout) composited over a Gaussian-blurred copy of the source.
-        base = img.convert("RGB").filter(ImageFilter.GaussianBlur(max(1, blur)))
-        base = base.convert("RGBA")
-        base.alpha_composite(res)
-        base.convert("RGB").save(dst)
-        if want_preview:
-            preview_path = dst
-    else:
-        flat = Image.new("RGBA", res.size, _hex_to_rgb(bg) + (255,))
-        flat.alpha_composite(res)
-        flat.convert("RGB").save(dst)
-        if want_preview:
-            preview_path = dst
+
+def _write_result(img, res, dst, bg, blur, want_preview):
+    """Write cut-out `res` of picture `img` onto background `bg` at `dst`.
+
+    Stills and animation frames compose through _compose_frame, so a blur
+    strength means the same everywhere. Returns the preview's path (a
+    checkered copy of a transparent result), `dst` itself, or None without a
+    preview.
+    """
+    if bg != "transparent":
+        _compose_frame(img, res, bg, blur).convert("RGB").save(dst)
+        return dst if want_preview else None
+    res.save(dst)
+    if not want_preview:
+        return None
+    board = _checkerboard(res.size).convert("RGBA")
+    board.alpha_composite(res)
+    preview_path = dst + ".preview.png"
+    board.convert("RGB").save(preview_path)
     return preview_path
 
 
@@ -557,7 +573,7 @@ def handle_single(req):
     t = time.time()
     preview = process_one(req["model"], rid, req["input"], req["output"],
                           req.get("alpha", False), req.get("bg", "transparent"),
-                          req.get("blur", 20), want_preview=True)
+                          req.get("blur", background.STRENGTH_DEFAULT), want_preview=True)
     if _cancel.is_set():                    # a single inference can't be stopped
         out({"type": "canceled", "scope": "single", "id": rid})   # mid-run; drop it
         return
@@ -624,7 +640,7 @@ def handle_batch(req):
     get_session(req["model"], rid)         # load + emit the device message
     alpha = req.get("alpha", False)
     bg = req.get("bg", "transparent")
-    blur = req.get("blur", 20)
+    blur = req.get("blur", background.STRENGTH_DEFAULT)
     taken = batchnames.taken_by(files)     # a source is never an output
     renamed = 0                            # results written under a numbered name
     failed = []                            # [{"name", "message"}], in order
@@ -694,13 +710,17 @@ def _apply_transform(im, rot, fh, fv):
     return im
 
 
-def _compose_frame(orig_rgba, cut_rgba, bg, blur):
-    """Apply the chosen background to one processed frame; returns RGBA."""
+def _compose_frame(orig, cut_rgba, bg, blur):
+    """Put cut-out `cut_rgba` of picture `orig` onto background `bg`; returns RGBA.
+
+    "blur" keeps the picture and blurs only the background: the sharp cut-out
+    over the picture's background blurred without it, by strength `blur`
+    (background.blur_behind).
+    """
     if bg == "transparent":
         return cut_rgba
     if bg == "blur":
-        base = orig_rgba.convert("RGB").filter(
-            ImageFilter.GaussianBlur(max(1, blur))).convert("RGBA")
+        base = background.blur_behind(orig, cut_rgba.getchannel("A"), blur).convert("RGBA")
     else:
         base = Image.new("RGBA", cut_rgba.size, _hex_to_rgb(bg) + (255,))
     base.alpha_composite(cut_rgba)
@@ -752,7 +772,7 @@ def handle_gif(req):
     src, dst, model = req["input"], req["output"], req["model"]
     alpha = req.get("alpha", False)
     bg = req.get("bg", "transparent")
-    blur = int(req.get("blur", 20))
+    blur = req.get("blur", background.STRENGTH_DEFAULT)
     rot = int(req.get("rot", 0))
     fh, fv = bool(req.get("fh")), bool(req.get("fv"))
     im = open_image(src)
@@ -774,7 +794,7 @@ def handle_gif(req):
             frame = _apply_transform(im.convert("RGBA"), rot, fh, fv)
             # After decoding: a WebP frame's duration is set only once it loads.
             durations.append(im.info.get("duration", 100))
-            cut = _remove_resilient(model, rid, frame, alpha).convert("RGBA")
+            cut = _straight_cutout(frame, _remove_resilient(model, rid, frame, alpha), alpha)
             fp = os.path.join(framedir, "f%05d.png" % i)
             _compose_frame(frame, cut, bg, blur).save(fp)
             paths.append(fp)
@@ -936,7 +956,7 @@ def handle_seg_extract(req):
     rid = req.get("id")
     dst = req["output"]
     bg = req.get("bg", "transparent")
-    blur = int(req.get("blur", 20))
+    blur = req.get("blur", background.STRENGTH_DEFAULT)
     if req.get("mask"):
         paths = [req["mask"]]
     elif "masks" in req:

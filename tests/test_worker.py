@@ -314,3 +314,22 @@ def test_an_animated_webp_comes_back_animated_with_its_timing(worker, tmp_path):
     assert durations == [80, 120, 160], "each frame keeps its own duration"
     assert Image.open(reply["preview"]).format == "PNG", \
         "a PNG first frame stands in where GdkPixbuf has no WebP loader"
+
+
+def test_a_soft_edge_keeps_the_pictures_own_colours(worker, tmp_path):
+    """rembg darkens a soft edge's colours by its alpha; on a new background
+    that showed as a dark rim around the subject."""
+    out = tmp_path / "cutout.png"
+    reply, _ = worker.ask(
+        {"op": "single", "model": "u2netp", "id": 1, "input": str(TESTDATA / "subject.png"),
+         "output": str(out)},
+        until={"done_single", "error"})
+    assert reply["type"] == "done_single", reply.get("message")
+    cut = Image.open(out).convert("RGBA")
+    picture = Image.open(TESTDATA / "subject.png").convert("RGB")
+    soft = [(x, y) for x in range(cut.width) for y in range(cut.height)
+            if 16 < cut.getpixel((x, y))[3] < 240]
+    assert soft, "the cut-out has a soft edge to check"
+    for xy in soft:
+        assert cut.getpixel(xy)[:3] == picture.getpixel(xy), \
+            f"the edge pixel at {xy} has the picture's colour, not one darkened by its alpha"

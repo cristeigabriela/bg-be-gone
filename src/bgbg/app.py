@@ -35,6 +35,7 @@ from viewer import (  # noqa: E402
     Transform,
     transform_pixbuf,
 )
+import background  # noqa: E402
 import batchnames  # noqa: E402
 import formats  # noqa: E402
 from gi.repository import GObject, Graphene, Gsk, Pango  # noqa: E402
@@ -1185,7 +1186,9 @@ class Window(Adw.ApplicationWindow):
         colour = Gdk.RGBA()
         if isinstance(s.get("custom_colour"), str) and colour.parse(s["custom_colour"]):
             self.color_btn.set_rgba(colour)
-        blur = s.get("blur")
+        # "blur_strength", not the old "blur": that one was a radius in pixels,
+        # which means something else on this scale, so it's left unread.
+        blur = s.get("blur_strength")
         if isinstance(blur, (int, float)) and not isinstance(blur, bool) and math.isfinite(blur):
             self.blur_row.set_value(blur)          # the row clamps it to its range
         for key, row in (("batch_input", self.in_row), ("batch_output", self.out_row)):
@@ -1205,7 +1208,7 @@ class Window(Adw.ApplicationWindow):
         self.color_btn.connect("notify::rgba", lambda *_: self._remember(
             custom_colour=self.color_btn.get_rgba().to_string()))
         self.blur_row.connect("notify::value", lambda *_: self._remember(
-            blur=int(self.blur_row.get_value())))
+            blur_strength=int(self.blur_row.get_value())))
 
     def _remember(self, **values):
         """Save the `values` that changed; a failure is logged once and shown once."""
@@ -1296,10 +1299,12 @@ class Window(Adw.ApplicationWindow):
         self.color_row.set_sensitive(False)
         out_grp.add(self.color_row)
 
+        # A share of the picture's size (background.py), so it looks the same on any photo.
         self.blur_row = Adw.SpinRow(
-            title="Blur strength",
-            adjustment=Gtk.Adjustment(value=20, lower=2, upper=80,
-                                      step_increment=1, page_increment=5))
+            title="Blur strength", subtitle="The same look on any photo size",
+            adjustment=Gtk.Adjustment(
+                value=background.STRENGTH_DEFAULT, lower=background.STRENGTH_MIN,
+                upper=background.STRENGTH_MAX, step_increment=1, page_increment=5))
         self.blur_row.set_visible(False)
         out_grp.add(self.blur_row)
 
