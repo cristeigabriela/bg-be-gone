@@ -84,7 +84,8 @@ builds the worker environment, and registers the app. Launch `bg-be-gone`, open
 it from your app menu, or right-click an image and choose *Open With*.
 
 The installer offers to download the default background-removal model now
-(BiRefNet General, ~970 MB, to `~/.u2net/`), so the first run works offline; it
+(BiRefNet General, ~970 MB, to rembg's model folder: `~/.rembg/`, or `~/.u2net/`
+with older rembg releases), so the first run works offline; it
 asks on a terminal, with yes as the default. Pass `--no-model-download` to skip
 it, and the first background removal downloads it instead. The first
 segmentation downloads a SAM model (~110–770 MB depending on your GPU/VRAM) to

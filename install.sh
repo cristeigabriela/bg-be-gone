@@ -86,6 +86,19 @@ gi.require_version('Adw', '1'); from gi.repository import Gtk, Adw" 2>&1)"; then
 
 DEFAULT_MODEL="birefnet-general"
 
+# Where the worker's rembg keeps its models, asked of that rembg: the default
+# moved from ~/.u2net (2.0.76) to ~/.rembg (2.0.88); U2NET_HOME still wins.
+rembg_home() {
+  "$VENV/bin/python" -I -c \
+    'from rembg.sessions.base import BaseSession; print(BaseSession.u2net_home())'
+}
+
+# rembg 2.0.88 keeps a model in <home>/models/<name>/; 2.0.76, in <home>.
+model_downloaded() {
+  [ -f "$U2NET_DIR/$DEFAULT_MODEL.onnx" ] ||
+    [ -f "$U2NET_DIR/models/$DEFAULT_MODEL/$DEFAULT_MODEL.onnx" ]
+}
+
 fetch_default_model() {
   [ "$SEGMENT_ONLY" = 1 ] && return
   if [ "$FETCH_MODEL" = no ]; then
@@ -460,9 +473,13 @@ make_venv
 # Runs on every install, not just a fresh venv: a driver, ROCm or wheel upgrade
 # can change which arch actually works.
 if [ "$VENDOR" = amd ]; then configure_rocm; else rm -f "$GPU_ENV"; fi
-# Where rembg keeps its models (its own default when U2NET_HOME is unset).
-U2NET_DIR="${U2NET_HOME:-${XDG_DATA_HOME:-$HOME}/.u2net}"
-if [ "$SEGMENT_ONLY" != 1 ] && [ -f "$U2NET_DIR/$DEFAULT_MODEL.onnx" ]; then
+# A segmentation-only build has no rembg, and no model of its to fetch.
+U2NET_DIR=""
+if [ "$SEGMENT_ONLY" != 1 ] && ! U2NET_DIR="$(rembg_home)"; then
+  warn "Couldn't ask rembg where it keeps its models."
+  U2NET_DIR="${U2NET_HOME:-$HOME/.rembg}"
+fi
+if [ "$SEGMENT_ONLY" != 1 ] && model_downloaded; then
   ok "$DEFAULT_MODEL is already downloaded"
 else
   fetch_default_model
@@ -473,7 +490,7 @@ msg "The app runs from this folder ($ROOT): keep it here. After moving it, run .
 if [ "$SEGMENT_ONLY" = 1 ]; then
   msg "Segmentation-only build. First segment downloads a SAM model to"
   msg "  ~/.cache/bg-be-gone/models/ (~110-770 MB depending on your GPU/VRAM)."
-elif [ ! -f "$U2NET_DIR/$DEFAULT_MODEL.onnx" ]; then
+elif ! model_downloaded; then
   msg "First background removal downloads the model (~1 GB) to $U2NET_DIR/."
   msg "First segmentation downloads a SAM model to ~/.cache/bg-be-gone/models/."
 else
