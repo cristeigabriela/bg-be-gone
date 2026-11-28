@@ -352,24 +352,155 @@ function Remove-Inventory {
     @(Get-TreeFiles $rootFull)
 }
 
-function Remove-CacheTree {
-    <#
-    .SYNOPSIS
-      Delete a cache bg-be-gone fills at run time (models, kernels), refusing
-      any reparse point at $Path or inside it before deleting anything.
-    #>
-    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    Assert-NoReparseBelow -Root $Root -Path $Path
-    if (Test-Path -LiteralPath $Path -PathType Container) {
-        $null = Get-TreeFiles $Path   # throws on a reparse point inside
+function Get-DataUserRecord {
+    <# The record file that says $Prefix uses $DataDir. #>
+    param([Parameter(Mandatory)][string]$DataDir, [Parameter(Mandatory)][string]$Prefix)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha.ComputeHash($script:Utf8NoBom.GetBytes($Prefix.TrimEnd('\').ToLowerInvariant()))
+    } finally {
+        $sha.Dispose()
     }
-    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+    $id = -join ($bytes[0..7] | ForEach-Object { $_.ToString('x2') })
+    Join-Path $DataDir "installs\$id.json"
 }
 
-# ---------------------------------------------------------------------------
-# The worker
-# ---------------------------------------------------------------------------
+function Register-DataUser {
+    <#
+    .SYNOPSIS
+      Record that the install at $Prefix keeps its models and settings in
+      $DataDir, which every install of this user shares.
+    #>
+    param([Parameter(Mandatory)][string]$DataDir, [Parameter(Mandatory)][string]$Prefix)
+    $record = Get-DataUserRecord $DataDir $Prefix
+    Assert-NoReparseBelow -Root $DataDir -Path $record
+    New-Item -ItemType Directory -Force (Split-Path -Parent $record) -ErrorAction Stop | Out-Null
+    Write-Utf8File $record (@{ root = $Prefix.TrimEnd('\') } | ConvertTo-Json)
+}
+
+function Unregister-DataUser {
+    <# Drop $Prefix's record from $DataDir, and the records folder once empty. #>
+    param([Parameter(Mandatory)][string]$DataDir, [Parameter(Mandatory)][string]$Prefix)
+    $record = Get-DataUserRecord $DataDir $Prefix
+    # From the data folder down to the record, so neither the record nor its
+    # folder is deleted through a junction.
+    Assert-NoReparseBelow -Root $DataDir -Path $record
+    if (Test-Path -LiteralPath $record -PathType Leaf) { Remove-Item -LiteralPath $record -Force }
+    $dir = Split-Path -Parent $record
+    if ((Test-Path -LiteralPath $dir) -and -not (Get-ChildItem -LiteralPath $dir -Force | Select-Object -First 1)) {
+        Remove-Item -LiteralPath $dir -Force
+    }
+}
+
+function Test-InstallAt {
+    <#
+    True when $Path holds a bg-be-gone install: a manifest, or the files an
+    install made before there were manifests. Generous on purpose: it decides
+    whether shared data is kept.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    foreach ($marker in 'bg-be-gone-install.json', 'BgBeGone.cmd', 'BgBeGone.vbs',
+                        'worker\python.exe', 'worker\pyvenv.cfg') {
+        if (Test-Path -LiteralPath (Join-Path $Path $marker) -PathType Leaf) { return $true }
+    }
+    $false
+}
+
+function Get-OtherDataUser {
+    <#
+    .SYNOPSIS
+      The other installs that still keep their models and settings in
+      $DataDir: recorded ones whose folder still holds an install, and an
+      install inside $DataDir itself (the default prefix), which may predate
+      the records.
+    #>
+    param([Parameter(Mandatory)][string]$DataDir, [Parameter(Mandatory)][string]$Prefix)
+    $me = $Prefix.TrimEnd('\')
+    $roots = @()
+    $records = Join-Path $DataDir 'installs'
+    if (Test-Path -LiteralPath $records) {
+        foreach ($file in Get-ChildItem -LiteralPath $records -Filter '*.json' -File) {
+            try { $roots += (Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json).root } catch {
+                Write-Warning "Unreadable install record $($file.FullName): $_"
+            }
+        }
+    }
+    $roots += $DataDir.TrimEnd('\')
+    @($roots | Where-Object { $_ -and -not [string]::Equals($_.TrimEnd('\'), $me, [StringComparison]::OrdinalIgnoreCase) } |
+        Select-Object -Unique | Where-Object { Test-InstallAt $_ })
+}
+
+function Get-OwnedDataFile {
+    <#
+    .SYNOPSIS
+      The files under $DataDir that bg-be-gone downloads or generates, for
+      uninstall -Purge. Anything else there (a model the user put in
+      models\) is not listed.
+
+    .DESCRIPTION
+      Each pattern names the code that writes it.
+    #>
+    param([Parameter(Mandatory)][string]$DataDir)
+    $patterns = @(
+        # rembg's downloads: U2NET_HOME is this folder, its files <model>.onnx (plat/windows.py).
+        @{ Dir = 'u2net'; Filter = '*.onnx' }
+        # engines/torch_birefnet.py: BiRefNet checkpoints, their check records, partial downloads.
+        @{ Dir = 'models\birefnet'; Filter = 'BiRefNet-*.pth' }
+        @{ Dir = 'models\birefnet'; Filter = 'BiRefNet-*.pth.verified' }
+        @{ Dir = 'models\birefnet'; Filter = '*.part' }
+        # segmentation.py: MobileSAM's two files, SAM 2.1's zips and their extracted pairs.
+        @{ Dir = 'models'; Filter = 'mobile_sam_image_encoder.onnx*' }
+        @{ Dir = 'models'; Filter = 'sam_mask_decoder_single.onnx*' }
+        @{ Dir = 'models'; Filter = 'sam2.1_hiera_*.zip*' }
+        @{ Dir = 'models\sam2.1_hiera_*'; Filter = 'sam2.1_hiera_*.*coder.onnx' }
+        # Settings the app writes (engines/selection.py, segmentation.py).
+        @{ Dir = 'config'; Filter = 'settings.json*' }
+        @{ Dir = 'config'; Filter = 'seg.json' }
+        # The frontend's and worker's log (plat/windows.py).
+        @{ Dir = '.'; Filter = 'bg-be-gone-worker.log' }
+        # Install records (Register-DataUser).
+        @{ Dir = 'installs'; Filter = '*.json' }
+    )
+    foreach ($p in $patterns) {
+        foreach ($dir in @(Get-Item -Path (Join-Path $DataDir $p.Dir) -ErrorAction SilentlyContinue | Where-Object PSIsContainer)) {
+            Get-ChildItem -LiteralPath $dir.FullName -Filter $p.Filter -File -Force | ForEach-Object FullName
+        }
+    }
+    # MIOpen's kernel cache (plat.kernel_cache_dir()): everything in it is generated.
+    $miopen = Join-Path $DataDir 'miopen'
+    if (Test-Path -LiteralPath $miopen -PathType Container) {
+        Get-ChildItem -LiteralPath $miopen -Recurse -File -Force | ForEach-Object FullName
+    }
+}
+
+function Remove-OwnedData {
+    <#
+    .SYNOPSIS
+      Delete what Get-OwnedDataFile lists, then the folders that leaves
+      empty, down from $DataDir. Nothing is deleted through a reparse point.
+
+    .OUTPUTS
+      How many files were removed.
+    #>
+    param([Parameter(Mandatory)][string]$DataDir)
+    $root = [IO.Path]::GetFullPath($DataDir).TrimEnd('\')
+    $cache = @{}
+    $files = @(Get-OwnedDataFile $root)
+    foreach ($f in $files) { Assert-NoReparseBelow -Root $root -Path $f -Cache $cache }
+    $dirs = @{}
+    foreach ($f in $files) {
+        [IO.File]::SetAttributes($f, [IO.FileAttributes]::Normal)
+        [IO.File]::Delete($f)
+        for ($d = [IO.Path]::GetDirectoryName($f); $d.Length -gt $root.Length; $d = [IO.Path]::GetDirectoryName($d)) { $dirs[$d] = $true }
+    }
+    foreach ($d in ($dirs.Keys | Sort-Object Length -Descending)) {
+        if ([IO.Directory]::Exists($d) -and -not [IO.Directory]::EnumerateFileSystemEntries($d).GetEnumerator().MoveNext()) {
+            [IO.Directory]::Delete($d)
+        }
+    }
+    $files.Count
+}
+
 function Get-WorkerPython {
     <# The interpreter inside a worker folder. #>
     param([Parameter(Mandatory)][string]$WorkerDir)
@@ -773,7 +904,8 @@ function New-AppIcon {
 Export-ModuleMember -Function Write-Utf8File, Invoke-NativeShown, New-UniqueName, New-PrivateTempDir,
     Test-ReparsePoint, Assert-NoReparseBelow, Get-TreeFiles, Write-Inventory, Test-Inventory,
     Read-Inventory, Update-Inventory, Test-LegacyInstall,
-    Remove-Inventory, Write-LegacyInventory, Remove-CacheTree, Get-WorkerPython, New-WorkerPython,
+    Remove-Inventory, Write-LegacyInventory, Get-OwnedDataFile, Remove-OwnedData, Register-DataUser, Unregister-DataUser, Test-InstallAt, Get-OtherDataUser,
+    Get-WorkerPython, New-WorkerPython,
     Install-LockedPackage, New-WorkerStartInfo, Invoke-WorkerPython, Test-Worker,
     Write-WorkerRecord, Complete-Worker, Switch-Worker, Get-LaunchCommand, Install-LaunchModule,
     ConvertTo-CommandLine,

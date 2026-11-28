@@ -140,7 +140,9 @@ must not hold a `%`: the shortcut then names it on its command line.
 that folder's inventory lists. Files anyone else put there stay, and nothing
 is removed through a junction or symbolic link. Add `-Purge` to also remove
 the downloaded models (BiRefNet about 1 GB; SAM 110-770 MB), settings, and the
-log. An MSYS2 passed with `-Msys2Root` is never touched.
+log. Every install of a user shares those, in `%LOCALAPPDATA%\bg-be-gone`, so
+`-Purge` keeps them while another install still uses them, and says which.
+An MSYS2 passed with `-Msys2Root` is never touched.
 
 ## AppImage
 

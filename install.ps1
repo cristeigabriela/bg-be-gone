@@ -155,6 +155,7 @@ function Save-Manifest {
         variant     = $Variant
         source      = $Root
         msys2_root  = $Msys2Root
+        data_dir    = $ModelData
         app_id      = $AppId
         gtk         = $Gtk
         owned       = @($owned)
@@ -166,6 +167,9 @@ function Save-Manifest {
 # Recorded before the first download, so uninstall can clean up a failed run.
 Add-Owned $ManifestName
 Save-Manifest $null
+# Models and settings are shared by every install of this user; the record
+# lets uninstall -Purge tell whether another install still uses them.
+Register-DataUser -DataDir $ModelData -Prefix $Prefix
 
 # --- 1. GTK runtime -------------------------------------------------------------
 $gtkRecord = Join-Path (New-PrivateTempDir 'bgbg-gtk') 'gtk.json'

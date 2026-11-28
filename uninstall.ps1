@@ -10,8 +10,9 @@
   not create. Nothing is removed through a junction or symbolic link.
 
   With -Purge it also removes the per-user caches bg-be-gone writes under
-  %LOCALAPPDATA%\bg-be-gone: downloaded models, settings, the ROCm kernel
-  cache and the worker log.
+  %LOCALAPPDATA%\bg-be-gone, unless another install still uses them (every
+  install of a user shares them): downloaded models, settings, the ROCm kernel
+  cache and the worker log. Files you put there yourself stay.
 
 .PARAMETER Purge
   Also delete the downloaded models, settings, ROCm kernel cache and log.
@@ -34,9 +35,6 @@ $ManifestName = 'bg-be-gone-install.json'
 $ManifestPath = Join-Path $Prefix $ManifestName
 $DataDir = Join-Path $env:LOCALAPPDATA 'bg-be-gone'
 $PngName = 'io.github.cristeigabriela.BgBeGone.png'
-
-# What bg-be-gone itself writes at run time, relative to $DataDir.
-$Caches = @('models', 'u2net', 'miopen', 'config', 'bg-be-gone-worker.log')
 
 function Remove-OwnedFile {
     <# Delete one recorded file, then the folders it leaves empty up to $Prefix. #>
@@ -120,15 +118,18 @@ foreach ($rel in @($owned | Where-Object { $folders -notcontains $_ -and $_ -ne 
 }
 if ($owned -contains $ManifestName) { Remove-OwnedFile $ManifestName }
 
-if ($Purge -and (Test-Path -LiteralPath $DataDir)) {
-    Assert-NoReparseBelow -Root $DataDir -Path $DataDir
-    foreach ($rel in $Caches) {
-        $full = Join-Path $DataDir $rel
-        if (Test-Path -LiteralPath $full) {
-            Remove-CacheTree -Root $DataDir -Path $full
-            Write-Host "Removed $full"
-        }
-    }
+$sharedWith = @()
+if (Test-Path -LiteralPath $DataDir) {
+    Unregister-DataUser -DataDir $DataDir -Prefix $Prefix
+    $sharedWith = @(Get-OtherDataUser -DataDir $DataDir -Prefix $Prefix)
+}
+if ($Purge -and $sharedWith.Count) {
+    Write-Warning ("Kept the models and settings in $($DataDir): the install(s) at " +
+                   ($sharedWith -join ', ') + " use them too. Uninstall those with -Purge to remove them.")
+} elseif ($Purge -and (Test-Path -LiteralPath $DataDir)) {
+    # Only what bg-be-gone downloaded or wrote; a file the user put there stays.
+    $removed = Remove-OwnedData $DataDir
+    Write-Host "Removed $removed downloaded or generated file(s) from $DataDir"
 }
 
 foreach ($dir in @($Prefix, $DataDir) | Select-Object -Unique) {
@@ -136,7 +137,7 @@ foreach ($dir in @($Prefix, $DataDir) | Select-Object -Unique) {
         Remove-Item -LiteralPath $dir -Force
     }
 }
-if (-not $Purge) {
+if (-not $Purge -and (Test-Path -LiteralPath $DataDir)) {
     Write-Host "Left downloaded models and settings in $DataDir (re-run with -Purge to remove them)."
 }
 Write-Host "Uninstalled."
