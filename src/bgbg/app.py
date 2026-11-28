@@ -37,7 +37,7 @@ from viewer import (  # noqa: E402
 )
 import batchnames  # noqa: E402
 import formats  # noqa: E402
-from gi.repository import Graphene, Pango  # noqa: E402
+from gi.repository import Graphene, Gsk, Pango  # noqa: E402
 import modelinfo  # noqa: E402
 from modelinfo import Device, Pick  # noqa: E402
 from engines import selection  # noqa: E402  (standard library only)
@@ -387,6 +387,31 @@ button.suggested-action.pill { box-shadow: 0 4px 14px alpha(@accent_bg_color, 0.
 .dev-amd    { background: #ed1c24; box-shadow: 0 0 8px alpha(#ed1c24, 0.6); }
 .dev-dml    { background: #0a84ff; box-shadow: 0 0 8px alpha(#0a84ff, 0.6); }
 .dev-cpu    { background: #9aa0a6; }
+
+/* footer progress (ProgressMotion): a sheen sweeps the filled part while work
+   runs, when GTK draws on the GPU; with no fraction yet, a pulse sweeps the
+   whole bar. Accent only. */
+progressbar.footer-progress > trough > progress { background-repeat: no-repeat; }
+progressbar.footer-progress.running.sheen > trough > progress {
+  background-image: linear-gradient(90deg, alpha(white, 0), alpha(white, 0.45), alpha(white, 0));
+  background-size: 48px 100%;
+  animation: footer-sheen 1.6s ease-in-out infinite;
+}
+@keyframes footer-sheen {
+  from { background-position: -48px 0; }
+  to   { background-position: 200px 0; }
+}
+progressbar.footer-progress.unknown > trough > progress {
+  background-color: alpha(@accent_bg_color, 0.3);
+  background-image: linear-gradient(90deg, alpha(@accent_bg_color, 0), @accent_bg_color,
+                                    alpha(@accent_bg_color, 0));
+  background-size: 64px 100%;
+  animation: footer-pulse 1.2s ease-in-out infinite alternate;
+}
+@keyframes footer-pulse {
+  from { background-position: -24px 0; }
+  to   { background-position: 110px 0; }
+}
 """
 
 
@@ -535,6 +560,99 @@ def _after_next_frame(widget, callback, *args):
         callback(*args)
     handler = clock.connect("after-paint", run)
     clock.request_phase(Gdk.FrameClockPhase.AFTER_PAINT)
+
+
+class Motion(enum.Enum):
+    """What a progress bar's motion says; each is a CSS class with its own animation."""
+
+    RUNNING = "running"        # a known fraction: a sheen sweeps the filled part, on the GPU
+    UNKNOWN = "unknown"        # no fraction yet: a pulse sweeps the whole bar
+
+
+class ProgressMotion:
+    """How a progress bar moves: eased steps, a sheen on the GPU while work runs, a fade-out.
+
+    Every motion runs on the frame clock, as CSS or libadwaita animations,
+    never as an idle or timeout per frame: idle callbacks once starved the
+    worker's replies. Both kinds follow gtk-enable-animations, so with
+    animations off the bar jumps and nothing moves. A hidden bar runs nothing.
+    """
+
+    EASE_MS = 250
+    FADE_MS = 300
+    SHEEN = "sheen"                 # the CSS class that adds the sweep to RUNNING
+
+    def __init__(self, bar):
+        self._bar = bar
+        self._mode = None               # the Motion shown, or None while hidden
+        self._target = 0.0              # the fraction the bar shows or eases to
+        self._last_step_us = 0          # when move_to last ran, monotonic microseconds
+        self._ease = Adw.TimedAnimation.new(
+            bar, 0.0, 0.0, self.EASE_MS,
+            Adw.CallbackAnimationTarget.new(lambda value: bar.set_fraction(value)))
+        self._ease.set_easing(Adw.Easing.EASE_OUT_CUBIC)
+        self._fade = Adw.TimedAnimation.new(
+            bar, 1.0, 0.0, self.FADE_MS, Adw.PropertyAnimationTarget.new(bar, "opacity"))
+        self._fade.connect("done", self._on_faded)
+
+    def move_to(self, fraction):
+        """Show the bar heading to `fraction`; it never eases backwards."""
+        # A new run, one after the pulse, or one that started over: jump there.
+        restart = self._mode is not Motion.RUNNING or fraction < self._target
+        # Steps closer together than an ease already look smooth, and easing
+        # each of them would redraw every frame for as long as they keep coming.
+        now = GLib.get_monotonic_time()
+        frequent = now - self._last_step_us < self.EASE_MS * 1000
+        self._last_step_us = now
+        self._show(Motion.RUNNING)
+        if restart or frequent:
+            self._ease.reset()
+            self._bar.set_fraction(fraction)
+        else:
+            self._ease.set_value_from(self._bar.get_fraction())
+            self._ease.set_value_to(fraction)
+            self._ease.play()
+        self._target = fraction
+
+    def unknown(self):
+        """Show work with no fraction yet: a soft pulse across the whole bar."""
+        self._show(Motion.UNKNOWN)
+        self._ease.reset()
+        self._bar.set_fraction(1.0)
+
+    def fade_out(self):
+        if self._mode is None:
+            return
+        self._mode = None
+        for motion in Motion:
+            self._bar.remove_css_class(motion.value)
+        self._fade.play()
+
+    def _show(self, mode):
+        self._fade.reset()              # a run that starts while the last one fades out
+        self._bar.set_opacity(1.0)
+        for motion in Motion:
+            self._bar.remove_css_class(motion.value)
+        self._bar.add_css_class(mode.value)
+        # Cairo paints the whole window in software for every frame of the
+        # sweep (a quarter of a core on Windows), so it only runs on the GPU.
+        if self._drawn_on_gpu():
+            self._bar.add_css_class(self.SHEEN)
+        else:
+            self._bar.remove_css_class(self.SHEEN)
+        self._bar.set_visible(True)
+        self._mode = mode
+
+    def _drawn_on_gpu(self):
+        native = self._bar.get_native()
+        renderer = native.get_renderer() if native is not None else None
+        return renderer is not None and not isinstance(renderer, Gsk.CairoRenderer)
+
+    def _on_faded(self, *_):
+        self._bar.set_visible(False)
+        self._bar.set_opacity(1.0)
+        self._ease.reset()
+        self._target = 0.0
 
 
 def _descendants(widget):
@@ -1192,6 +1310,7 @@ class Window(Adw.ApplicationWindow):
         self.footer_progress.set_size_request(150, -1)
         self.footer_progress.set_show_text(True)
         self.footer_progress.set_visible(False)
+        self._footer_motion = ProgressMotion(self.footer_progress)
         centre.append(self.footer_progress)
         bar.set_center_widget(centre)
 
@@ -1204,9 +1323,8 @@ class Window(Adw.ApplicationWindow):
     def _footer_progress(self, done, total):
         """Show frame/step progress in the shared footer bar (GIF + segmentation)."""
         total = max(int(total), 1)
-        self.footer_progress.set_fraction(min(1.0, done / total))
+        self._footer_motion.move_to(min(1.0, done / total))
         self.footer_progress.set_text("%d / %d" % (done, total))
-        self.footer_progress.set_visible(True)
 
     @staticmethod
     def _download_text(msg):
@@ -1228,7 +1346,7 @@ class Window(Adw.ApplicationWindow):
 
     def _hide_footer_progress(self):
         if getattr(self, "footer_progress", None) is not None:
-            self.footer_progress.set_visible(False)
+            self._footer_motion.fade_out()
 
     def _mirror_status(self, label, page):
         """Reflect a per-page status label into the footer while its page is
@@ -2923,6 +3041,8 @@ class Window(Adw.ApplicationWindow):
             if SELFTEST:
                 _finish_selftest(self, {"ok": True, "ready": msg})
         elif t == "loading":
+            self.footer_progress.set_text("")
+            self._footer_motion.unknown()      # a load has no fraction to show
             if job is Job.BATCH:
                 self.batch_status.set_text("Loading model %s…" % msg["model"])
             else:
