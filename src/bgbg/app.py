@@ -411,6 +411,23 @@ progressbar.footer-progress.unknown > trough > progress {
   from { background-position: -24px 0; }
   to   { background-position: 110px 0; }
 }
+
+/* Source | Result: the handle is the gap between the two cards, with no line.
+   It keeps a 12 px grab area and the resize cursor; hovering or dragging it
+   shows a short grip, a shape rather than a colour change. */
+paned.card-split > separator {
+  min-width: 12px;
+  background: none;
+  box-shadow: none;
+  border: none;
+}
+paned.card-split > separator:hover,
+paned.card-split > separator:active {
+  background-image: image(alpha(@window_fg_color, 0.35));
+  background-size: 4px 40px;
+  background-position: center;
+  background-repeat: no-repeat;
+}
 """
 
 
@@ -1076,8 +1093,10 @@ class Window(Adw.ApplicationWindow):
         tv.add_top_bar(self.worker_banner)
 
         body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        body.append(self._build_sidebar())
-        body.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        # libadwaita's sidebar surface sets it off from the pages, with no line.
+        sidebar = self._build_sidebar()
+        sidebar.add_css_class("sidebar-pane")
+        body.append(sidebar)
         self.stack.set_hexpand(True)
         body.append(self.stack)
         tv.set_content(body)
@@ -1928,6 +1947,7 @@ class Window(Adw.ApplicationWindow):
         page.append(self.seg_mode_toggle)
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, wide_handle=True)
+        paned.add_css_class("card-split")
         paned.set_vexpand(True)
         self.seg_panel = Panel(
             "Source — click objects", transforms=False,
@@ -2372,6 +2392,7 @@ class Window(Adw.ApplicationWindow):
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL,
                           wide_handle=True)
+        paned.add_css_class("card-split")
         paned.set_vexpand(True)
         self.src_panel = Panel("Source", on_change=self._on_source_change)
         self.res_panel = Panel(
