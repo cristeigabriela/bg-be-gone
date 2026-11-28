@@ -37,7 +37,7 @@ from viewer import (  # noqa: E402
 )
 import batchnames  # noqa: E402
 import formats  # noqa: E402
-from gi.repository import Graphene, Gsk, Pango  # noqa: E402
+from gi.repository import GObject, Graphene, Gsk, Pango  # noqa: E402
 import modelinfo  # noqa: E402
 from modelinfo import Device, Pick  # noqa: E402
 from engines import selection  # noqa: E402  (standard library only)
@@ -1308,10 +1308,20 @@ class Window(Adw.ApplicationWindow):
         self.footer_progress.add_css_class("footer-progress")
         self.footer_progress.set_valign(Gtk.Align.CENTER)
         self.footer_progress.set_size_request(150, -1)
-        self.footer_progress.set_show_text(True)
         self.footer_progress.set_visible(False)
         self._footer_motion = ProgressMotion(self.footer_progress)
         centre.append(self.footer_progress)
+        # The bar's count ("12 / 30") sits beside it, not drawn above it, so
+        # the bar's middle lines up with the text's at any font size. It
+        # shows the bar's own text, and comes and goes (and fades) with it.
+        count = Gtk.Label(valign=Gtk.Align.CENTER)
+        count.add_css_class("status-label")
+        count.add_css_class("numeric")
+        for prop in ("text", "visible", "opacity"):
+            self.footer_progress.bind_property(
+                prop, count, "label" if prop == "text" else prop,
+                GObject.BindingFlags.SYNC_CREATE)
+        centre.append(count)
         bar.set_center_widget(centre)
 
         self.footer_context = Gtk.Label(label="")
