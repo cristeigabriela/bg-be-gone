@@ -29,6 +29,7 @@ import numpy as np
 from PIL import Image, ImageFilter
 import onnxruntime as ort
 
+import background
 import modelinfo
 from engines.selection import Engine
 from plat import config_dir, models_dir, probe_vram
@@ -950,16 +951,17 @@ def _hex_to_rgb(s):
     return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
 
 
-def composite_extract(src_pil, alpha, bg, dst, blur=20):
+def composite_extract(src_pil, alpha, bg, dst, blur=background.STRENGTH_DEFAULT):
     """Composite the ``alpha`` (uint8 HxW) cutout of ``src_pil`` over ``bg`` and
-    save to ``dst``. ``bg`` is "transparent" / "blur" / "#rrggbb"."""
+    save to ``dst``. ``bg`` is "transparent" / "blur" / "#rrggbb"; ``blur`` is
+    the blur strength (background.py)."""
     src = src_pil.convert("RGB")
     cutout = src.convert("RGBA")
     cutout.putalpha(Image.fromarray(alpha.astype(np.uint8), "L"))
     if bg == "transparent":
         cutout.save(dst)
     elif bg == "blur":
-        base = src.filter(ImageFilter.GaussianBlur(max(1, blur))).convert("RGBA")
+        base = background.blur_behind(src, cutout.getchannel("A"), blur).convert("RGBA")
         base.alpha_composite(cutout)
         base.convert("RGB").save(dst)
     else:

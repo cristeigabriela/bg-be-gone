@@ -11,11 +11,12 @@ Background removal needs ``rembg`` (imported lazily); segmentation needs only
 can be absent — a segmentation-only install ships without rembg.
 
 Requests (one JSON object per line on stdin):
-  {"op":"single","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"id":N}
+  {"op":"single","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":S,
+   "keep_dir":D?,"id":N}                     # keep_dir: keep what recomposite needs
   {"op":"batch","input_dir":D,"output_dir":D,"model":M,"alpha":bool,"bg":BG,
    "pattern":"{name}_nobg","id":N}
-  {"op":"gif","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":int,
-   "rot":0..3,"fh":bool,"fv":bool,"id":N}   # per-frame background removal;
+  {"op":"gif","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":S,
+   "rot":0..3,"fh":bool,"fv":bool,"keep_dir":D?,"id":N}   # per-frame removal;
                                              # GIF or WebP (animated) by output
   {"op":"convert","input":P,"output":P,"id":N}   # re-encode as output's format
   {"op":"frames","input":P,"id":N}           # count an image's frames
@@ -31,7 +32,14 @@ Requests (one JSON object per line on stdin):
   {"op":"engine_status","id":N}              # waits for PyTorch's start-up, if any
   {"op":"shutdown"}
 
-BG is "transparent", "blur" or "#rrggbb" to flatten onto.
+BG is "transparent", "blur" or "#rrggbb" to flatten onto. S is the blur
+strength, 1-100, relative to the picture's size (background.py).
+
+Re-compositing a kept result onto another background, with no model, from
+the keep_dir its "single" or "gif" wrote:
+  {"op":"recomposite","keep_dir":D,"output":P,"bg":BG,"blur":S,"id":N}   # a still
+  {"op":"recomposite","keep_dir":D,"input":P,"output":P,"bg":BG,"blur":S,
+   "rot":0..3,"fh":bool,"fv":bool,"id":N}   # an animation: its source, as for "gif"
 
 Responses (one JSON object per line on stdout):
   {"type":"ready","models":[...],"providers":[...],"seg":bool,"bgremove":bool,
@@ -92,11 +100,12 @@ import traceback  # noqa: E402
 import warnings  # noqa: E402
 import urllib.error  # noqa: E402
 
-from PIL import Image, ImageFilter, UnidentifiedImageError  # noqa: E402
+from PIL import Image, ImageOps, UnidentifiedImageError  # noqa: E402
 # Imports onnxruntime, then rembg when it is installed.
 from engines import ort as ort_engine  # noqa: E402
 from engines import selection  # noqa: E402
 from engines import torch_birefnet  # noqa: E402  (imports no torch itself)
+import background  # noqa: E402
 import batchnames  # noqa: E402
 import formats  # noqa: E402
 
@@ -320,6 +329,22 @@ def _remove_resilient(model, req_id, img, alpha):
         return res
 
 
+def _straight_cutout(img, cut, alpha_matting):
+    """The cut-out with the picture's own colours under its alpha.
+
+    Without alpha matting, rembg blends the picture with transparent black
+    by the mask, so a soft edge's colours are darkened by its own alpha:
+    a dark rim on whatever background it's put onto. Alpha matting's
+    cut-out already holds the estimated foreground colours, so it's kept.
+    """
+    cut = cut.convert("RGBA")
+    if alpha_matting:
+        return cut
+    straight = img.convert("RGB").convert("RGBA")
+    straight.putalpha(cut.getchannel("A"))
+    return straight
+
+
 def _hex_to_rgb(s):
     s = s.lstrip("#")
     return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
@@ -521,33 +546,46 @@ def handle_frames(req):
     out({"type": "frames", "frames": getattr(im, "n_frames", 1), "id": req.get("id")})
 
 
-def process_one(model, req_id, src, dst, alpha, bg, blur=20, want_preview=False):
-    img = _plain(open_image(src))
-    res = _remove_resilient(model, req_id, img, alpha).convert("RGBA")
+def process_one(model, req_id, src, dst, alpha, bg, blur=background.STRENGTH_DEFAULT,
+                want_preview=False, keep_dir=None):
+    """Cut `src` out with `model` and write it onto background `bg` at `dst`.
 
-    preview_path = None
-    if bg == "transparent":
-        res.save(dst)
-        if want_preview:
-            board = _checkerboard(res.size).convert("RGBA")
-            board.alpha_composite(res)
-            preview_path = dst + ".preview.png"
-            board.convert("RGB").save(preview_path)
-    elif bg == "blur":
-        # Keep the picture, blur only the background: sharp foreground (the
-        # model's cutout) composited over a Gaussian-blurred copy of the source.
-        base = img.convert("RGB").filter(ImageFilter.GaussianBlur(max(1, blur)))
-        base = base.convert("RGBA")
-        base.alpha_composite(res)
-        base.convert("RGB").save(dst)
-        if want_preview:
-            preview_path = dst
-    else:
-        flat = Image.new("RGBA", res.size, _hex_to_rgb(bg) + (255,))
-        flat.alpha_composite(res)
-        flat.convert("RGB").save(dst)
-        if want_preview:
-            preview_path = dst
+    `keep_dir`, when given, keeps the picture and its cut-out there, so
+    recomposite can put the result onto another background without the model.
+    """
+    # Upright first: rembg would turn its mask by the EXIF orientation, and
+    # the cut-out, kept picture and composite must all match that mask.
+    img = _plain(ImageOps.exif_transpose(open_image(src)))
+    res = _straight_cutout(img, _remove_resilient(model, req_id, img, alpha), alpha)
+    if keep_dir:
+        os.makedirs(keep_dir, exist_ok=True)
+        img.save(os.path.join(keep_dir, _KEPT_PICTURE))
+        res.save(os.path.join(keep_dir, _KEPT_CUTOUT))
+    return _write_result(img, res, dst, bg, blur, want_preview)
+
+
+# A still's kept files, in its keep_dir; an animation keeps one cut-out per frame.
+_KEPT_PICTURE = "picture.png"
+_KEPT_CUTOUT = "cutout.png"
+
+
+def _write_result(img, res, dst, bg, blur, want_preview):
+    """Write cut-out `res` of picture `img` onto background `bg` at `dst`.
+
+    Generate and a re-composite both write through here, so the same cut-out
+    and settings give the same file. Returns the preview's path (a checkered
+    copy of a transparent result), `dst` itself, or None without a preview.
+    """
+    if bg != "transparent":
+        _compose_frame(img, res, bg, blur).convert("RGB").save(dst)
+        return dst if want_preview else None
+    res.save(dst)
+    if not want_preview:
+        return None
+    board = _checkerboard(res.size).convert("RGBA")
+    board.alpha_composite(res)
+    preview_path = dst + ".preview.png"
+    board.convert("RGB").save(preview_path)
     return preview_path
 
 
@@ -557,7 +595,8 @@ def handle_single(req):
     t = time.time()
     preview = process_one(req["model"], rid, req["input"], req["output"],
                           req.get("alpha", False), req.get("bg", "transparent"),
-                          req.get("blur", 20), want_preview=True)
+                          req.get("blur", background.STRENGTH_DEFAULT), want_preview=True,
+                          keep_dir=req.get("keep_dir"))
     if _cancel.is_set():                    # a single inference can't be stopped
         out({"type": "canceled", "scope": "single", "id": rid})   # mid-run; drop it
         return
@@ -624,7 +663,7 @@ def handle_batch(req):
     get_session(req["model"], rid)         # load + emit the device message
     alpha = req.get("alpha", False)
     bg = req.get("bg", "transparent")
-    blur = req.get("blur", 20)
+    blur = req.get("blur", background.STRENGTH_DEFAULT)
     taken = batchnames.taken_by(files)     # a source is never an output
     renamed = 0                            # results written under a numbered name
     failed = []                            # [{"name", "message"}], in order
@@ -694,13 +733,17 @@ def _apply_transform(im, rot, fh, fv):
     return im
 
 
-def _compose_frame(orig_rgba, cut_rgba, bg, blur):
-    """Apply the chosen background to one processed frame; returns RGBA."""
+def _compose_frame(orig, cut_rgba, bg, blur):
+    """Put cut-out `cut_rgba` of picture `orig` onto background `bg`; returns RGBA.
+
+    "blur" keeps the picture and blurs only the background: the sharp cut-out
+    over the picture's background blurred without it, by strength `blur`
+    (background.blur_behind).
+    """
     if bg == "transparent":
         return cut_rgba
     if bg == "blur":
-        base = orig_rgba.convert("RGB").filter(
-            ImageFilter.GaussianBlur(max(1, blur))).convert("RGBA")
+        base = background.blur_behind(orig, cut_rgba.getchannel("A"), blur).convert("RGBA")
     else:
         base = Image.new("RGBA", cut_rgba.size, _hex_to_rgb(bg) + (255,))
     base.alpha_composite(cut_rgba)
@@ -747,12 +790,59 @@ def handle_gif(req):
     model is loaded once and reused for every frame. Each finished frame is
     written to disk (not held in RAM) so a long animation stays memory-bounded
     during the slow per-frame inference. Progress is per frame; cancellable
-    between frames."""
+    between frames.
+
+    With "keep_dir", each frame's cut-out is kept there too, for recomposite
+    to put onto another background later.
+    """
     rid = req.get("id")
-    src, dst, model = req["input"], req["output"], req["model"]
-    alpha = req.get("alpha", False)
+    model, alpha = req["model"], req.get("alpha", False)
+    kept = req.get("keep_dir")
+    loaded = []
+
+    def cut_of(i, frame):
+        if not loaded:
+            get_session(model, rid)        # once; reused for every frame
+            loaded.append(True)
+        cut = _straight_cutout(frame, _remove_resilient(model, rid, frame, alpha), alpha)
+        if kept:
+            cut.save(_kept_frame(kept, i))
+        return cut
+
+    if kept:
+        os.makedirs(kept, exist_ok=True)
+        with open(os.path.join(kept, _KEPT_SOURCE), "w", encoding="utf-8") as f:
+            json.dump(_file_stamp(req["input"]), f)
+    _render_animation(req, cut_of, "gif_done", "gif")
+
+
+# An animation's keep_dir notes its source file as it was, since recomposite
+# reads that file again.
+_KEPT_SOURCE = "source.json"
+
+
+def _file_stamp(path):
+    """What tells a file changed: its size and modification time."""
+    st = os.stat(path)
+    return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+def _kept_frame(folder, i):
+    """Where frame `i`'s cut-out is kept for re-compositing."""
+    return os.path.join(folder, "f%05d.png" % i)
+
+
+def _render_animation(req, cut_of, done_type, scope):
+    """Cut out (via `cut_of(i, frame)`) and compose every frame of the
+    request's animation, then reassemble it at its output path.
+
+    Reports "gif_progress" per frame and `done_type` at the end; a cancel
+    between frames reports "canceled" with `scope`.
+    """
+    rid = req.get("id")
+    src, dst = req["input"], req["output"]
     bg = req.get("bg", "transparent")
-    blur = int(req.get("blur", 20))
+    blur = req.get("blur", background.STRENGTH_DEFAULT)
     rot = int(req.get("rot", 0))
     fh, fv = bool(req.get("fh")), bool(req.get("fv"))
     im = open_image(src)
@@ -761,26 +851,25 @@ def handle_gif(req):
     # Report 0/N up front so the progress bar appears immediately — the model
     # load + first-frame warmup (slow on BiRefNet) happen before frame 1 lands.
     out({"type": "gif_progress", "done": 0, "total": n, "id": rid})
-    get_session(model, rid)                # load once; reused for every frame
     framedir = tempfile.mkdtemp(prefix="gifframes-", dir=os.path.dirname(dst) or None)
     paths, durations = [], []
     t = time.time()
     try:
         for i in range(n):
             if _cancel.is_set():
-                out({"type": "canceled", "scope": "gif", "id": rid})
+                out({"type": "canceled", "scope": scope, "id": rid})
                 return
             im.seek(i)
-            frame = _apply_transform(im.convert("RGBA"), rot, fh, fv)
+            frame = _apply_transform(ImageOps.exif_transpose(im.convert("RGBA")), rot, fh, fv)
             # After decoding: a WebP frame's duration is set only once it loads.
             durations.append(im.info.get("duration", 100))
-            cut = _remove_resilient(model, rid, frame, alpha).convert("RGBA")
+            cut = cut_of(i, frame)
             fp = os.path.join(framedir, "f%05d.png" % i)
             _compose_frame(frame, cut, bg, blur).save(fp)
             paths.append(fp)
             out({"type": "gif_progress", "done": i + 1, "total": n, "id": rid})
         if _cancel.is_set():
-            out({"type": "canceled", "scope": "gif", "id": rid})
+            out({"type": "canceled", "scope": scope, "id": rid})
             return
         if formats.format_of(dst) is formats.WEBP:
             _frames_to_webp(paths, dst, durations, loop)
@@ -789,10 +878,43 @@ def handle_gif(req):
         # For a frontend whose GdkPixbuf has no loader for the animation.
         preview = dst + ".preview.png"
         shutil.copyfile(paths[0], preview)
-        out({"type": "gif_done", "output": dst, "preview": preview, "frames": n,
+        out({"type": done_type, "output": dst, "preview": preview, "frames": n,
              "device": _last_device, "seconds": round(time.time() - t, 2), "id": rid})
     finally:
         shutil.rmtree(framedir, ignore_errors=True)
+
+
+# What recomposite says when an animation's source changed since its Generate.
+SOURCE_CHANGED = "The original file changed; press Generate again."
+
+
+def handle_recomposite(req):
+    """Put a kept cut-out onto another background, without the model.
+
+    The cut-out is the one "single" or "gif" kept for this input, so the
+    result is the file Generate would write with these settings. A still is
+    one compose; an animation recomposes every frame, with progress, and a
+    cancel stops it between frames.
+    """
+    rid = req.get("id")
+    folder = req["keep_dir"]
+    if "input" in req:                     # an animation, re-read from its source
+        with open(os.path.join(folder, _KEPT_SOURCE), encoding="utf-8") as f:
+            kept_stamp = json.load(f)
+        if _file_stamp(req["input"]) != kept_stamp:
+            # Its frames would no longer match the kept cut-outs.
+            out({"type": "error", "message": SOURCE_CHANGED, "id": rid})
+            return
+        _render_animation(
+            req, lambda i, _frame: Image.open(_kept_frame(folder, i)).convert("RGBA"),
+            "recomposited", "recomposite")
+        return
+    img = Image.open(os.path.join(folder, _KEPT_PICTURE))
+    res = Image.open(os.path.join(folder, _KEPT_CUTOUT)).convert("RGBA")
+    preview = _write_result(img, res, req["output"], req.get("bg", "transparent"),
+                            req.get("blur", background.STRENGTH_DEFAULT), want_preview=True)
+    out({"type": "recomposited", "output": req["output"], "preview": preview,
+         "frames": 1, "id": rid})
 
 
 # ---------------------------------------------------------------------------
@@ -936,7 +1058,7 @@ def handle_seg_extract(req):
     rid = req.get("id")
     dst = req["output"]
     bg = req.get("bg", "transparent")
-    blur = int(req.get("blur", 20))
+    blur = req.get("blur", background.STRENGTH_DEFAULT)
     if req.get("mask"):
         paths = [req["mask"]]
     elif "masks" in req:
@@ -1042,6 +1164,7 @@ _HANDLERS = {
     "single": handle_single,
     "batch": handle_batch,
     "gif": handle_gif,
+    "recomposite": handle_recomposite,
     "convert": handle_convert,
     "frames": handle_frames,
     "seg_load": handle_seg_load,

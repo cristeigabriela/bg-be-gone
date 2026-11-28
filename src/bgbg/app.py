@@ -35,6 +35,7 @@ from viewer import (  # noqa: E402
     Transform,
     transform_pixbuf,
 )
+import background  # noqa: E402
 import batchnames  # noqa: E402
 import formats  # noqa: E402
 from gi.repository import GObject, Graphene, Gsk, Pango  # noqa: E402
@@ -77,6 +78,7 @@ class Job(enum.Enum):
     SEG_RUN = "seg_run"          # Segment everything, or a click in point mode
     SEG_PREVIEW = "seg_preview"  # the live composite in Segment's result panel
     SEG_SAVE = "seg_save"        # the full-size render behind Save selection
+    RECOMPOSITE = "recomposite"  # the shown result, put onto a changed background
 
 
 # Reply types that belong to one request; any other reply is window-wide state.
@@ -84,13 +86,18 @@ _JOB_REPLIES = {
     "loading", "done_single", "gif_progress", "gif_done", "canceled", "progress",
     "done_batch", "converted", "frames", "seg_ready", "seg_download", "seg_step",
     "seg_progress", "seg_objects", "seg_mask", "seg_extracted", "seg_canceled", "error",
-    "download",
+    "download", "recomposited",
 }
 # Reply types that end their request.
 _JOB_ENDS = {
     "done_single", "gif_done", "canceled", "done_batch", "converted", "frames",
     "seg_ready", "seg_objects", "seg_mask", "seg_extracted", "seg_canceled", "error",
+    "recomposited",
 }
+# How long a background setting rests before the shown result follows it.
+_RECOMPOSITE_DELAY_MS = 150
+# Replies after which a Generate's kept folder belongs to the shown result.
+_KEPT_ADOPTED = {"done_single", "gif_done"}
 _SEG_JOBS = {Job.SEG_LOAD, Job.SEG_RUN, Job.SEG_PREVIEW, Job.SEG_SAVE}
 
 
@@ -192,7 +199,25 @@ class _InFlight:
     source: Optional[_PendingOpen] = None    # OPEN: the source being opened
     save: Optional[_PendingSave] = None      # SAVE: where the re-encoded result goes
     input: Optional[str] = None              # SINGLE: its input, deleted if we encoded it
+    kept: Optional["_Kept"] = None           # SINGLE: what it keeps, the result's once shown
     loads: Optional[tuple] = None            # SEG_LOAD: the (source, model) it loads
+
+
+@dataclass
+class _Kept:
+    """What a result was made from, so its background can change without the model.
+
+    The worker writes it into `folder`, in the window's temp folder; the
+    window deletes the folder when the result goes (_forget_kept), and the
+    whole temp folder goes when the window closes.
+    """
+
+    folder: str                       # the picture and cut-out, or a cut-out per frame
+    bg: str                           # the background the shown result has
+    blur: int
+    # An animation's source and its baked rotate/flip, which recomposite
+    # reads again; None for a still.
+    animation: Optional[dict] = None
 
 
 # A remembered window side outside this range is not a size to restore.
@@ -285,6 +310,15 @@ ENGINES = [
     ("ONNX Runtime", selection.Engine.ORT),
     ("PyTorch", selection.Engine.TORCH),
 ]
+# The Output button's short name for each background.
+BG_SHORT_NAMES = {
+    "transparent": "Transparent",
+    "blur": "Blur",
+    "#ffffff": "White",
+    "#000000": "Black",
+    "#00b140": "Green screen",
+    "custom": "Custom",
+}
 BGS = [
     ("Transparent", "transparent"),
     ("Blur background", "blur"),
@@ -912,6 +946,7 @@ class Panel:
             b.connect("clicked", cb)
             tools.append(b)
         header.set_end_widget(tools)
+        self._tools = tools
         self.box.append(header)
 
         self.view = ImageView(on_change=self._changed)
@@ -969,6 +1004,10 @@ class Panel:
     def hide_cursor_badge(self):
         self.cursor_badge.set_visible(False)
 
+    def add_tool(self, widget):
+        """Put `widget` first among the header's tools."""
+        self._tools.prepend(widget)
+
     def _reset(self, *_):
         self.view.reset_view()
 
@@ -1021,6 +1060,11 @@ class Window(Adw.ApplicationWindow):
         self._inputs_made = 0          # encoded inputs so far, to name each one's file
         self._animations_made = 0      # animation results so far, to name each one's file
         self._animations = set()       # animation results in the temp folder
+        self._kept = None              # what the shown result was made from (_Kept)
+        self._kept_made = 0            # kept folders so far, to name each one
+        self._live_results = set()     # still results re-composited, deleted when replaced
+        self._recomposite_timer = 0    # the debounce before a background change applies
+        self._live_made = 0            # re-composited stills so far, to name each one's file
         self._animation_saves = {}     # animation result -> saves still reading it
         self._encoded_inputs = set()   # paths _prepare_input wrote, the only ones it deletes
         self._saves_writing = 0        # saves being rendered off the UI thread
@@ -1185,7 +1229,9 @@ class Window(Adw.ApplicationWindow):
         colour = Gdk.RGBA()
         if isinstance(s.get("custom_colour"), str) and colour.parse(s["custom_colour"]):
             self.color_btn.set_rgba(colour)
-        blur = s.get("blur")
+        # "blur_strength", not the old "blur": that one was a radius in pixels,
+        # which means something else on this scale, so it's left unread.
+        blur = s.get("blur_strength")
         if isinstance(blur, (int, float)) and not isinstance(blur, bool) and math.isfinite(blur):
             self.blur_row.set_value(blur)          # the row clamps it to its range
         for key, row in (("batch_input", self.in_row), ("batch_output", self.out_row)):
@@ -1205,7 +1251,7 @@ class Window(Adw.ApplicationWindow):
         self.color_btn.connect("notify::rgba", lambda *_: self._remember(
             custom_colour=self.color_btn.get_rgba().to_string()))
         self.blur_row.connect("notify::value", lambda *_: self._remember(
-            blur=int(self.blur_row.get_value())))
+            blur_strength=int(self.blur_row.get_value())))
 
     def _remember(self, **values):
         """Save the `values` that changed; a failure is logged once and shown once."""
@@ -1236,7 +1282,9 @@ class Window(Adw.ApplicationWindow):
     def _build_sidebar(self):
         scroller = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER)
-        scroller.set_size_request(280, -1)
+        # The Output rows used to widen it; without them, it keeps room for the
+        # Subject row's value and its cost.
+        scroller.set_size_request(360, -1)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         box.set_margin_top(16)
         box.set_margin_bottom(16)
@@ -1263,6 +1311,11 @@ class Window(Adw.ApplicationWindow):
         model_grp.add(self.model_row)
         self._refresh_bg_subtitles()
 
+        # It changes the cut-out itself, so it's part of what runs.
+        self.alpha_row = Adw.SwitchRow(
+            title="Alpha matting", subtitle="Cleaner edges, a little slower")
+        model_grp.add(self.alpha_row)
+
         # Shown only when the worker says it can run PyTorch, so an install
         # without it looks as it always did.
         self.model_adv = Adw.ExpanderRow(title="Advanced")
@@ -1278,36 +1331,77 @@ class Window(Adw.ApplicationWindow):
         box.append(model_grp)
         box.append(self._build_seg_group())
 
-        out_grp = Adw.PreferencesGroup(title="Output")
+        self._build_output_rows()
+        return scroller
+
+    def _build_output_rows(self):
+        """Background, Custom colour and Blur strength, in the list the Result
+        headers' Output popovers show (_output_button)."""
+        self.output_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.output_list.add_css_class("boxed-list")
+        self.output_list.set_size_request(320, -1)
         self.bg_row = Adw.ComboRow(
             title="Background",
             model=Gtk.StringList.new([b[0] for b in BGS]))
         self.bg_row.connect("notify::selected", lambda *_: self._sync_color())
-        out_grp.add(self.bg_row)
+        self.output_list.append(self.bg_row)
 
         self.color_row = Adw.ActionRow(title="Custom colour")
         self.color_btn = Gtk.ColorDialogButton.new(Gtk.ColorDialog())
         rgba = Gdk.RGBA()
         rgba.parse("#00b140")
         self.color_btn.set_rgba(rgba)
-        self.color_btn.connect("notify::rgba", self._seg_bg_changed)
+        self.color_btn.connect("notify::rgba", self._on_output_changed)
         self.color_btn.set_valign(Gtk.Align.CENTER)
         self.color_row.add_suffix(self.color_btn)
         self.color_row.set_sensitive(False)
-        out_grp.add(self.color_row)
+        self.output_list.append(self.color_row)
 
+        # A share of the picture's size (background.py), so it looks the same on any photo.
         self.blur_row = Adw.SpinRow(
-            title="Blur strength",
-            adjustment=Gtk.Adjustment(value=20, lower=2, upper=80,
-                                      step_increment=1, page_increment=5))
+            title="Blur strength", subtitle="The same look on any photo size",
+            adjustment=Gtk.Adjustment(
+                value=background.STRENGTH_DEFAULT, lower=background.STRENGTH_MIN,
+                upper=background.STRENGTH_MAX, step_increment=1, page_increment=5))
         self.blur_row.set_visible(False)
-        out_grp.add(self.blur_row)
+        self.blur_row.connect("notify::value", self._on_output_changed)
+        self.output_list.append(self.blur_row)
+        self._output_buttons = []
+        self._output_owner = None       # the popover holding the rows, if any
 
-        self.alpha_row = Adw.SwitchRow(
-            title="Alpha matting", subtitle="Cleaner edges, a little slower")
-        out_grp.add(self.alpha_row)
-        box.append(out_grp)
-        return scroller
+    def _output_button(self):
+        """The Output button for a Result header: the current background, as
+        text, and a popover with its settings, shared by every page."""
+        content = Adw.ButtonContent(icon_name="preferences-color-symbolic")
+        button = Gtk.MenuButton(child=content)
+        button.add_css_class("flat")
+        popover = Gtk.Popover()
+        button.set_popover(popover)
+
+        def show_rows(*_):
+            # One set of rows: they move into whichever popover opens. Their
+            # parent is the popover's own contents widget, so the popover
+            # that holds them is kept here to hand them over.
+            owner = self._output_owner
+            if owner is not popover:
+                if owner is not None:
+                    owner.set_child(None)
+                popover.set_child(self.output_list)
+                self._output_owner = popover
+        popover.connect("show", show_rows)
+        self._output_buttons.append((button, content))
+        self._sync_output_buttons()
+        return button
+
+    def _sync_output_buttons(self):
+        """Name the background on every Output button: in its label, tooltip
+        and accessible name, so it reads without the colour swatch."""
+        name = BG_SHORT_NAMES[BGS[self.bg_row.get_selected()][1]]
+        for button, content in getattr(self, "_output_buttons", []):
+            content.set_label(name)
+            button.set_tooltip_text("Background: %s" % name)
+            button.update_property([Gtk.AccessibleProperty.LABEL],
+                                   ["Output background: %s" % name])
 
     def _build_statusbar(self):
         """Persistent window footer: device (left), the active page's status/hint
@@ -1588,13 +1682,132 @@ class Window(Adw.ApplicationWindow):
         bg = BGS[self.bg_row.get_selected()][1]
         self.color_row.set_sensitive(bg == "custom")
         self.blur_row.set_visible(bg == "blur")
-        self._mark_stale()
+        self._sync_output_buttons()
+        self._on_output_changed()
+
+    def _on_output_changed(self, *_):
+        """A background setting changed: the shown result follows, live."""
         self._seg_bg_changed()
+        # A change still running is for settings that no longer hold, even
+        # when this one goes back to what's shown: drop it now, not at the send.
+        if self._abandon_jobs({Job.RECOMPOSITE}) is Abandoned.SOME:
+            self._recomposite_over()
+        if self._kept is None:
+            self._mark_stale()           # a result made before it could be kept
+            return
+        self._schedule_recomposite()
+
+    def _schedule_recomposite(self):
+        """Apply the background settings to the shown result, once they rest."""
+        if getattr(self, "_kept", None) is None:    # also before the window is built
+            return
+        if self._recomposite_timer:
+            GLib.source_remove(self._recomposite_timer)
+        # Debounced: dragging the strength or a colour sends one job, not dozens.
+        self._recomposite_timer = GLib.timeout_add(_RECOMPOSITE_DELAY_MS, self._recomposite)
+
+    def _recomposite(self):
+        """Put the shown result onto the current background, without the model.
+
+        One job at a time, the latest wins: one still out is abandoned, and
+        its reply dropped. Waits while a Generate or a batch runs: _set_busy applies it after.
+        """
+        self._recomposite_timer = 0
+        kept = self._kept
+        _model, bg, _alpha, blur = self.get_settings()
+        if kept is None or self.busy or (bg, blur) == (kept.bg, kept.blur):
+            return False
+        self._abandon_jobs({Job.RECOMPOSITE})
+        req = {"op": "recomposite", "keep_dir": kept.folder, "bg": bg, "blur": blur}
+        if kept.animation is None:
+            self._live_made += 1
+            req["output"] = os.path.join(self.tmpdir, "live-%d.png" % self._live_made)
+        else:
+            self._animations_made += 1
+            req["output"] = os.path.join(
+                self.tmpdir, "result-%d%s" % (self._animations_made, kept.animation["suffix"]))
+            req.update({k: kept.animation[k] for k in ("input", "rot", "fh", "fv")})
+            self.gen_cancel_btn.set_sensitive(True)
+            self.status.set_text("Changing the background…")
+        self._send_job(Job.RECOMPOSITE, req, alpha=_alpha_of(bg),
+                       kept=_Kept(kept.folder, bg, blur, kept.animation))
+        return False
+
+    def _on_recomposited(self, req, msg):
+        """Show a re-composited result; Save and its JPEG offer follow it."""
+        self._recomposite_over()
+        output = msg["output"]
+        if self._kept is None or req.kept.folder != self._kept.folder:
+            _remove_quietly(output)       # for a result that's gone since
+            return
+        if msg["frames"] > 1:
+            self._animations.add(output)
+            if not self.res_panel.view.load_file(output):
+                self.res_panel.view.load_file(msg["preview"])
+        else:
+            self._live_results.add(output)
+        self._replace_result(output)
+        self._result_alpha = req.alpha
+        self._kept = req.kept
+        self.status.set_text("Background: %s." % BG_SHORT_NAMES.get(req.kept.bg, "Custom"))
+        if msg["frames"] > 1:
+            self.save_btn.set_sensitive(True)
+            return
+        self.save_btn.set_sensitive(False)
+
+        def decoded(loaded):
+            if loaded is Loaded.SHOWN and self.result_output == output \
+                    and not self._has_job(Job.OPEN):
+                self.save_btn.set_sensitive(True)
+        self.res_panel.view.load_file_async(output, done=decoded)
+
+    def _recomposite_over(self):
+        self.gen_cancel_btn.set_sensitive(self.busy and self._has_job(Job.SINGLE, Job.BATCH))
+        self._hide_footer_progress()
+
+    def _stop_recomposite(self):
+        """Drop a pending or running background change: a new result replaces it."""
+        if self._recomposite_timer:
+            GLib.source_remove(self._recomposite_timer)
+            self._recomposite_timer = 0
+        if self._abandon_jobs({Job.RECOMPOSITE}) is Abandoned.SOME:
+            self._recomposite_over()
+
+    def _new_kept(self, bg, blur, animation=None):
+        """A new folder for what a Generate keeps; the result owns it once shown."""
+        self._kept_made += 1
+        folder = os.path.join(self.tmpdir, "kept-%d" % self._kept_made)
+        return _Kept(folder, bg, blur, animation)
+
+    def _adopt_kept(self, kept):
+        """The shown result was made from `kept`: the one before goes."""
+        if kept is None:
+            return
+        if self._kept is not None and self._kept.folder != kept.folder:
+            shutil.rmtree(self._kept.folder, ignore_errors=True)
+        self._kept = kept
+        self._schedule_recomposite()     # a change made while it generated applies now
+
+    def _forget_kept(self):
+        """The result is gone: so is what it was made from."""
+        if self._kept is not None:
+            shutil.rmtree(self._kept.folder, ignore_errors=True)
+        self._kept = None
+
+    def _drop_kept(self, kept):
+        """Delete a request's kept folder, unless the shown result owns it."""
+        if kept is None or (self._kept is not None and kept.folder == self._kept.folder):
+            return
+        shutil.rmtree(kept.folder, ignore_errors=True)
 
     def _seg_bg_changed(self, *_):
-        if getattr(self, "seg_panel", None) is not None and \
-                self.stack.get_visible_child_name() == "segment":
+        if getattr(self, "seg_panel", None) is None:
+            return
+        if self.stack.get_visible_child_name() == "segment":
             self._update_seg_preview()
+        elif self.seg_result_output is not None:
+            # Changed from another page: redrawn on the way back (_on_page_changed).
+            self._seg_preview_stale = True
 
     def get_settings(self):
         model = self._bg_model_key()
@@ -1731,6 +1944,11 @@ class Window(Adw.ApplicationWindow):
         new = self.stack.get_visible_child_name()
         old = getattr(self, "_cur_page", None)
         self._cur_page = new
+        if new == "segment" and getattr(self, "_seg_preview_stale", False):
+            # Save selection waits for the preview of the settings it'll use.
+            self._seg_preview_stale = False
+            self.seg_save_btn.set_sensitive(False)
+            self._update_seg_preview()
         # Free a domain's model when you leave it (keep it resident while you're
         # on its page, so re-runs stay fast).
         if old is not None and self._domain(old) != self._domain(new):
@@ -1808,7 +2026,6 @@ class Window(Adw.ApplicationWindow):
         seg = self.stack.get_visible_child_name() == "segment"
         self.model_grp.set_visible(not seg)
         self.seg_grp.set_visible(seg and self._seg_available)
-        self.alpha_row.set_visible(not seg)
 
     def _accel_save(self):
         p = self.stack.get_visible_child_name()
@@ -1960,6 +2177,7 @@ class Window(Adw.ApplicationWindow):
             "Result", empty_icon="emblem-photos-symbolic",
             empty_title="Your selection appears here",
             empty_hint="Pick objects, then Save")
+        self.seg_res_panel.add_tool(self._output_button())
         paned.set_start_child(self.seg_panel.box)
         paned.set_end_child(self.seg_res_panel.box)
         paned.set_resize_start_child(True)
@@ -2398,6 +2616,7 @@ class Window(Adw.ApplicationWindow):
         self.res_panel = Panel(
             "Result", empty_icon="emblem-photos-symbolic",
             empty_title="Your cut-out appears here", empty_hint="Press Generate")
+        self.res_panel.add_tool(self._output_button())
         paned.set_start_child(self.src_panel.box)
         paned.set_end_child(self.res_panel.box)
         paned.set_resize_start_child(True)
@@ -2648,7 +2867,9 @@ class Window(Adw.ApplicationWindow):
         self.source_path = path
         self._source_animation = animation
         self.res_panel.view.clear()
+        self._stop_recomposite()
         self._replace_result(None)
+        self._forget_kept()
         self.save_btn.set_sensitive(False)
         self.gen_btn.set_sensitive(not self.busy)   # a batch may still be running
         if self._worker_state is not WorkerState.UP:
@@ -2705,6 +2926,10 @@ class Window(Adw.ApplicationWindow):
         old, self.result_output = self.result_output, path
         if old is not None and old != path and old not in self._animation_saves:
             self._remove_animation(old)
+        if old in self._live_results and old != path:
+            self._live_results.discard(old)
+            _remove_quietly(old)
+            _remove_quietly(old + ".preview.png")
 
     def _hold_animation(self, path):
         """Keep animation result `path` for a save until the returned release()."""
@@ -2976,6 +3201,7 @@ class Window(Adw.ApplicationWindow):
         if not busy:
             self.src_panel.view.set_scanning(False)   # end the scan shimmer
             self._hide_footer_progress()
+            self._schedule_recomposite()      # a background change waits for the job
             GLib.idle_add(self._replace_worker_when_idle)   # an Engine change waits for this job
 
     def _on_source_change(self):
@@ -2991,6 +3217,7 @@ class Window(Adw.ApplicationWindow):
             return
         if self._worker_state is WorkerState.DOWN:
             return
+        self._stop_recomposite()             # Generate makes a new result anyway
         model, bg, alpha, blur = self.get_settings()
         if self._source_animation is formats.Animation.ANIMATED:
             self._generate_animation(model, bg, alpha, blur)
@@ -3000,12 +3227,15 @@ class Window(Adw.ApplicationWindow):
         self.src_panel.view.set_scanning(True)      # scan shimmer over the source
         self.status.set_text("Generating…")
 
+        kept = self._new_kept(bg, blur)
+
         def send(inp):
             # The input is deleted once the job ends, if we encoded it.
             self._send_job(Job.SINGLE, {
                 "op": "single", "input": inp, "output": out,
-                "model": model, "alpha": alpha, "bg": bg, "blur": blur},
-                alpha=_alpha_of(bg), input=inp)
+                "model": model, "alpha": alpha, "bg": bg, "blur": blur,
+                "keep_dir": kept.folder},
+                alpha=_alpha_of(bg), input=inp, kept=kept)
 
         def failed(e):
             self.src_panel.view.set_scanning(False)
@@ -3029,12 +3259,19 @@ class Window(Adw.ApplicationWindow):
         self._set_busy(True, cancel=True)
         self.src_panel.view.set_scanning(True)
         self.status.set_text("Removing background from %s…" % fmt.name)
+        source = {"input": self.source_path, "rot": v.rot, "fh": v.fh, "fv": v.fv,
+                  "suffix": fmt.suffix}
+        kept = self._new_kept(bg, blur, animation=source)
         self._send_job(Job.SINGLE, {
             "op": "gif", "input": self.source_path, "output": out,
             "model": model, "alpha": alpha, "bg": bg, "blur": blur,
-            "rot": v.rot, "fh": v.fh, "fv": v.fv}, alpha=_alpha_of(bg))
+            "rot": v.rot, "fh": v.fh, "fv": v.fv, "keep_dir": kept.folder},
+            alpha=_alpha_of(bg), kept=kept)
 
     def _on_bg_cancel(self):
+        if self._has_job(Job.RECOMPOSITE):
+            self._cancel_jobs(Job.RECOMPOSITE)
+            self.gen_cancel_btn.set_sensitive(False)
         if not self.busy:
             return
         if self._preparing.pop(Prep.SINGLE, None) is not None:
@@ -3073,12 +3310,20 @@ class Window(Adw.ApplicationWindow):
             # Given up on: its replies, success or error, touch nothing. Once
             # it ends, the worker is done with any input of ours it read.
             if t in _JOB_ENDS:
-                self._remove_temp_input(self._abandoned.pop(rid).input)
+                gone = self._abandoned.pop(rid)
+                self._remove_temp_input(gone.input)
+                self._drop_kept(gone.kept)
+            if t == "recomposited":
+                # Written for nothing: a newer change replaced it.
+                for written in {msg["output"], msg.get("preview") or msg["output"]}:
+                    _remove_quietly(written)
             return False
         if t in _JOB_ENDS:
             req = self._jobs.pop(rid, None)
             if req is not None:
                 self._remove_temp_input(req.input)
+                if t not in _KEPT_ADOPTED:
+                    self._drop_kept(req.kept)
                 # An Engine change waits for every job; after this reply is handled.
                 GLib.idle_add(self._replace_worker_when_idle)
         else:
@@ -3142,6 +3387,7 @@ class Window(Adw.ApplicationWindow):
         elif t == "done_single":
             self._replace_result(msg["output"])
             self._result_alpha = req.alpha
+            self._adopt_kept(req.kept)
             # Save waits for the decode: until then the panel shows the old result.
             self.save_btn.set_sensitive(False)
             output = msg["output"]
@@ -3156,6 +3402,10 @@ class Window(Adw.ApplicationWindow):
             self.res_panel.view.load_file_async(output, done=decoded)
             self.status.set_text("Done in %.2fs." % msg["seconds"])
             self._set_busy(False)
+        elif t == "gif_progress" and job is Job.RECOMPOSITE:
+            self._footer_progress(msg["done"], msg["total"])
+            self.status.set_text("Changing the background — frame %d / %d"
+                                 % (msg["done"], msg["total"]))
         elif t == "gif_progress":
             self._footer_progress(msg["done"], msg["total"])
             if msg["done"] == 0:
@@ -3177,6 +3427,12 @@ class Window(Adw.ApplicationWindow):
                                  % (msg["frames"], msg["seconds"],
                                     formats.format_of(msg["output"]).name))
             self._set_busy(False)
+            self._adopt_kept(req.kept)
+        elif t == "recomposited":
+            self._on_recomposited(req, msg)
+        elif t == "canceled" and job is Job.RECOMPOSITE:
+            self._recomposite_over()
+            self.status.set_text("Cancelled: the result keeps its last background.")
         elif t == "canceled":
             self._set_busy(False, spin=(msg.get("scope") != "batch"))
             if msg.get("scope") == "batch":
@@ -3351,6 +3607,11 @@ class Window(Adw.ApplicationWindow):
         elif job is Job.SINGLE:
             self.status.set_text(text)
             self._set_busy(False)
+        elif job is Job.RECOMPOSITE:
+            # The shown result keeps its last background, e.g. when an
+            # animation's source changed on disk since it was generated.
+            self.status.set_text(text)
+            self._recomposite_over()
         else:                       # a reply to no request we track
             for label in (self.status, self.batch_status, self.seg_status):
                 label.set_text(text)
@@ -3438,6 +3699,7 @@ class Window(Adw.ApplicationWindow):
         self._preparing.clear()
         for req in lost:
             self._remove_temp_input(req.input)
+            self._drop_kept(req.kept)
             if req.job is Job.SAVE:
                 self._on_save_reply(req.save, {
                     "type": "error", "message": "the background process stopped."})
