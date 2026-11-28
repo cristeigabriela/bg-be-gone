@@ -46,8 +46,9 @@ param(
     [string]$RecordFile
 )
 
-# 'Continue' + explicit exit-code checks: pacman writes progress to stderr.
-$ErrorActionPreference = 'Continue'
+# Any failure stops the script. pacman and the other programs run through
+# Invoke-NativeShown or Invoke-Msys2, with their exit codes checked.
+$ErrorActionPreference = 'Stop'
 
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Import-Module (Join-Path $Here 'BgBeGone.Windows.psm1') -Force -ErrorAction Stop
@@ -85,7 +86,9 @@ $bash = Join-Path $Msys2Root 'usr\bin\bash.exe'
 function Invoke-Msys2 {
     <# Run a command in an MSYS2 login shell and return what it prints, to parse. #>
     param([string]$Command)
-    & $bash -lc $Command
+    # A scope of its own with 'Continue': under 'Stop' a captured stderr line
+    # would throw even on success. Callers check $LASTEXITCODE.
+    & { $ErrorActionPreference = 'Continue'; & $bash -lc $Command }
 }
 
 function Invoke-Msys2Shown {
@@ -128,8 +131,15 @@ function Install-Msys2Base {
         if ($LASTEXITCODE -ne 0) { throw "The MSYS2 base archive failed to unpack into $unpack" }
         Move-Item -LiteralPath (Join-Path $unpack 'msys64') $Msys2Root -ErrorAction Stop
     } finally {
-        Remove-Item -LiteralPath $download -Recurse -Force -ErrorAction SilentlyContinue
-        if (Test-Path -LiteralPath $unpack) { Remove-Item -LiteralPath $unpack -Recurse -Force -ErrorAction SilentlyContinue }
+        # Tolerated, but said: leftovers in our own temp and staging folders
+        # must not hide the error that brought us here.
+        foreach ($leftover in $download, $unpack) {
+            try {
+                if (Test-Path -LiteralPath $leftover) { Remove-Item -LiteralPath $leftover -Recurse -Force }
+            } catch {
+                Write-Warning "Could not remove $($leftover): $_"
+            }
+        }
     }
     # The first login shell creates the home folder and pacman's keyring.
     Invoke-Msys2Shown ' '

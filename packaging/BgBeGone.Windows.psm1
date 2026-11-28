@@ -32,6 +32,13 @@ $script:InventoryName = 'bg-be-gone-files.txt'
 
 $script:Utf8NoBom = New-Object Text.UTF8Encoding($false)
 
+# Every function here fails loudly: module code reads this, not its caller's
+# preference. Programs run through Invoke-NativeShown or in a scope of their
+# own with 'Continue', since under 'Stop' Windows PowerShell 5.1 throws at a
+# program's first captured stderr line even when it succeeds; their exit
+# codes are checked instead.
+$ErrorActionPreference = 'Stop'
+
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
@@ -543,7 +550,8 @@ function New-WorkerPython {
 
     # python-build-standalone marks itself as managed by the tool that
     # installed it. This copy belongs to the worker, which installs into it.
-    Remove-Item -LiteralPath (Join-Path $Dest 'Lib\EXTERNALLY-MANAGED') -Force -ErrorAction SilentlyContinue
+    $managed = Join-Path $Dest 'Lib\EXTERNALLY-MANAGED'
+    if (Test-Path -LiteralPath $managed) { Remove-Item -LiteralPath $managed -Force }
 }
 
 function Install-LockedPackage {
@@ -620,7 +628,10 @@ function Invoke-WorkerPython {
 function Stop-ProcessTree {
     <# The runner's child outlives a plain Kill, so end the whole tree. #>
     param([Parameter(Mandatory)][Diagnostics.Process]$Process)
-    if (-not $Process.HasExited) { & taskkill.exe /F /T /PID $Process.Id 2>&1 | Out-Null }
+    if ($Process.HasExited) { return }
+    # Tolerated: the tree may end on its own meanwhile, and taskkill's
+    # complaint about a process already gone is no failure of ours.
+    & { $ErrorActionPreference = 'Continue'; & taskkill.exe /F /T /PID $Process.Id 2>&1 | Out-Null }
 }
 
 function Test-Worker {
@@ -708,7 +719,8 @@ for n in names:
         pass
 print(json.dumps({'python': platform.python_version(), 'packages': pkgs}))
 '@
-    $versions = & (Get-WorkerPython $WorkerDir) -I -c $query
+    # Output is data here, so not Invoke-NativeShown: a scope of its own instead.
+    $versions = & { $ErrorActionPreference = 'Continue'; & (Get-WorkerPython $WorkerDir) -I -c $query }
     if ($LASTEXITCODE -ne 0) { throw "Could not read the package versions in $WorkerDir" }
     Write-Utf8File (Join-Path $WorkerDir 'versions.json') $versions
 }
@@ -725,7 +737,7 @@ function Complete-Worker {
     param([Parameter(Mandatory)][string]$WorkerDir)
     # Lib\ only: the stdlib and site-packages. tcl\ ships a .py data file that
     # isn't valid Python 3 and is never imported.
-    & (Get-WorkerPython $WorkerDir) -I -m compileall -q -j 0 (Join-Path $WorkerDir 'Lib') | Out-Null
+    Invoke-NativeShown (Get-WorkerPython $WorkerDir) @('-I', '-m', 'compileall', '-q', '-j', '0', (Join-Path $WorkerDir 'Lib'))
     if ($LASTEXITCODE -ne 0) { throw "Compiling the worker's bytecode failed" }
     Write-Inventory $WorkerDir
 }
@@ -832,7 +844,7 @@ function Install-LaunchModule {
     Write-Utf8File $path $text
     # Compiled now, so its .pyc is part of the tree's inventory instead of a
     # file the first start leaves behind.
-    & (Join-Path $GtkRoot 'bin\python.exe') -I -m py_compile $path
+    Invoke-NativeShown (Join-Path $GtkRoot 'bin\python.exe') @('-I', '-m', 'py_compile', $path)
     if ($LASTEXITCODE -ne 0) { throw "Compiling $path failed" }
     $path
 }

@@ -202,6 +202,11 @@ jobs:
           Copy-Item tests/testdata/subject.png $photo
           ./packaging/test-windows-launch.ps1 -Shortcut $env:BGBG_LNK -Open $photo -Expect seg
 
+      # A second install, on the MSYS2 above, whose shortcut step can't succeed.
+      - name: A failed step fails the install
+        shell: pwsh
+        run: ./packaging/test-install-failure.ps1 -Msys2Root "$env:BGBG_PREFIX\msys64" -Prefix "$env:RUNNER_TEMP\failtest\bg-be-gone"
+
       - name: Uninstall removes only what it installed
         shell: pwsh
         run: |
