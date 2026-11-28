@@ -1407,6 +1407,7 @@ class Window(Adw.ApplicationWindow):
 
         worker = Worker(deliver, first_id=first_id)
         self.worker = worker
+        self._forget_seg_model()           # a new worker holds no Segment model
 
     def _offer_engines(self, on_offer, settings_path):
         """Show Model > Advanced > Engine when the worker can run PyTorch,
@@ -1627,6 +1628,14 @@ class Window(Adw.ApplicationWindow):
         choice = self._seg_model_choice()
         return "Auto" if choice == SEG_AUTO else self._seg_label(choice)
 
+    def _forget_seg_model(self):
+        """Segment's model was released, or its worker went: name no model as loaded."""
+        self._seg_in_use = None
+        if getattr(self, "seg_model_row", None) is not None:
+            self._refresh_seg_subtitles()
+        if getattr(self, "footer_context", None) is not None:
+            self._update_footer()
+
     def _refresh_seg_subtitles(self):
         """Name Segment's model, the one loaded or else the one asked for, and its cost.
 
@@ -1740,6 +1749,7 @@ class Window(Adw.ApplicationWindow):
             self.seg_loaded_for = None
             self.seg_pending = None
             self._abandon_jobs({Job.SEG_LOAD})  # its reply would re-mark it loaded
+            self._forget_seg_model()
         if self.worker.ok:
             self.worker.send({"op": "unload", "scope": scope})
 
@@ -3357,6 +3367,7 @@ class Window(Adw.ApplicationWindow):
         self._end_requests_in_flight()
         self.seg_pending = None
         self.seg_loaded_for = None
+        self._forget_seg_model()
         self._set_busy(False)
         self._seg_set_busy(False)
         self._release_source_actions()
