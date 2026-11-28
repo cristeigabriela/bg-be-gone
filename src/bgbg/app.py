@@ -1367,6 +1367,7 @@ class Window(Adw.ApplicationWindow):
         self.blur_row.connect("notify::value", self._on_output_changed)
         self.output_list.append(self.blur_row)
         self._output_buttons = []
+        self._output_owner = None       # the popover holding the rows, if any
 
     def _output_button(self):
         """The Output button for a Result header: the current background, as
@@ -1378,12 +1379,15 @@ class Window(Adw.ApplicationWindow):
         button.set_popover(popover)
 
         def show_rows(*_):
-            # One set of rows: they move into whichever popover opens.
-            holder = self.output_list.get_parent()
-            if holder is not popover:
-                if holder is not None:
-                    holder.set_child(None)
+            # One set of rows: they move into whichever popover opens. Their
+            # parent is the popover's own contents widget, so the popover
+            # that holds them is kept here to hand them over.
+            owner = self._output_owner
+            if owner is not popover:
+                if owner is not None:
+                    owner.set_child(None)
                 popover.set_child(self.output_list)
+                self._output_owner = popover
         popover.connect("show", show_rows)
         self._output_buttons.append((button, content))
         self._sync_output_buttons()
