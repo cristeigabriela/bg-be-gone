@@ -1444,7 +1444,8 @@ class Window(Adw.ApplicationWindow):
             cancel=self.seg_cancel_btn, save=self.seg_save_btn,
             status_text="Open an image, then Segment.")
         self.seg_banner = Adw.Banner(
-            title="Tip: hold Space to pan · click to keep objects · Ctrl-click removes")
+            title="Tip: hold Space to pan · click to keep objects · "
+                  "in Click to select, Ctrl-click removes")
         self.seg_banner.set_button_label("Got it")
         self.seg_banner.connect(
             "button-clicked", lambda *_: self.seg_banner.set_revealed(False))
@@ -1705,9 +1706,13 @@ class Window(Adw.ApplicationWindow):
         self._update_seg_preview()
         n = len(self.seg_panel.view.get_seg_selection())
         if not self.seg_busy:
-            self._seg_base_status = (
-                "%d selected — Save selection." % n if n
-                else "Click objects to keep them (they light up on hover).")
+            if not self.seg_objects:       # a click before there is anything to pick
+                self._seg_base_status = ("Press Segment everything first: it finds the "
+                                         "objects to pick from.")
+            elif n:
+                self._seg_base_status = "%d selected — Save selection." % n
+            else:
+                self._seg_base_status = "Click objects to keep them (they light up on hover)."
             self.seg_status.set_text(self._seg_base_status)
 
     def _on_seg_hover(self, depth, drilled, wx=0.0, wy=0.0):
@@ -2655,8 +2660,8 @@ class Window(Adw.ApplicationWindow):
             (self.batch_status if job is Job.BATCH else self.status).set_text(text)
             self._footer_download(msg)
         elif t == "seg_step":
-            self.seg_status.set_text(
-                "%s unavailable — trying a lighter model…" % msg["rung"])
+            label = {m["rung"]: m["label"] for m in self._seg_models}.get(msg["rung"], msg["rung"])
+            self.seg_status.set_text("%s couldn't load — trying a lighter model…" % label)
         elif t == "seg_progress":
             # The scan shimmer conveys activity; keep a calm static label, but
             # also drive the shared footer progress bar.
@@ -2696,8 +2701,8 @@ class Window(Adw.ApplicationWindow):
             self.seg_panel.view.set_point_mask(msg["mask"], msg.get("contour"))
             self._update_seg_preview()
             self.seg_status.set_text(
-                "Object selected (%.2f) — Save, or click to refine." %
-                msg["score"])
+                "Object selected (the model is %d%% sure) — Save, or click to refine."
+                % round(100 * msg["score"]))
         elif t == "seg_extracted":
             out = msg["output"]
             if job is Job.SEG_PREVIEW:              # live prerender → right panel
@@ -2805,10 +2810,10 @@ class Window(Adw.ApplicationWindow):
             page.add(g)
 
         group("Remove a background", "Single &amp; Batch tabs", [
-            ("document-open-symbolic", "Open or drop an image",
-             "Drag a file in, or click Open in the header."),
+            ("document-open-symbolic", "Open, drop or paste an image",
+             "Drag a file in, click Open in the header, or press Ctrl+V."),
             ("applications-graphics-symbolic", "Pick a subject or model",
-             "General, portrait, anime — or an exact model under Advanced."),
+             "General, portrait, anime — or an exact model with Subject → Custom model…"),
             ("image-x-generic-symbolic", "Generate, then Save",
              "Output transparent, blurred, or a solid colour."),
             ("view-grid-symbolic", "Batch a whole folder",

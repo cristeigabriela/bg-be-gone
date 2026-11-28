@@ -236,13 +236,15 @@ without the download size — and see
   (`{name}` = original filename, `{n}` = index), and click **Run batch**. Output
   is PNG. Batch takes every still format above; animated GIFs and WebPs go
   through the Single page.
-- **Segment:** open an image and pick a **Mode** in the sidebar. In *Everything*,
-  click **Segment everything** to detect objects as tinted layers, click the ones
-  to keep (the rest dim), then **Extract selection**. Hovering highlights the whole
-  object; keep hovering to focus the part under the cursor (**Focus speed** sets how
-  long that takes). In *Click to select*, click an object to select it (Ctrl-click
-  or right-click to subtract), then **Extract**. **Cancel** stops a slow run.
-  Extract uses the same background options as background removal.
+- **Segment:** open an image and pick a mode with the toggle under the buttons.
+  In *Everything*, click **Segment everything** to detect objects as tinted layers,
+  click the ones to keep (the rest dim), then **Save selection**. Hovering
+  highlights the whole object; keep hovering to focus the part under the cursor
+  (**Focus speed** sets how long that takes). In *Click to select*, click an object
+  to select it (Ctrl-click or right-click to subtract), then **Save selection**.
+  **Cancel** stops a slow run. Each mode keeps what it found when you switch, and
+  leaving the page frees only the model; **Clear** drops the objects. Saving uses
+  the same background options as background removal.
 
 ## GPU support
 
