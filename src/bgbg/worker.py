@@ -654,32 +654,42 @@ def handle_single(req):
          "seconds": round(time.time() - t, 2), "id": rid})
 
 
-def _webp_frames(path):
-    """How many frames a WebP holds, from its header; 1 for any other format.
+# Containers whose extra frames are an animation, by Pillow's format name. A
+# multi-page TIFF or multi-image HEIC is a set of stills: a batch keeps the first.
+_ANIMATED_CONTAINERS = {"GIF": "GIF", "PNG": "PNG", "WEBP": "WebP"}
 
-    A file that won't open counts as one frame, so process_one reports it with
-    its name like any other unreadable image.
+
+def _animated_container(path):
+    """The container's name when the file animates, whatever its name says; else None.
+
+    A file that won't open counts as a still, so the batch reports it with its
+    name like any other unreadable image.
     """
-    if formats.format_of(path) is not formats.WEBP:
-        return 1
     try:
         with Image.open(path) as im:
-            return getattr(im, "n_frames", 1)
+            if getattr(im, "is_animated", False):
+                return _ANIMATED_CONTAINERS.get(im.format)
     except (UnidentifiedImageError, OSError):
-        return 1
+        pass
+    return None
 
 
 def _batch_skip_reason(path):
     """Why a batch leaves out an image it can read, or None to process it.
 
     Batch keeps one frame per file, so animations go through the Single page,
-    which keeps them all. A GIF is left out even as a still, as before.
+    which keeps them all; a GIF is left out even as a still. Single animates
+    by the file's name, so a .png that animates isn't sent there.
     """
     if not path.lower().endswith(formats.BATCH_SUFFIXES):
         return "it's a GIF; open it on the Single page, which keeps every frame."
-    if _webp_frames(path) > 1:
-        return "it's an animated WebP; open it on the Single page, which keeps every frame."
-    return None
+    container = _animated_container(path)
+    if container is None:
+        return None
+    if formats.can_animate(path):
+        return ("it's an animated %s; open it on the Single page, which keeps every frame."
+                % container)
+    return "it's an animated %s; a batch would keep only its first frame." % container
 
 
 def _batch_sources(req):

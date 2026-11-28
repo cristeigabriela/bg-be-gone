@@ -179,7 +179,8 @@ def scan_folder(folder):
 
     Hidden files are left out, as the worker's own folder scan leaves them
     out: a batch's unfinished part files are hidden. A GIF counts as
-    animated even when it is a still, since batch leaves every GIF out.
+    animated even when it is a still, since batch leaves every GIF out; any
+    other file is judged by its header, as the worker judges it by content.
     """
     found = []
     with os.scandir(folder) as entries:
@@ -191,10 +192,8 @@ def scan_folder(folder):
                 continue
             if fmt is formats.GIF:
                 animation = formats.Animation.ANIMATED
-            elif fmt is formats.WEBP:
-                animation = formats.webp_animation(entry.path)
             else:
-                animation = formats.Animation.STILL
+                animation = formats.animation_in(entry.path)
             found.append((entry.path, animation))
     found.sort(key=lambda image: os.path.basename(image[0]).casefold())
     return found

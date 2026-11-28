@@ -181,6 +181,26 @@ def test_a_skipped_animation_is_listed_with_its_reason(worker, folders, fixture,
     assert names(outdir) == ["a_nobg.png"], "the other images still run"
 
 
+@pytest.mark.parametrize("fixture, name, kind", [
+    # An animated PNG (make_apng_fixture.py): a batch would write its first frame alone.
+    ("animated.png", "walk.png", "PNG"),
+    # An animated WebP saved as .png: what's inside decides, not the name.
+    ("animated.webp", "moving.png", "WebP"),
+], ids=["apng", "webp-named-png"])
+def test_an_animation_is_skipped_whatever_its_name_says(worker, folders, fixture, name, kind):
+    """Only WebP was checked for frames, so an animated PNG came out a still."""
+    indir, outdir = folders
+    add_image(indir, "a.png")
+    add_image(indir, name, fixture=fixture)
+    reply = run_batch(worker, indir, outdir, "{name}_nobg")
+    # A .png opens as a still on the Single page too, so it isn't sent there.
+    assert reply["skipped"] == [{
+        "name": name,
+        "message": "it's an animated %s; a batch would keep only its first frame." % kind}], \
+        "the summary names the skipped file, and why"
+    assert names(outdir) == ["a_nobg.png"], "the other images still run"
+
+
 @pytest.mark.parametrize("pattern, message", [
     # A token that doesn't exist: refused, never quietly replaced by "{name}_nobg".
     ("{foo}", "The rename pattern uses {foo}, which isn't a token. Use {name} or {n}."),

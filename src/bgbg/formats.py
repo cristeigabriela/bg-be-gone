@@ -9,6 +9,7 @@ HEIC/HEIF. The frontend previews with GdkPixbuf and asks the worker for a PNG
 when no GdkPixbuf loader is installed for the format.
 """
 import os
+import struct
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -92,25 +93,49 @@ def batch_output_key(fmt):
 
 # libwebp's ANIMATION_FLAG, in the flags byte of an extended (VP8X) header.
 _WEBP_ANIMATION_FLAG = 0x02
+# The PNG signature, and the chunks that settle it: the APNG spec puts acTL
+# before the first IDAT, so reaching IDAT first means a still.
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_ANIMATION_CHUNK, _PNG_IMAGE_CHUNK = b"acTL", b"IDAT"
+# Chunks read at most before giving up and calling it a still.
+_PNG_MAX_CHUNKS = 64
 
 
-def webp_animation(path):
-    """Whether a WebP file says it animates, from its first 21 bytes.
+def animation_in(path):
+    """Whether a PNG or WebP file says it animates, from its header alone.
 
-    Only an extended (VP8X) WebP can animate, and its header says so, so a
-    folder can be sorted without decoding it. A file that can't be read, or
-    isn't a WebP, counts as a still: a batch then reports it like any other
-    image it can't read.
+    Read by content, not by name, so a folder can be sorted without decoding
+    it: only an extended (VP8X) WebP or a PNG with an acTL chunk animates. A
+    file that can't be read, or is neither, counts as a still: a batch then
+    reports it like any other image it can't read, or animates.
     """
     try:
         with open(path, "rb") as f:
             head = f.read(21)
+            if head.startswith(_PNG_SIGNATURE):
+                return _png_animation(f)
     except OSError:
         return Animation.STILL
     if len(head) < 21 or head[0:4] != b"RIFF" or head[8:12] != b"WEBP" \
             or head[12:16] != b"VP8X":
         return Animation.STILL
     return Animation.ANIMATED if head[20] & _WEBP_ANIMATION_FLAG else Animation.STILL
+
+
+def _png_animation(f):
+    """Walk a PNG's chunks, from just after its signature, to acTL or IDAT."""
+    f.seek(len(_PNG_SIGNATURE))
+    for _ in range(_PNG_MAX_CHUNKS):
+        header = f.read(8)
+        if len(header) < 8:
+            break
+        length, kind = struct.unpack(">I4s", header)
+        if kind == _PNG_ANIMATION_CHUNK:
+            return Animation.ANIMATED
+        if kind == _PNG_IMAGE_CHUNK:
+            break
+        f.seek(length + 4, os.SEEK_CUR)        # the chunk's data and its CRC
+    return Animation.STILL
 
 
 def default_save_format(source_path, choices):

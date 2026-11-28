@@ -96,6 +96,12 @@ TESTDATA = Path(__file__).parent / "testdata"
     ("subject.webp", formats.Animation.STILL),
     # Named .webp but not one: a still, which the batch then reports it can't read.
     ("not_an_image.webp", formats.Animation.STILL),
-], ids=["animated", "still", "not-a-webp"])
-def test_the_gallery_tells_an_animated_webp_from_its_header(fixture, want):
-    assert formats.webp_animation(str(TESTDATA / fixture)) is want
+    # An animated PNG: an acTL chunk before its image data (make_apng_fixture.py).
+    ("animated.png", formats.Animation.ANIMATED),
+    # A plain PNG has none.
+    ("subject.png", formats.Animation.STILL),
+    # A JPEG never animates.
+    ("subject.jpg", formats.Animation.STILL),
+], ids=["webp-animated", "webp-still", "not-a-webp", "apng", "png-still", "jpeg"])
+def test_the_gallery_tells_an_animation_from_its_header(fixture, want):
+    assert formats.animation_in(str(TESTDATA / fixture)) is want

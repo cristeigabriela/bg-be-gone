@@ -422,6 +422,8 @@ class _Tile(Gtk.Overlay):
         self._check.set_visible(item.selectable)
         self._check.set_sensitive(self._gallery.editing is Editing.OPEN)
         self._badge.set_visible(not item.selectable)
+        # Single animates by the file's name: an animated .png opens as a still there.
+        self._badge.set_text("Single only" if formats.can_animate(item.path) else "Animated")
         self._name.set_text(item.name)
 
         face = item.face if item.state is TileState.DONE else Face.SOURCE
@@ -475,7 +477,9 @@ _STATE_ICONS = {
 def _tooltip(item):
     """The file's name, then what happened to it, in words."""
     if not item.selectable:
-        return "%s\nAnimated: open it on the Single page, which keeps every frame." % item.name
+        if formats.can_animate(item.path):
+            return "%s\nAnimated: open it on the Single page, which keeps every frame." % item.name
+        return "%s\nAnimated: a batch would keep only its first frame." % item.name
     lines = [item.name]
     if item.state is TileState.QUEUED:
         lines.append("Waiting its turn")
