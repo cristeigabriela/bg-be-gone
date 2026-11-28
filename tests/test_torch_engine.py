@@ -11,7 +11,7 @@ import sys
 import pytest
 
 from engines import torch_birefnet
-from test_worker import TESTDATA, WORKER, Worker
+from workerpipe import TESTDATA, WORKER, Worker
 
 FAKE_TORCH = TESTDATA / "fake_torch"
 GOOD = b"checkpoint bytes"

@@ -19,13 +19,14 @@ Requests (one JSON object per line on stdin):
                                              # GIF or WebP (animated) by output
   {"op":"convert","input":P,"output":P,"id":N}   # re-encode as output's format
   {"op":"frames","input":P,"id":N}           # count an image's frames
-  {"op":"cancel"}                            # stop single/batch/gif in progress
+  {"op":"cancel","id":N}     # stop request N: running, or skipped once it's due
   {"op":"models"}
-  {"op":"seg_load","input":P,"model":"auto|large|base_plus|small|tiny|mobile","id":N}
+  {"op":"seg_load","input":P,"model":"auto|large|base_plus|small|tiny|mobile",
+   "maskdir":D,"id":N}
   {"op":"seg_everything","points_per_side":int?,"id":N}
   {"op":"seg_point","points":[[x,y,label],...],"use_prev":bool,"id":N}
   {"op":"seg_extract","ids":[...]|"mask":P,"bg":BG,"blur":int,"output":P,"id":N}
-  {"op":"seg_cancel"}
+  {"op":"seg_cancel","id":N}                 # the same as cancel
   {"op":"engine_status","id":N}              # waits for PyTorch's start-up, if any
   {"op":"shutdown"}
 
@@ -581,7 +582,8 @@ def handle_seg_load(req):
     path = req["input"]
     want = req.get("model", "auto")
     pil = open_image(path).convert("RGB")
-    maskdir = os.path.join(os.path.dirname(os.path.abspath(path)), "segmasks")
+    # The input can be the user's own photo, so the masks never go next to it.
+    maskdir = req.get("maskdir") or tempfile.mkdtemp(prefix="bg-be-gone-masks-")
     os.makedirs(maskdir, exist_ok=True)
 
     def on_step(rung, exc):
@@ -815,13 +817,67 @@ def _dispatch(req):
              "message": f"{e}\n{traceback.format_exc()}", "id": rid})
 
 
+class _Cancels:
+    """Which requests a cancel has reached, by request id.
+
+    The stdin thread hands cancels in as they arrive; the worker thread runs
+    one request at a time. A cancel for the running request sets that
+    request's own event. One for a request still queued is kept, and the
+    request is skipped when it comes up.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._running = None        # (request id, its Event) while one runs
+        self._queued = set()        # ids cancelled before they started
+
+    def start(self, rid):
+        """Begin request `rid`: its cancel Event, or None if it was cancelled
+        while queued and must be skipped."""
+        with self._lock:
+            if rid in self._queued:
+                self._queued.discard(rid)
+                return None
+            event = threading.Event()
+            self._running = (rid, event)
+            return event
+
+    def finish(self):
+        with self._lock:
+            self._running = None
+
+    def cancel(self, rid):
+        with self._lock:
+            if self._running is not None and self._running[0] == rid:
+                self._running[1].set()
+            else:
+                self._queued.add(rid)
+
+
+_cancels = _Cancels()
+
+
 def _worker_loop(q):
+    global _cancel
     while True:
         req = q.get()
         if req is None:
             return
-        _cancel.clear()
-        _dispatch(req)
+        rid = req.get("id")
+        event = _cancels.start(rid)
+        if event is None:
+            # Cancelled while queued: it ends here, and says so.
+            if req.get("op") in _SEG_OPS:
+                out({"type": "seg_canceled", "id": rid})
+            else:
+                out({"type": "canceled", "scope": req.get("op"), "id": rid})
+            continue
+        # Handlers check the module's _cancel; for this request it is its own.
+        _cancel = event
+        try:
+            _dispatch(req)
+        finally:
+            _cancels.finish()
 
 
 def main():
@@ -842,9 +898,13 @@ def main():
             break
         # Cancel is handled on the stdin thread so it can interrupt a running
         # task (segmentation checks _cancel between grid points; gif between
-        # frames). "seg_cancel" is kept for back-compat.
+        # frames). It names the request it is for; "seg_cancel" is kept for
+        # back-compat.
         if op in ("cancel", "seg_cancel"):
-            _cancel.set()
+            if req.get("id") is None:
+                sys.stderr.write("a cancel that names no request is ignored\n")
+            else:
+                _cancels.cancel(req["id"])
             continue
         q.put(req)
 

@@ -7,6 +7,7 @@ resident on the GPU. Frontend and worker talk over line-delimited JSON.
 """
 import os
 import sys
+import enum
 import json
 import logging
 import shutil
@@ -33,6 +34,7 @@ from viewer import (  # noqa: E402
 )
 import formats  # noqa: E402
 from engines import selection  # noqa: E402  (standard library only)
+import offmain  # noqa: E402
 
 APP_ID = "io.github.cristeigabriela.BgBeGone"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -72,11 +74,57 @@ def _run_off_main(work, done):
     threading.Thread(target=thread, daemon=True).start()
 
 
+class Job(enum.Enum):
+    """What a request sent to the worker is for.
+
+    Every reply carries its request's id. Window keeps the requests still in
+    flight by id, so a reply for one that no longer applies (its image was
+    replaced, or the page unloaded its model) is dropped instead of landing
+    on new work.
+    """
+
+    OPEN = "open"                # decode a new source, or count its frames
+    SINGLE = "single"            # Generate, on a still or an animation
+    BATCH = "batch"
+    SAVE = "save"                # re-encode a result as WebP or JPEG for Save
+    SEG_LOAD = "seg_load"        # load SAM and encode the image
+    SEG_RUN = "seg_run"          # Segment everything, or a click in point mode
+    SEG_PREVIEW = "seg_preview"  # the live composite in Segment's result panel
+    SEG_SAVE = "seg_save"        # the full-size render behind Save selection
+
+
+# Reply types that belong to one request; any other reply is window-wide state.
+_JOB_REPLIES = {
+    "loading", "done_single", "gif_progress", "gif_done", "canceled", "progress",
+    "done_batch", "converted", "frames", "seg_ready", "seg_download", "seg_step",
+    "seg_progress", "seg_objects", "seg_mask", "seg_extracted", "seg_canceled", "error",
+}
+# Reply types that end their request.
+_JOB_ENDS = {
+    "done_single", "gif_done", "canceled", "done_batch", "converted", "frames",
+    "seg_ready", "seg_objects", "seg_mask", "seg_extracted", "seg_canceled", "error",
+}
+_SEG_JOBS = {Job.SEG_LOAD, Job.SEG_RUN, Job.SEG_PREVIEW, Job.SEG_SAVE}
+
+
+class Abandoned(enum.Enum):
+    """Whether Window._abandon_jobs found any of the jobs it was given."""
+
+    SOME = "some"
+    NONE = "none"
+
+
+class Prep(enum.Enum):
+    """Whose input file is being encoded, before its request can be sent."""
+
+    SINGLE = "single"            # Generate's input
+    SEGMENT = "segment"          # Segment's model load
+
+
 @dataclass
 class _PendingOpen:
     """A source the worker is decoding or probing before the app adopts it."""
 
-    rid: int
     path: str
     preview: Optional[str]   # what GdkPixbuf already shows, or None until the worker's PNG
 
@@ -88,6 +136,20 @@ class _PendingSave:
     target: formats.SaveTarget
     choices: tuple
     staging: Optional[str]   # our temporary PNG to delete afterwards, if any
+
+
+@dataclass
+class _InFlight:
+    """A request sent to the worker, kept by its id until its last reply."""
+
+    job: Job
+    # SINGLE and SEG_SAVE: whether the result is transparent, which decides
+    # if JPEG is offered. Recorded when sent, never read from the settings later.
+    alpha: Optional[formats.Alpha] = None
+    source: Optional[_PendingOpen] = None    # OPEN: the source being opened
+    save: Optional[_PendingSave] = None      # SAVE: where the re-encoded result goes
+    input: Optional[str] = None              # SINGLE: its input, deleted if we encoded it
+    loads: Optional[tuple] = None            # SEG_LOAD: the (source, model) it loads
 
 
 def _remove_quietly(path):
@@ -340,11 +402,24 @@ class Worker:
         rid = self._next_id
         self._next_id += 1
         req["id"] = rid
-        if self._queued is not None:
-            self._queued.append(req)
-        else:
-            self._write(req)
+        self._post(req)
         return rid
+
+    def cancel(self, rid):
+        """Ask the worker to stop request `rid`: running, or skipped when it
+        comes up. Written as is, since send() would give it an id of its own,
+        and here the id names the target."""
+        if not self.ok:
+            return
+        self._post({"op": "cancel", "id": rid})
+
+    def _post(self, message):
+        """Write `message` now, or hold it until "ready", in order: a cancel
+        sent that early waits behind the request it names."""
+        if self._queued is not None:
+            self._queued.append(message)
+        else:
+            self._write(message)
 
     def _write(self, req):
         try:
@@ -506,17 +581,17 @@ class Window(Adw.ApplicationWindow):
         self._source_animation = formats.Animation.STILL
         self.result_output = None
         # Whether the shown result's pixels are transparent, which decides if
-        # JPEG is offered. Recorded per request (id -> Alpha) and adopted with
-        # the result, never read from the settings at save time.
+        # JPEG is offered. Recorded per request (_InFlight.alpha) and adopted
+        # with the result, never read from the settings at save time.
         self._result_alpha = formats.Alpha.TRANSPARENT
-        self._generating_alpha = {}
-        self._seg_export_alpha = {}
-        # The source the worker is decoding or probing (a _PendingOpen), and
-        # every open request id still out, so a superseded reply is dropped.
-        self._open = None
-        self._open_rids = set()
-        # Results the worker is writing as WebP or JPEG: id -> _PendingSave.
-        self._pending_saves = {}
+        # Every request to the worker until its last reply: id -> _InFlight.
+        # A request given up on moves to _abandoned, where its late replies are
+        # dropped; its temporary input is still deleted once it ends.
+        self._jobs = {}
+        self._abandoned = {}
+        self._preparing = {}           # Prep -> token of the input encode under way
+        self._inputs_made = 0          # encoded inputs so far, to name each one's file
+        self._encoded_inputs = set()   # paths _prepare_input wrote, the only ones it deletes
         self.busy = False
         self.batch_input = None
         self.batch_output = None
@@ -524,9 +599,8 @@ class Window(Adw.ApplicationWindow):
         # segmentation state
         self._seg_available = False
         self._seg_models = []          # [{"rung","label"}] from the worker
-        self.seg_loaded_for = None     # source path currently encoded
+        self.seg_loaded_for = None     # (source path, model asked for) the worker holds
         self.seg_pending = None        # callback to run once seg_ready arrives
-        self._seg_load_rid = None      # id of the in-flight seg_load, or None
         self.seg_busy = False
         self.seg_objects = []
         self.seg_points = []           # accumulated [x, y, label] in point mode
@@ -822,7 +896,8 @@ class Window(Adw.ApplicationWindow):
         self._mark_stale()
 
     def _job_in_flight(self):
-        return self.busy or self.seg_busy or self._open is not None or bool(self._pending_saves)
+        """Whether a request is out to the worker, or an input is being made for one."""
+        return bool(self._jobs or self._preparing)
 
     def _replace_worker_when_idle(self):
         """Swap in a new worker for an Engine change once no job is in flight.
@@ -836,6 +911,10 @@ class Window(Adw.ApplicationWindow):
         label, self._engine_switch = self._engine_switch, None
         old = self.worker
         self.seg_loaded_for = None     # the new worker holds no encoded image
+        # The old worker's abandoned requests will never answer now.
+        for req in self._abandoned.values():
+            self._remove_temp_input(req.input)
+        self._abandoned.clear()
         self._start_worker()
         threading.Thread(target=old.shutdown, daemon=True).start()
         self._toast("Engine: %s." % label)
@@ -949,6 +1028,40 @@ class Window(Adw.ApplicationWindow):
         if old is not None and self._domain(old) != self._domain(new):
             self._release_domain(self._domain(old))
 
+    def _send_job(self, job, req, **details):
+        """Send a request and track it as `job` until its last reply.
+
+        `details` are _InFlight fields kept with it. Returns the request id,
+        or -1 when there is no worker to send it to.
+        """
+        rid = self.worker.send(req)
+        if rid >= 0:
+            self._jobs[rid] = _InFlight(job, **details)
+        return rid
+
+    def _has_job(self, *jobs):
+        return any(req.job in jobs for req in self._jobs.values())
+
+    def _rids(self, *jobs):
+        return [rid for rid, req in self._jobs.items() if req.job in jobs]
+
+    def _cancel_jobs(self, *jobs):
+        """Ask the worker to stop `jobs` by request id: the running one stops,
+        a queued one is skipped. Their replies still arrive and end them."""
+        for rid in self._rids(*jobs):
+            self.worker.cancel(rid)
+
+    def _abandon_jobs(self, jobs):
+        """Stop `jobs` and stop waiting for them: their late replies are dropped.
+
+        Returns Abandoned.SOME when there were any, Abandoned.NONE otherwise.
+        """
+        rids = self._rids(*jobs)
+        for rid in rids:
+            self.worker.cancel(rid)
+            self._abandoned[rid] = self._jobs.pop(rid)
+        return Abandoned.SOME if rids else Abandoned.NONE
+
     def _release_domain(self, domain):
         if domain == "bg":
             self._unload("bg")
@@ -956,8 +1069,11 @@ class Window(Adw.ApplicationWindow):
         # Stop any in-flight pass, then unload unconditionally. We can't rely on a
         # seg_canceled reply — only "segment everything" is cancellable; load /
         # point / extract finish normally — so unload authoritatively here.
+        self._abandon_jobs(_SEG_JOBS)
+        if self._preparing.pop(Prep.SEGMENT, None) is not None:
+            self._seg_set_busy(False)    # a load still being prepared: it is never sent
         if self.seg_busy:
-            self.worker.send({"op": "seg_cancel"})
+            self._seg_set_busy(False)
         self._unload("seg")
 
     def _unload(self, scope):
@@ -967,7 +1083,7 @@ class Window(Adw.ApplicationWindow):
         if scope == "seg":
             self.seg_loaded_for = None
             self.seg_pending = None
-            self._seg_load_rid = None      # ignore a load reply that's now stale
+            self._abandon_jobs({Job.SEG_LOAD})  # its reply would re-mark it loaded
             if getattr(self, "seg_panel", None) is not None:
                 self._seg_clear_overlays()
         if self.worker.ok:
@@ -1093,27 +1209,95 @@ class Window(Adw.ApplicationWindow):
         if not self.source_path:
             self._toast("Open an image first.")
             return
-        if self.seg_loaded_for == self.source_path:
+        # The model loaded for this image, and the model asked for: a load
+        # still running for another model doesn't count when it lands.
+        wanted = (self.source_path, self._seg_model_choice())
+        if self.seg_loaded_for == wanted:
             cb()
             return
         if self.seg_busy:
             return
-        inp = os.path.join(self.tmpdir, "seg_input.png")
-        try:
-            self.seg_panel.view.export_pixbuf().savev(inp, "png", [], [])
-        except Exception as e:
-            self._toast("Could not prepare image: %s" % e)
-            return
         self.seg_pending = cb
         self._seg_set_busy(True, cancel=True)
         self.seg_status.set_text("Preparing segmentation model…")
-        # Track this load so a reply that lands after we've left/unloaded (below)
-        # can be ignored instead of wrongly re-marking the model as resident.
-        self._seg_load_rid = self.worker.send({"op": "seg_load", "input": inp,
-                                               "model": self._seg_model_choice()})
+
+        def send(inp):
+            # Tracked as a job, so a reply that lands after we've left or
+            # unloaded is dropped instead of re-marking the model as resident.
+            # The masks go in our temp folder: the input can be the user's photo.
+            self._send_job(Job.SEG_LOAD, {
+                "op": "seg_load", "input": inp, "model": wanted[1],
+                "maskdir": os.path.join(self.tmpdir, "segmasks")}, loads=wanted)
+
+        def failed(e):
+            self._seg_set_busy(False)
+            self._toast("Could not prepare image: %s" % e)
+
+        self._prepare_input(Prep.SEGMENT, self.seg_panel.view, send, failed)
+
+    def _prepare_input(self, prep, view, send, failed):
+        """Hand the worker a file of what `view` shows, then call send(path).
+
+        The source file itself when the worker can read it, it is a still, and
+        it isn't rotated or flipped; otherwise a PNG encoded on a background
+        thread. Encoding a 4K photo on the UI thread froze the window for ~3 s
+        before each run.
+
+        An encode is tracked under `prep` from its start: a new image or a
+        cancel drops it, and its file, and send never runs. Each encode writes
+        a file of its own, so a late one can't overwrite a newer job's input.
+        """
+        src = self.source_path
+        if (src and not view.is_transformed() and formats.is_readable(src)
+                and self._source_animation is formats.Animation.STILL):
+            send(src)
+            return
+        pixbuf = view.export_pixbuf()
+        self._inputs_made += 1
+        dst = os.path.join(self.tmpdir, "input-%d.png" % self._inputs_made)
+        self._encoded_inputs.add(dst)
+        token = object()
+        self._preparing[prep] = token
+
+        def encode():
+            # Fast compression: the file is a temporary hand-off, read once.
+            pixbuf.savev(dst, "png", ["compression"], ["1"])
+            return dst
+
+        def encoded(result):
+            if self._preparing.get(prep) is not token:   # replaced or cancelled
+                self._remove_temp_input(dst)
+                return
+            del self._preparing[prep]
+            if isinstance(result, Exception):
+                self._remove_temp_input(dst)
+                failed(result)
+            else:
+                send(result)
+        offmain.run(encode, encoded)
+
+    def _remove_temp_input(self, path):
+        """Delete an input file this window encoded; leave any other file alone.
+
+        Only _prepare_input's own encodings: a pasted image lives in the same
+        temp folder, but it is the source, and later runs read it again.
+        """
+        if path in self._encoded_inputs:
+            self._encoded_inputs.discard(path)
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                _log.warning("could not remove the temporary input %s: %s", path, e)
+
+    def _in_tmpdir(self, path):
+        """Whether `path` is one of this window's own temporary files."""
+        tmp = os.path.normcase(os.path.abspath(self.tmpdir))
+        return os.path.normcase(os.path.abspath(path)).startswith(tmp + os.sep)
 
     def _on_seg_everything(self):
-        if self.seg_busy or self._open is not None:
+        if self.seg_busy or self._has_job(Job.OPEN):
             return
         self._ensure_seg_loaded(self._do_seg_everything)
 
@@ -1126,13 +1310,13 @@ class Window(Adw.ApplicationWindow):
         detail = self._seg_detail()
         if detail:
             req["points_per_side"] = detail
-        self.worker.send(req)
+        self._send_job(Job.SEG_RUN, req)
 
     def _on_seg_click(self, ix, iy, value, kind):
         if kind == "toggle":
             self._update_seg_selection_ui()
         else:  # point mode
-            if self.seg_busy or self._open is not None:
+            if self.seg_busy or self._has_job(Job.OPEN):
                 return
             self.seg_points.append([ix, iy, value])
             self._ensure_seg_loaded(self._do_seg_point)
@@ -1140,8 +1324,8 @@ class Window(Adw.ApplicationWindow):
     def _do_seg_point(self):
         self._seg_set_busy(True)
         self.seg_status.set_text("Refining selection…")
-        self.worker.send({"op": "seg_point", "points": self.seg_points,
-                          "use_prev": len(self.seg_points) > 1})
+        self._send_job(Job.SEG_RUN, {"op": "seg_point", "points": self.seg_points,
+                                     "use_prev": len(self.seg_points) > 1})
 
     def _on_seg_select_all(self):
         self.seg_panel.view.set_seg_selection([o["id"] for o in self.seg_objects])
@@ -1217,6 +1401,9 @@ class Window(Adw.ApplicationWindow):
         """Debounced worker prerender: the right panel shows the real output —
         all selected objects composited over the chosen background — exactly like
         the Single result, and as a normal image you can flip/rotate/zoom."""
+        # A preview still out is for the selection before this one: drop it
+        # now, not when the debounce fires, or it could still land.
+        self._abandon_jobs({Job.SEG_PREVIEW})
         if not self._seg_has_selection():
             if getattr(self, "_seg_preview_timer", None):
                 GLib.source_remove(self._seg_preview_timer)
@@ -1232,13 +1419,13 @@ class Window(Adw.ApplicationWindow):
     def _do_seg_prerender(self):
         self._seg_preview_timer = None
         if self._seg_has_selection():
-            self._seg_preview_rid = self.worker.send(self._seg_extract_req(
+            self._send_job(Job.SEG_PREVIEW, self._seg_extract_req(
                 os.path.join(self.tmpdir, "seg_preview.png")))
         return False
 
     def _on_seg_save(self):
         """Render the final PNG in the worker, then offer a save dialog."""
-        if self.seg_busy or self._open is not None:
+        if self.seg_busy or self._has_job(Job.OPEN):
             return
         if not self._seg_has_selection():
             self._toast("Pick at least one object first.")
@@ -1246,8 +1433,7 @@ class Window(Adw.ApplicationWindow):
         self._seg_set_busy(True)
         self.seg_status.set_text("Preparing export…")
         req = self._seg_extract_req(os.path.join(self.tmpdir, "seg_result.png"))
-        rid = self.worker.send(req)
-        self._seg_export_alpha[rid] = _alpha_of(req["bg"])
+        self._send_job(Job.SEG_SAVE, req, alpha=_alpha_of(req["bg"]))
 
     def _seg_save_file(self, src, alpha):
         """Offer the export at `src`, whose background `alpha` describes."""
@@ -1259,8 +1445,18 @@ class Window(Adw.ApplicationWindow):
         self._ask_save_path("_object", formats.save_formats(alpha), save)
 
     def _on_seg_cancel(self):
-        self.worker.send({"op": "seg_cancel"})
-        self._unload("seg")            # free the SAM model even if it isn't cancellable
+        if self._preparing.pop(Prep.SEGMENT, None) is not None:
+            # Still preparing the image: nothing has reached the worker yet.
+            self.seg_pending = None
+            self._seg_set_busy(False)
+            self.seg_status.set_text("Cancelled.")
+            return
+        # A load past its download can't be stopped. It still finishes, and
+        # keeps its model for the next run, but runs nothing.
+        self.seg_pending = None
+        # Its reply (stopped, or skipped if still queued) ends the busy state.
+        self._cancel_jobs(Job.SEG_LOAD, Job.SEG_RUN)
+        self.seg_cancel_btn.set_sensitive(False)
         self.seg_status.set_text("Cancelling…")
 
     def _on_seg_mode_changed(self, *_):
@@ -1446,8 +1642,8 @@ class Window(Adw.ApplicationWindow):
         """
         if not path:
             return
-        if self._open is not None:         # this open wins over one in flight
-            self._open = None
+        if self._has_job(Job.OPEN):         # this open wins over one in flight
+            self._abandon_jobs({Job.OPEN})
             self._release_source_actions()
         name = os.path.basename(path)
         if self.src_panel.view.load_file(path):
@@ -1468,7 +1664,7 @@ class Window(Adw.ApplicationWindow):
 
     def _request_open(self, path, req, preview):
         """Send the worker the convert or frames request that opening `path` waits on."""
-        rid = self.worker.send(req)
+        rid = self._send_job(Job.OPEN, req, source=_PendingOpen(path, preview))
         if rid == -1:
             _log.warning("can't open %s: the worker isn't running", path)
             if preview is not None:        # shown already; it just can't animate
@@ -1476,8 +1672,7 @@ class Window(Adw.ApplicationWindow):
                 return
             self._toast("Can't open %s: the worker isn't running." % os.path.basename(path))
             return
-        self._open = _PendingOpen(rid, path, preview)
-        self._open_rids.add(rid)
+        self._drop_old_source_jobs()
         self._hold_source_actions()
         self.status.set_text("Opening %s…" % os.path.basename(path))
 
@@ -1493,10 +1688,26 @@ class Window(Adw.ApplicationWindow):
         self.seg_everything_btn.set_sensitive(not self.seg_busy)
         self.seg_save_btn.set_sensitive(self.seg_result_output is not None)
 
-    def _on_open_reply(self, msg):
+    def _drop_old_source_jobs(self):
+        """A new image replaces the source: drop what is still on its way for
+        the old one, so the old cut-out or objects never land next to the new
+        image."""
+        # An input still being encoded for the old image: it is never sent.
+        if self._preparing.pop(Prep.SINGLE, None) is not None:
+            self._set_busy(False)
+        if self._preparing.pop(Prep.SEGMENT, None) is not None:
+            self.seg_pending = None
+            self._seg_set_busy(False)
+        # A Generate or Segment pass still running for it: whatever it still
+        # sends is dropped.
+        if self._abandon_jobs({Job.SINGLE}) is Abandoned.SOME:
+            self._set_busy(False)
+        if self._abandon_jobs(_SEG_JOBS) is Abandoned.SOME:
+            self.seg_pending = None
+            self._seg_set_busy(False)
+
+    def _on_open_reply(self, pending, msg):
         """The worker's answer to the open in flight: frames, converted or error."""
-        pending, self._open = self._open, None
-        GLib.idle_add(self._replace_worker_when_idle)   # an Engine change waits for this open
         self._release_source_actions()
         name = os.path.basename(pending.path)
         if msg["type"] == "error":
@@ -1522,12 +1733,13 @@ class Window(Adw.ApplicationWindow):
 
     def _show_source(self, path, preview, animation):
         """Adopt `path` as the source; `preview` is the file the views show."""
+        self._drop_old_source_jobs()
         self.source_path = path
         self._source_animation = animation
         self.res_panel.view.clear()
         self.result_output = None
         self.save_btn.set_sensitive(False)
-        self.gen_btn.set_sensitive(True)
+        self.gen_btn.set_sensitive(not self.busy)   # a batch may still be running
         if animation is formats.Animation.ANIMATED:
             tail = " — animated %s, press Generate." % formats.format_of(path).name
         else:
@@ -1544,7 +1756,7 @@ class Window(Adw.ApplicationWindow):
             self.seg_status.set_text(os.path.basename(path) + " — Segment.")
 
     def _on_save(self):
-        if self._open is not None:
+        if self._has_job(Job.OPEN):
             return
         # An animated result is the worker's file itself (all frames), saved in
         # its own format; a still result is the current pixbuf.
@@ -1645,17 +1857,15 @@ class Window(Adw.ApplicationWindow):
 
     def _save_via_worker(self, src, target, choices, staging):
         """Have the worker re-encode `src` as `target`; `staging` is ours to delete."""
-        rid = self.worker.send({"op": "convert", "input": src, "output": target.path})
+        rid = self._send_job(Job.SAVE, {"op": "convert", "input": src, "output": target.path},
+                             save=_PendingSave(target, choices, staging))
         if rid == -1:
             if staging is not None:
                 _remove_quietly(staging)
             self._toast("Save failed: the worker isn't running.")
             return
-        self._pending_saves[rid] = _PendingSave(target, choices, staging)
 
-    def _on_save_reply(self, msg):
-        pending = self._pending_saves.pop(msg["id"])
-        GLib.idle_add(self._replace_worker_when_idle)   # an Engine change waits for this save
+    def _on_save_reply(self, pending, msg):
         if pending.staging is not None:
             _remove_quietly(pending.staging)
         if msg["type"] == "error":
@@ -1718,25 +1928,30 @@ class Window(Adw.ApplicationWindow):
             self.status.set_text("Settings changed — press Generate to update.")
 
     def _on_generate(self):
-        if self.busy or self._open is not None or not self.src_panel.view.has_image():
+        if self.busy or self._has_job(Job.OPEN) or not self.src_panel.view.has_image():
             return
         model, bg, alpha, blur = self.get_settings()
         if self._source_animation is formats.Animation.ANIMATED:
             self._generate_animation(model, bg, alpha, blur)
             return
-        inp = os.path.join(self.tmpdir, "input.png")
-        try:
-            self.src_panel.view.export_pixbuf().savev(inp, "png", [], [])
-        except Exception as e:
-            self._toast("Could not prepare image: %s" % e)
-            return
         out = os.path.join(self.tmpdir, "result.png")
         self._set_busy(True, cancel=True)
         self.src_panel.view.set_scanning(True)      # scan shimmer over the source
         self.status.set_text("Generating…")
-        rid = self.worker.send({"op": "single", "input": inp, "output": out,
-                                "model": model, "alpha": alpha, "bg": bg, "blur": blur})
-        self._generating_alpha[rid] = _alpha_of(bg)
+
+        def send(inp):
+            # The input is deleted once the job ends, if we encoded it.
+            self._send_job(Job.SINGLE, {
+                "op": "single", "input": inp, "output": out,
+                "model": model, "alpha": alpha, "bg": bg, "blur": blur},
+                alpha=_alpha_of(bg), input=inp)
+
+        def failed(e):
+            self.src_panel.view.set_scanning(False)
+            self._set_busy(False)
+            self._toast("Could not prepare image: %s" % e)
+
+        self._prepare_input(Prep.SINGLE, self.src_panel.view, send, failed)
 
     def _generate_animation(self, model, bg, alpha, blur):
         # Same options as a still; the worker processes each frame and reports
@@ -1749,15 +1964,21 @@ class Window(Adw.ApplicationWindow):
         self._set_busy(True, cancel=True)
         self.src_panel.view.set_scanning(True)
         self.status.set_text("Removing background from %s…" % fmt.name)
-        rid = self.worker.send({"op": "gif", "input": self.source_path, "output": out,
-                                "model": model, "alpha": alpha, "bg": bg, "blur": blur,
-                                "rot": v.rot, "fh": v.fh, "fv": v.fv})
-        self._generating_alpha[rid] = _alpha_of(bg)
+        self._send_job(Job.SINGLE, {
+            "op": "gif", "input": self.source_path, "output": out,
+            "model": model, "alpha": alpha, "bg": bg, "blur": blur,
+            "rot": v.rot, "fh": v.fh, "fv": v.fv}, alpha=_alpha_of(bg))
 
     def _on_bg_cancel(self):
         if not self.busy:
             return
-        self.worker.send({"op": "cancel"})
+        if self._preparing.pop(Prep.SINGLE, None) is not None:
+            # Still preparing the image: nothing has reached the worker yet.
+            self._set_busy(False)
+            self.status.set_text("Cancelled.")
+            return
+        # Its reply (stopped, or skipped if still queued) ends the busy state.
+        self._cancel_jobs(Job.SINGLE, Job.BATCH)
         self.gen_cancel_btn.set_sensitive(False)
         self.batch_cancel_btn.set_sensitive(False)
         self.status.set_text("Cancelling…")
@@ -1773,24 +1994,35 @@ class Window(Adw.ApplicationWindow):
         self.progress.set_fraction(0)
         self.progress.set_text("starting…")
         self.batch_status.set_text("Preparing…")
-        self.worker.send({"op": "batch", "input_dir": self.batch_input,
-                          "output_dir": self.batch_output, "model": model,
-                          "alpha": alpha, "bg": bg, "blur": blur,
-                          "pattern": pattern})
+        self._send_job(Job.BATCH, {
+            "op": "batch", "input_dir": self.batch_input,
+            "output_dir": self.batch_output, "model": model,
+            "alpha": alpha, "bg": bg, "blur": blur, "pattern": pattern})
 
     # ---------- worker replies ----------
     def _on_worker_message(self, msg):
         t = msg.get("type")
         rid = msg.get("id")
-        if rid in self._open_rids:
-            # Only the current open is answered. A superseded one's reply,
-            # success or error, is dropped without touching any other state.
-            self._open_rids.discard(rid)
-            if self._open is not None and rid == self._open.rid:
-                self._on_open_reply(msg)
+        if t in _JOB_REPLIES and rid in self._abandoned:
+            # Given up on: its replies, success or error, touch nothing. Once
+            # it ends, the worker is done with any input of ours it read.
+            if t in _JOB_ENDS:
+                self._remove_temp_input(self._abandoned.pop(rid).input)
             return False
-        if rid in self._pending_saves and t in ("converted", "error"):
-            self._on_save_reply(msg)
+        if t in _JOB_ENDS:
+            req = self._jobs.pop(rid, None)
+            if req is not None:
+                self._remove_temp_input(req.input)
+                # An Engine change waits for every job; after this reply is handled.
+                GLib.idle_add(self._replace_worker_when_idle)
+        else:
+            req = self._jobs.get(rid)
+        job = req.job if req is not None else None
+        if job is Job.OPEN:
+            self._on_open_reply(req.source, msg)
+            return False
+        if job is Job.SAVE:
+            self._on_save_reply(req.save, msg)
             return False
         if t == "ready":
             self.worker.started()
@@ -1813,9 +2045,11 @@ class Window(Adw.ApplicationWindow):
             if SELFTEST:
                 _finish_selftest(self, {"ok": True, "ready": msg})
         elif t == "loading":
-            self.status.set_text(
-                "Loading %s… (the first run is slower)" % msg["model"])
-            self.batch_status.set_text("Loading model %s…" % msg["model"])
+            if job is Job.BATCH:
+                self.batch_status.set_text("Loading model %s…" % msg["model"])
+            else:
+                self.status.set_text(
+                    "Loading %s… (the first run is slower)" % msg["model"])
         elif t == "notice":
             self._toast(msg["message"])
         elif t == "device":
@@ -1826,7 +2060,7 @@ class Window(Adw.ApplicationWindow):
                             "is slower; later runs are fast." % msg["label"])
         elif t == "done_single":
             self.result_output = msg["output"]
-            self._result_alpha = self._generating_alpha.pop(rid, formats.Alpha.TRANSPARENT)
+            self._result_alpha = req.alpha
             # Save waits for the decode: until then the panel shows the old result.
             self.save_btn.set_sensitive(False)
             output = msg["output"]
@@ -1834,6 +2068,8 @@ class Window(Adw.ApplicationWindow):
             def decoded(loaded):
                 if loaded is not Loaded.SHOWN or self.result_output != output:
                     return            # failed, or a newer result replaced it
+                if self._has_job(Job.OPEN):
+                    return            # a new image is on its way
                 self.save_btn.set_sensitive(True)
 
             self.res_panel.view.load_file_async(output, done=decoded)
@@ -1853,14 +2089,13 @@ class Window(Adw.ApplicationWindow):
             if not self.res_panel.view.load_file(msg["output"]):
                 self.res_panel.view.load_file(msg["preview"])
             self.result_output = msg["output"]
-            self._result_alpha = self._generating_alpha.pop(rid, formats.Alpha.TRANSPARENT)
+            self._result_alpha = req.alpha
             self.save_btn.set_sensitive(True)
             self.status.set_text("Done: %d frames in %.1fs — Save the %s."
                                  % (msg["frames"], msg["seconds"],
                                     formats.format_of(msg["output"]).name))
             self._set_busy(False)
         elif t == "canceled":
-            self._generating_alpha.pop(rid, None)
             self._set_busy(False, spin=(msg.get("scope") != "batch"))
             if msg.get("scope") == "batch":
                 self.progress.set_text("cancelled")
@@ -1886,9 +2121,7 @@ class Window(Adw.ApplicationWindow):
             self._toast("Batch finished: %d images" % msg["count"])
         elif t == "seg_ready":
             self._seg_set_busy(False)
-            if msg.get("id") != getattr(self, "_seg_load_rid", None):
-                return False           # left/unloaded before this load finished
-            self.seg_loaded_for = self.source_path
+            self.seg_loaded_for = req.loads
             note = {"auto": " · auto", "fallback": " · fallback"}.get(
                 msg.get("mode"), "")
             self.seg_model_row.set_subtitle(msg["model"] + note)
@@ -1941,11 +2174,9 @@ class Window(Adw.ApplicationWindow):
                 msg["score"])
         elif t == "seg_extracted":
             out = msg["output"]
-            if out.endswith("seg_preview.png"):     # live prerender → right panel
-                # Ignore a stale reply: a prerender sent for an earlier selection
-                # can land during response lag, after we've cleared the panel.
-                if (msg.get("id") != getattr(self, "_seg_preview_rid", None)
-                        or not self._seg_has_selection()):
+            if job is Job.SEG_PREVIEW:              # live prerender → right panel
+                # The selection can be cleared while the prerender was out.
+                if not self._seg_has_selection():
                     return False
                 self.seg_res_panel.view.load_file_async(out, transform=Transform.KEEP)
                 self.seg_result_output = out
@@ -1953,15 +2184,12 @@ class Window(Adw.ApplicationWindow):
             else:                                    # explicit Save → file dialog
                 self._seg_set_busy(False)
                 self.seg_status.set_text("Ready — choose where to save.")
-                alpha = self._seg_export_alpha.pop(rid, formats.Alpha.TRANSPARENT)
-                self._seg_save_file(out, alpha)
+                self._seg_save_file(out, req.alpha)
         elif t == "seg_canceled":
             self._seg_set_busy(False)
             self._unload("seg")            # free the SAM model + cached encode
             self.seg_status.set_text("Cancelled.")
         elif t == "error":
-            self._generating_alpha.pop(rid, None)
-            self._seg_export_alpha.pop(rid, None)
             first = msg["message"].splitlines()[0]
             self.status.set_text("Error: " + first)
             self.batch_status.set_text("Error: " + first)
