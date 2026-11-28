@@ -81,6 +81,10 @@ def save_formats(alpha):
     return (PNG, WEBP, JPEG)
 
 
+# What a batch writes, by the key its request and the settings file name it with.
+BATCH_OUTPUTS = {"png": PNG, "webp": WEBP, "jpeg": JPEG}
+
+
 def default_save_format(source_path, choices):
     """The source's own format when it is one of `choices`, else the first."""
     source = format_of(source_path or "")

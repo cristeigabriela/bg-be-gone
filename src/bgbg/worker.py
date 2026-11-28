@@ -15,6 +15,8 @@ Requests (one JSON object per line on stdin):
    "keep_dir":D?,"id":N}                     # keep_dir: keep what recomposite needs
   {"op":"batch","input_dir":D,"output_dir":D,"model":M,"alpha":bool,"bg":BG,
    "pattern":"{name}_nobg","id":N}
+      # optional "format":"png|webp|jpeg": what each result is written as,
+      #   png by default; jpeg only with a background to flatten onto
   {"op":"gif","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":S,
    "rot":0..3,"fh":bool,"fv":bool,"keep_dir":D?,"id":N}   # per-frame removal;
                                              # GIF or WebP (animated) by output
@@ -397,6 +399,21 @@ class NoImagesError(WorkerError):
         self.user_message = user_message
 
 
+class UnknownBatchFormatError(WorkerError, ValueError):
+    def __init__(self, key):
+        super().__init__(f"unknown batch output format {key!r}")
+        self.key = key
+        self.user_message = ("bg-be-gone can't write a batch as %r: it writes PNG, WebP or JPEG."
+                             % key)
+
+
+class TransparentJpegError(WorkerError, ValueError):
+    def __init__(self):
+        super().__init__("a transparent batch can't be written as JPEG")
+        self.user_message = ("JPEG can't keep a transparent background. Choose PNG or WebP, "
+                             "or a background to flatten onto.")
+
+
 def _causes(exc):
     """`exc` and every exception it was raised from, outermost first."""
     seen = []
@@ -553,15 +570,21 @@ def process_one(model, req_id, src, dst, alpha, bg, blur=background.STRENGTH_DEF
     `keep_dir`, when given, keeps the picture and its cut-out there, so
     recomposite can put the result onto another background without the model.
     """
-    # Upright first: rembg would turn its mask by the EXIF orientation, and
-    # the cut-out, kept picture and composite must all match that mask.
-    img = _plain(ImageOps.exif_transpose(open_image(src)))
-    res = _straight_cutout(img, _remove_resilient(model, req_id, img, alpha), alpha)
+    img, res = _cut_out(model, req_id, src, alpha)
     if keep_dir:
         os.makedirs(keep_dir, exist_ok=True)
         img.save(os.path.join(keep_dir, _KEPT_PICTURE))
         res.save(os.path.join(keep_dir, _KEPT_CUTOUT))
     return _write_result(img, res, dst, bg, blur, want_preview)
+
+
+def _cut_out(model, req_id, src, alpha):
+    """The upright picture at `src`, and its cut-out with the picture's own
+    colours: what Generate and a batch both composite."""
+    # Upright first: rembg would turn its mask by the EXIF orientation, and
+    # the cut-out, kept picture and composite must all match that mask.
+    img = _plain(ImageOps.exif_transpose(open_image(src)))
+    return img, _straight_cutout(img, _remove_resilient(model, req_id, img, alpha), alpha)
 
 
 # A still's kept files, in its keep_dir; an animation keeps one cut-out per frame.
@@ -576,10 +599,9 @@ def _write_result(img, res, dst, bg, blur, want_preview):
     and settings give the same file. Returns the preview's path (a checkered
     copy of a transparent result), `dst` itself, or None without a preview.
     """
+    _composite(img, res, bg, blur).save(dst)
     if bg != "transparent":
-        _compose_frame(img, res, bg, blur).convert("RGB").save(dst)
         return dst if want_preview else None
-    res.save(dst)
     if not want_preview:
         return None
     board = _checkerboard(res.size).convert("RGBA")
@@ -587,6 +609,15 @@ def _write_result(img, res, dst, bg, blur, want_preview):
     preview_path = dst + ".preview.png"
     board.convert("RGB").save(preview_path)
     return preview_path
+
+
+def _composite(img, res, bg, blur):
+    """Cut-out `res` of picture `img` on background `bg`: the cut-out itself
+    when transparent, else the flattened RGB picture. Generate, a batch and
+    a re-composite all write this."""
+    if bg == "transparent":
+        return res
+    return _compose_frame(img, res, bg, blur).convert("RGB")
 
 
 def handle_single(req):
@@ -633,12 +664,76 @@ def _batch_skip_reason(path):
     return None
 
 
+def _batch_format(req, bg):
+    """The format a batch writes, checked against its background before any work.
+
+    Raises:
+        UnknownBatchFormatError: the request names no format a batch writes.
+        TransparentJpegError: JPEG was asked for with a transparent background.
+    """
+    key = req.get("format") or "png"
+    fmt = formats.BATCH_OUTPUTS.get(key)
+    if fmt is None:
+        raise UnknownBatchFormatError(key)
+    alpha = formats.Alpha.TRANSPARENT if bg == "transparent" else formats.Alpha.FLATTENED
+    if fmt not in formats.save_formats(alpha):
+        raise TransparentJpegError()
+    return fmt
+
+
+def _batch_render(model, req_id, src, alpha, bg, blur):
+    """One batch result, in memory, made as Generate makes it. Nothing is on
+    disk yet, so a quit or a crash during the slow part, the model, leaves no
+    file behind."""
+    img, res = _cut_out(model, req_id, src, alpha)
+    return _composite(img, res, bg, blur)
+
+
+# Held from a result's part file being made until the part has its real name
+# or is deleted. At exit main() takes it, so the process never ends with a
+# part half-written: the worker thread is a daemon and dies wherever it is.
+_writing = threading.Lock()
+# How long an exit waits for that. The frontend gives a worker 2 s to exit.
+_EXIT_WRITE_WAIT_S = 1.5
+
+
+def _remove_part(part):
+    """Delete one of the batch's own part files; one already gone is fine."""
+    try:
+        os.remove(part)
+    except FileNotFoundError:
+        pass                    # Pillow deletes a file whose save failed itself
+    except OSError as err:
+        print(f"batch: could not remove {part}: {err}", file=sys.stderr, flush=True)
+
+
+def _publish_result(image, outdir, stem, fmt, taken):
+    """Write a finished result into a part file of the batch's own, then give
+    it its name; returns the published path.
+
+    It gets its name from a call that never replaces a file, so one that
+    appears under that name meanwhile is kept. On any failure, the part goes.
+    """
+    with _writing:
+        part = batchnames.new_part(outdir, stem, fmt.suffix)
+        published = None
+        try:
+            save_image(image, part)
+            published = batchnames.publish(part, outdir, stem, fmt.suffix, taken)
+        finally:
+            if published is None:
+                _remove_part(part)
+        return published
+
+
 def handle_batch(req):
     rid = req.get("id")
     indir = req["input_dir"]
     outdir = req["output_dir"]
     pattern = req.get("pattern") or "{name}_nobg"
     batchnames.check_pattern(pattern)      # before any work, so nothing half-runs
+    bg = req.get("bg", "transparent")
+    fmt = _batch_format(req, bg)
     images = sorted(f for f in glob.glob(os.path.join(indir, "*"))
                     if f.lower().endswith(formats.READ_SUFFIXES) and os.path.isfile(f))
     files, skipped = [], []                # skipped: [{"name", "message"}], in order
@@ -662,7 +757,6 @@ def handle_batch(req):
     os.makedirs(outdir, exist_ok=True)
     get_session(req["model"], rid)         # load + emit the device message
     alpha = req.get("alpha", False)
-    bg = req.get("bg", "transparent")
     blur = req.get("blur", background.STRENGTH_DEFAULT)
     taken = batchnames.taken_by(files)     # a source is never an output
     renamed = 0                            # results written under a numbered name
@@ -673,39 +767,23 @@ def handle_batch(req):
             out({"type": "canceled", "scope": "batch", "done": i - 1,
                  "total": total, "id": rid})
             return
-        out({"type": "progress", "done": i - 1, "total": total,
-             "name": os.path.basename(f), "id": rid})
+        name = os.path.basename(f)
+        out({"type": "progress", "done": i - 1, "total": total, "name": name, "id": rid})
         # One file that can't be read must not cost the rest of the run.
-        part = None
         try:
             stem = batchnames.stem_for(pattern, f, i)
-            # The result is written into a file of the batch's own, and gets
-            # its name only once complete, from a call that never replaces a
-            # file: one that appears under that name meanwhile is kept.
-            part = batchnames.new_part(outdir, stem)
-            process_one(req["model"], rid, f, part, alpha, bg, blur,
-                        want_preview=False)
-            dst = batchnames.publish(part, outdir, stem, taken)
-            part = None
+            result = _batch_render(req["model"], rid, f, alpha, bg, blur)
+            dst = _publish_result(result, outdir, stem, fmt, taken)
         except _Canceled:
-            # A cancel that stopped a model download ends the run; its
-            # unfinished file must not stay behind.
-            if part is not None:
-                os.remove(part)
-            raise
+            raise                          # a cancel that stopped a model download
         except Exception as e:  # noqa: BLE001 - reported per file, run goes on
             print(f"batch: {f} failed:", file=sys.stderr)
             traceback.print_exc()
             sys.stderr.flush()
-            if part is not None:           # only ever the batch's own file
-                try:
-                    os.remove(part)
-                except OSError as rm_err:
-                    print(f"batch: could not remove {part}: {rm_err}", file=sys.stderr)
-            failed.append({"name": os.path.basename(f),
-                           "message": describe_error(e, {"input": f})})
+            message = describe_error(e, {"input": f})
+            failed.append({"name": name, "message": message})
             continue
-        if os.path.basename(dst) != stem + ".png":
+        if os.path.basename(dst) != stem + fmt.suffix:
             renamed += 1
     out({"type": "progress", "done": total, "total": total, "name": "",
          "id": rid})
@@ -1355,6 +1433,19 @@ def main():
             continue
         _cancels.queue(req.get("id"))
         q.put(req)
+    _let_a_write_finish()
+
+
+def _let_a_write_finish():
+    """At exit, wait for a batch result being written to get its name, and keep
+    the worker thread from starting another one.
+
+    The worker thread is a daemon: it dies wherever it is once main() returns,
+    and mid-write it would leave its part file behind.
+    """
+    if not _writing.acquire(timeout=_EXIT_WRITE_WAIT_S):
+        sys.stderr.write("exit: a batch result was still being written after %.1f s; "
+                         "its part file may stay\n" % _EXIT_WRITE_WAIT_S)
 
 
 if __name__ == "__main__":

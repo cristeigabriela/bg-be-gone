@@ -28,10 +28,10 @@ def test_publishing_never_replaces_a_file_that_took_the_name(tmp_path, disk):
     """A file that appeared under the name while the result rendered is kept."""
     existing = tmp_path / "cat_nobg.png"
     existing.write_bytes(b"a file that appeared meanwhile")
-    part = batchnames.new_part(str(tmp_path), "cat_nobg")
+    part = batchnames.new_part(str(tmp_path), "cat_nobg", ".png")
     with open(part, "wb") as f:
         f.write(b"the finished result")
-    published = batchnames.publish(part, str(tmp_path), "cat_nobg", set())
+    published = batchnames.publish(part, str(tmp_path), "cat_nobg", ".png", set())
     assert existing.read_bytes() == b"a file that appeared meanwhile", "the existing file is kept"
     assert published == str(tmp_path / "cat_nobg (2).png"), "the result takes the next number"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["cat_nobg (2).png", "cat_nobg.png"], \

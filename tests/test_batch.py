@@ -1,21 +1,37 @@
-"""A batch never writes over a file: clashing names get a number."""
+"""A batch: the files it runs on, what it writes, and how it ends.
+
+It never writes over a file (clashing names get a number), and it never
+leaves its own unfinished file behind.
+"""
 import shutil
+import subprocess
+import sys
 
 import pytest
+from PIL import Image
 
-from workerpipe import TESTDATA
+from formats import Alpha
+from workerpipe import BACKGROUND_PIXEL, SUBJECT_PIXEL, TESTDATA, WORKER
 
 _ONLY_BARE_TOKENS = ("The rename pattern can only use {name} and {n}, with nothing else in "
                      "the braces.")
+# How long a worker may take to exit: the frontend kills one after 2 s.
+_EXIT_S = 5
+
+
+def batch_request(indir, outdir, pattern="{name}_nobg", **options):
+    return {"op": "batch", "model": "u2netp", "input_dir": str(indir),
+            "output_dir": str(outdir), "pattern": pattern, **options}
+
+
+def run_request(worker, request):
+    reply, seen = worker.ask(request, until={"done_batch", "error"})
+    assert reply["type"] == "done_batch", "the batch must finish: %s" % reply.get("message")
+    return reply, seen
 
 
 def run_batch(worker, indir, outdir, pattern):
-    reply, _ = worker.ask(
-        {"op": "batch", "model": "u2netp", "input_dir": str(indir),
-         "output_dir": str(outdir), "pattern": pattern},
-        until={"done_batch", "error"})
-    assert reply["type"] == "done_batch", "the batch must finish: %s" % reply.get("message")
-    return reply
+    return run_request(worker, batch_request(indir, outdir, pattern))[0]
 
 
 def add_image(folder, name, fixture="subject.png"):
@@ -213,3 +229,174 @@ def test_a_file_that_appears_during_the_run_is_not_overwritten(worker, folders):
         "a file that appeared after the run started is still not overwritten"
     assert names(outdir) == ["a_nobg.png", "b_nobg (2).png", "b_nobg.png"], \
         "b's result takes the next free number instead"
+
+
+# --- What a batch writes --------------------------------------------------------
+
+@pytest.mark.parametrize("key, bg, written_as, alpha, background_colour", [
+    # The default: a cut-out with its transparency.
+    ("png", "transparent", "PNG", Alpha.TRANSPARENT, None),
+    # WebP keeps the transparency too.
+    ("webp", "transparent", "WEBP", Alpha.TRANSPARENT, None),
+    # JPEG only once the background is flattened, here onto white.
+    ("jpeg", "#ffffff", "JPEG", Alpha.FLATTENED, (255, 255, 255)),
+    # Blur keeps the photo, so the background is no flat colour to check.
+    ("png", "blur", "PNG", Alpha.FLATTENED, None),
+    # A colour, in a lossy format: close to it, not exact.
+    ("webp", "#00b140", "WEBP", Alpha.FLATTENED, (0, 177, 64)),
+], ids=["png-transparent", "webp-transparent", "jpeg-white", "png-blur", "webp-colour"])
+def test_each_format_and_background_gives_its_own_kind_of_file(
+        worker, folders, key, bg, written_as, alpha, background_colour):
+    indir, outdir = folders
+    add_image(indir, "a.png")
+    run_request(worker, batch_request(indir, outdir, format=key, bg=bg, blur=8))
+    # Spelled out, not read from formats.py, so a changed suffix fails here.
+    suffix = {"png": ".png", "webp": ".webp", "jpeg": ".jpg"}[key]
+    assert names(outdir) == ["a_nobg" + suffix], "the result is named in its format"
+    result = Image.open(outdir / ("a_nobg" + suffix))
+    assert result.format == written_as, "the file is the format asked for, not just named it"
+    rgba = result.convert("RGBA")
+    if alpha is Alpha.TRANSPARENT:
+        assert rgba.getchannel("A").getpixel(SUBJECT_PIXEL) > 224, "the subject stays opaque"
+        assert rgba.getchannel("A").getpixel(BACKGROUND_PIXEL) < 32, "the background is cut away"
+    else:
+        assert rgba.getchannel("A").getextrema() == (255, 255), "a flattened result is opaque"
+        assert rgba.convert("L").getpixel(SUBJECT_PIXEL) < 100, "the dark subject is kept on top"
+    if background_colour is not None:
+        got = rgba.getpixel(BACKGROUND_PIXEL)[:3]
+        assert all(abs(g - w) <= 16 for g, w in zip(got, background_colour)), \
+            "the background is the colour asked for: %s" % (got,)
+
+
+def test_a_transparent_batch_is_never_written_as_jpeg(worker, folders):
+    """JPEG has no alpha channel: the cut-out would come out on black."""
+    indir, outdir = folders
+    add_image(indir, "a.png")
+    reply, _ = worker.ask(batch_request(indir, outdir, format="jpeg", bg="transparent"),
+                          until={"done_batch", "error"})
+    assert reply["type"] == "error", "the run is refused"
+    assert reply["message"] == ("JPEG can't keep a transparent background. Choose PNG or WebP, "
+                                "or a background to flatten onto."), "the error says what to pick"
+    assert not outdir.exists(), "nothing is written, not even the output folder"
+
+
+def test_a_result_in_another_format_still_never_overwrites(worker, folders):
+    indir, outdir = folders
+    outdir.mkdir()
+    add_image(indir, "a.png")
+    earlier = outdir / "a_nobg.webp"
+    earlier.write_bytes(b"an earlier run's result")
+    run_request(worker, batch_request(indir, outdir, format="webp"))
+    assert earlier.read_bytes() == b"an earlier run's result", "an existing file is never replaced"
+    assert names(outdir) == ["a_nobg (2).webp", "a_nobg.webp"], "the new result is numbered"
+
+
+@pytest.mark.parametrize("orientation", [
+    # Stored turned a quarter, sides swapped on disk, as phones write portraits.
+    6,
+    # Stored mirrored: the same size, so only the pixels tell.
+    2,
+], ids=["turned", "mirrored"])
+@pytest.mark.parametrize("bg", [
+    # The cut-out alone.
+    "transparent",
+    # The blur, which reads the picture around the subject.
+    "blur",
+], ids=["transparent", "blur"])
+def test_a_batch_writes_a_photo_as_generate_does_upright(worker, folders, tmp_path,
+                                                         orientation, bg):
+    """oriented-N.jpg (make_orientation_fixtures.py): the gallery shows it upright,
+    so the result a tile flips to must be upright too, and Generate's own file."""
+    indir, outdir = folders
+    add_image(indir, "a.jpg", fixture=f"oriented-{orientation}.jpg")
+    generated = tmp_path / "generated.png"
+    reply, _ = worker.ask(
+        {"op": "single", "model": "u2netp", "input": str(indir / "a.jpg"),
+         "output": str(generated), "bg": bg},
+        until={"done_single", "error"})
+    assert reply["type"] == "done_single", reply.get("message")
+    run_request(worker, batch_request(indir, outdir, bg=bg))
+    batch, single = Image.open(outdir / "a_nobg.png"), Image.open(generated)
+    assert batch.size == (256, 192), "the result is the upright picture's size"
+    assert (batch.mode, batch.tobytes()) == (single.mode, single.tobytes()), \
+        "a batch writes, pixel for pixel, what Generate writes"
+
+
+# --- Unfinished files -------------------------------------------------------------
+
+@pytest.fixture
+def held_worker(start_worker):
+    """A worker whose batch stops at `step` (see testdata/held_batch_worker.py)."""
+    def start(step):
+        command = [sys.executable, str(TESTDATA / "held_batch_worker.py"), str(WORKER.parent),
+                   step]
+        return start_worker(None, command=command)
+    return start
+
+
+def run_until_held(worker, request):
+    """Send a batch and read its replies until the worker is held at its step."""
+    worker.send(request)
+    while True:
+        reply = worker.next_reply()
+        assert reply["type"] not in ("done_batch", "error"), "the batch ended early: %s" % reply
+        if reply["type"] == "held":
+            return
+
+
+def hidden(folder):
+    """The batch's own part files: a published result is never hidden."""
+    return [n for n in names(folder) if n.startswith(".")] if folder.exists() else []
+
+
+def test_a_worker_killed_during_the_cut_out_leaves_no_unfinished_file(held_worker, folders):
+    """A crash, or a quit that gave up waiting, used to leave a 0-byte part file:
+    it was made when the image started, long before its result existed."""
+    indir, outdir = folders
+    add_image(indir, "a.png")
+    w = held_worker("model")
+    run_until_held(w, batch_request(indir, outdir))
+    w.proc.kill()
+    w.proc.wait()
+    assert hidden(outdir) == [], "no file exists until the result does"
+
+
+def test_a_shutdown_during_the_cut_out_exits_at_once_and_leaves_nothing(held_worker, folders):
+    indir, outdir = folders
+    add_image(indir, "a.png")
+    w = held_worker("model")
+    run_until_held(w, batch_request(indir, outdir))
+    w.write({"op": "shutdown"})
+    try:
+        w.proc.wait(timeout=_EXIT_S)
+    except subprocess.TimeoutExpired:
+        pytest.fail("the worker must exit while the model runs: an image can't be stopped midway")
+    assert hidden(outdir) == [], "no file exists until the result does"
+
+
+def test_a_shutdown_during_a_write_lets_the_result_get_its_name(held_worker, folders):
+    """The worker thread dies wherever it is at exit; mid-write, that was its part file."""
+    indir, outdir = folders
+    add_image(indir, "a.png")
+    w = held_worker("write")
+    run_until_held(w, batch_request(indir, outdir))
+    w.write({"op": "shutdown"})
+    w.proc.wait(timeout=_EXIT_S)
+    assert names(outdir) == ["a_nobg.png"], \
+        "the result being written is finished and named before the worker exits"
+
+
+def test_a_write_that_fails_leaves_no_unfinished_file(held_worker, folders):
+    """The part file is the batch's own, made before the write: Pillow doesn't delete it."""
+    indir, outdir = folders
+    add_image(indir, "a.png")
+    w = held_worker("write-fails")
+    w.send(batch_request(indir, outdir))
+    while True:
+        reply = w.next_reply()
+        if reply["type"] in ("done_batch", "error"):
+            break
+    assert reply["failed"] == [{"name": "a.png", "message": "Not enough disk space to write "
+                                                            "the result."}], \
+        "the image is reported as failed, and why"
+    assert names(outdir) == [], "its part file is gone"
