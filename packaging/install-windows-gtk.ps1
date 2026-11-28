@@ -83,9 +83,15 @@ function Read-Lock {
 $bash = Join-Path $Msys2Root 'usr\bin\bash.exe'
 
 function Invoke-Msys2 {
-    <# Run a command in an MSYS2 login shell. #>
+    <# Run a command in an MSYS2 login shell and return what it prints, to parse. #>
     param([string]$Command)
     & $bash -lc $Command
+}
+
+function Invoke-Msys2Shown {
+    <# Run a command in an MSYS2 login shell, showing what it prints. #>
+    param([string]$Command)
+    Invoke-NativeShown $bash @('-lc', $Command)
 }
 
 function Get-InstalledSet {
@@ -118,7 +124,7 @@ function Install-Msys2Base {
             throw "The MSYS2 base archive failed its SHA256 check"
         }
         New-Item -ItemType Directory -Path $unpack -ErrorAction Stop | Out-Null
-        & $sfx -y "-o$unpack" | Out-Null
+        Invoke-NativeShown $sfx @('-y', "-o$unpack")
         if ($LASTEXITCODE -ne 0) { throw "The MSYS2 base archive failed to unpack into $unpack" }
         Move-Item -LiteralPath (Join-Path $unpack 'msys64') $Msys2Root -ErrorAction Stop
     } finally {
@@ -126,7 +132,7 @@ function Install-Msys2Base {
         if (Test-Path -LiteralPath $unpack) { Remove-Item -LiteralPath $unpack -Recurse -Force -ErrorAction SilentlyContinue }
     }
     # The first login shell creates the home folder and pacman's keyring.
-    Invoke-Msys2 ' ' | Out-Null
+    Invoke-Msys2Shown ' '
     if ($LASTEXITCODE -ne 0) { throw "MSYS2's first-run setup failed" }
 }
 
@@ -158,7 +164,7 @@ function Install-LockedSet {
     # path (the prefix may hold spaces or non-ASCII characters).
     Msg "Installing them with pacman -U"
     $files = ($todo | ForEach-Object { $_.File }) -join ' '
-    Invoke-Msys2 "cd /var/cache/pacman/pkg && pacman -U --noconfirm --needed $files"
+    Invoke-Msys2Shown "cd /var/cache/pacman/pkg && pacman -U --noconfirm --needed $files"
     if ($LASTEXITCODE -ne 0) { throw "pacman -U failed to install the locked packages" }
     Repair-PostInstallCache
 }
@@ -184,12 +190,12 @@ function Repair-PostInstallCache {
     }
     Msg "Rebuilding the MIME and font caches through $short"
     $ucrt = Join-Path $short 'ucrt64'
-    & (Join-Path $ucrt 'bin\update-mime-database.exe') (Join-Path $ucrt 'share\mime')
+    Invoke-NativeShown (Join-Path $ucrt 'bin\update-mime-database.exe') @((Join-Path $ucrt 'share\mime'))
     if ($LASTEXITCODE -ne 0) { Write-Warning "update-mime-database failed ($LASTEXITCODE)" }
     $saved = $env:FONTCONFIG_FILE
     try {
         $env:FONTCONFIG_FILE = Join-Path $ucrt 'etc\fonts\fonts.conf'
-        & (Join-Path $ucrt 'bin\fc-cache.exe')
+        Invoke-NativeShown (Join-Path $ucrt 'bin\fc-cache.exe')
         if ($LASTEXITCODE -ne 0) { Write-Warning "fc-cache failed ($LASTEXITCODE)" }
     } finally {
         $env:FONTCONFIG_FILE = $saved

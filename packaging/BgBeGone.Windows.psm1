@@ -41,6 +41,27 @@ function Write-Utf8File {
     [IO.File]::WriteAllText($Path, $Text, $script:Utf8NoBom)
 }
 
+function Invoke-NativeShown {
+    <#
+    .SYNOPSIS
+      Run a program whose output is for the user to read, with its stderr
+      shown as plain text. The exit code is in $LASTEXITCODE, as for a plain
+      call.
+
+    .DESCRIPTION
+      uv, pip and pacman write their progress to stderr. When the install's
+      output is redirected (into a log, say), Windows PowerShell 5.1 turns
+      each of those lines into an error record and prints a red
+      NativeCommandError block, so a working install reads as a failed one.
+
+      Not for a call whose output is parsed: everything goes to the host.
+    #>
+    param([Parameter(Mandatory)][string]$FilePath, [string[]]$ArgumentList = @())
+    # Under 'Stop', 2>&1 on a program would throw at its first stderr line.
+    $ErrorActionPreference = 'Continue'
+    & $FilePath @ArgumentList 2>&1 | ForEach-Object { "$_" } | Out-Host
+}
+
 function New-UniqueName {
     <# A sibling name for $Path no other program uses: <Path><Suffix>-<8 hex>. #>
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Suffix)
@@ -370,7 +391,7 @@ function New-WorkerPython {
     # on one volume. No registry entry and no python.exe shim: this copy is
     # the worker's alone.
     $unpack = New-UniqueName $Dest '.python'
-    & uv python install $script:PythonVersion --install-dir $unpack --no-registry --no-bin
+    Invoke-NativeShown uv @('python', 'install', $script:PythonVersion, '--install-dir', $unpack, '--no-registry', '--no-bin')
     if ($LASTEXITCODE -ne 0) { throw "uv python install $($script:PythonVersion) failed" }
     try {
         $tree = Get-ChildItem -LiteralPath $unpack -Directory |
@@ -413,12 +434,12 @@ function Install-LockedPackage {
     if (Get-Command uv -ErrorAction SilentlyContinue) {
         $pipArgs = @('pip', 'install', '--python', $py, '--no-deps', '--require-hashes', '-r', $Lock)
         if ($IndexUrl) { $pipArgs += @('--index-url', $IndexUrl) }
-        & uv @pipArgs
+        Invoke-NativeShown uv $pipArgs
     } else {
         $pipArgs = @('-I', '-m', 'pip', 'install', '--no-deps', '--require-hashes',
                      '--disable-pip-version-check', '--no-warn-script-location', '-r', $Lock)
         if ($IndexUrl) { $pipArgs += @('--index-url', $IndexUrl) }
-        & $py @pipArgs
+        Invoke-NativeShown $py $pipArgs
     }
     if ($LASTEXITCODE -ne 0) { throw "Installing $Lock into $WorkerDir failed" }
 }
@@ -749,7 +770,7 @@ function New-AppIcon {
     $bw.Dispose(); $ms.Dispose()
 }
 
-Export-ModuleMember -Function Write-Utf8File, New-UniqueName, New-PrivateTempDir,
+Export-ModuleMember -Function Write-Utf8File, Invoke-NativeShown, New-UniqueName, New-PrivateTempDir,
     Test-ReparsePoint, Assert-NoReparseBelow, Get-TreeFiles, Write-Inventory, Test-Inventory,
     Read-Inventory, Update-Inventory, Test-LegacyInstall,
     Remove-Inventory, Write-LegacyInventory, Remove-CacheTree, Get-WorkerPython, New-WorkerPython,
