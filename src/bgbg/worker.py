@@ -43,11 +43,13 @@ Responses (one JSON object per line on stdout):
   {"type":"download","model":M,"done":bytes,"total":bytes,"id":N}   # first use
   {"type":"device","provider":P,"label":L,"gpu":bool,"id":N}
   {"type":"progress","done":i,"total":n,"name":str,"id":N}
-  {"type":"done_single","output":P,"preview":P,"seconds":f,"id":N}
+  {"type":"done_single","output":P,"preview":P,"seconds":f,"device":D,"id":N}
+      # D: {"provider","label","gpu"} it last ran on; done_batch and gif_done
+      # carry it too, so every finished job says where it ran
   {"type":"done_batch","count":n,"total":n,"failed":[{"name","message"}],
    "skipped":[{"name","message"}],"renamed":n,"seconds":f,"outdir":P,"id":N}
   {"type":"gif_progress","done":i,"total":n,"id":N}
-  {"type":"gif_done","output":P,"preview":P,"frames":n,"seconds":f,"id":N}
+  {"type":"gif_done","output":P,"preview":P,"frames":n,"seconds":f,"device":D,"id":N}
   {"type":"converted","output":P,"frames":n,"id":N}
   {"type":"frames","frames":n,"id":N}
   {"type":"canceled","scope":"single|batch|gif","id":N}
@@ -239,13 +241,24 @@ def get_session(model, req_id):
         out({"type": "loading", "model": model, "id": req_id})
         with _rembg_download_progress(_download_reporter(model, req_id)):
             sess = ort_engine.new_session(model, ort_engine.preferred_providers())
-        active = sess.inner_session.get_providers()
-        prov = active[0] if active else "CPUExecutionProvider"
         _sessions[model] = sess
-        out({"type": "device", "provider": prov,
-             "label": ort_engine.PROVIDER_LABELS.get(prov, prov),
-             "gpu": prov in ort_engine.GPU_PROVIDERS, "id": req_id})
+        out({"type": "device", **_device(model, sess), "id": req_id})
     return _sessions[model]
+
+
+def _device(model, session):
+    """Where `session`, running `model`, runs, as the frontend's device label wants it."""
+    if model in _torch_models and session is _sessions.get(model):
+        return {"provider": "PyTorch", "label": _torch.device, "gpu": True}
+    active = session.inner_session.get_providers()
+    prov = active[0] if active else "CPUExecutionProvider"
+    return {"provider": prov, "label": ort_engine.PROVIDER_LABELS.get(prov, prov),
+            "gpu": prov in ort_engine.GPU_PROVIDERS}
+
+
+# Where the last background removal actually ran. Finished jobs report it, so
+# the label goes back to the GPU after a one-off CPU fallback.
+_last_device = None
 
 
 def get_cpu_session(model, req_id):
@@ -268,6 +281,7 @@ def _remove_resilient(model, req_id, img, alpha):
     """Run rembg on the preferred (GPU) session; if it fails with a runtime error
     — typically low VRAM — retry on CPU so the user still gets a result. The GPU
     session is kept, so a later run recovers automatically once VRAM frees up."""
+    global _last_device
     session = get_session(model, req_id)
     try:
         with warnings.catch_warnings():
@@ -279,6 +293,7 @@ def _remove_resilient(model, req_id, img, alpha):
                                     message="invalid value encountered")
             res = ort_engine.remove(img, session=session, alpha_matting=alpha)
         _fallback_notified.discard(model)      # GPU healthy again
+        _last_device = _device(model, session)
         return res
     except Exception as e:
         # On PyTorch any RuntimeError is a run failure: out of VRAM, a HIP/CUDA
@@ -296,7 +311,9 @@ def _remove_resilient(model, req_id, img, alpha):
                             "to free memory, then try again.",
                  "id": req_id})
         session = get_cpu_session(model, req_id)
-        return ort_engine.remove(img, session=session, alpha_matting=alpha)
+        res = ort_engine.remove(img, session=session, alpha_matting=alpha)
+        _last_device = _device(model, session)
+        return res
 
 
 def _hex_to_rgb(s):
@@ -541,7 +558,7 @@ def handle_single(req):
         out({"type": "canceled", "scope": "single", "id": rid})   # mid-run; drop it
         return
     out({"type": "done_single", "output": req["output"],
-         "preview": preview or req["output"],
+         "preview": preview or req["output"], "device": _last_device,
          "seconds": round(time.time() - t, 2), "id": rid})
 
 
@@ -651,6 +668,7 @@ def handle_batch(req):
          "id": rid})
     out({"type": "done_batch", "count": total - len(failed), "total": total,
          "failed": failed, "skipped": skipped, "renamed": renamed,
+         "device": _last_device,
          "seconds": round(time.time() - t, 1), "outdir": outdir, "id": rid})
 
 
@@ -768,7 +786,7 @@ def handle_gif(req):
         preview = dst + ".preview.png"
         shutil.copyfile(paths[0], preview)
         out({"type": "gif_done", "output": dst, "preview": preview, "frames": n,
-             "seconds": round(time.time() - t, 2), "id": rid})
+             "device": _last_device, "seconds": round(time.time() - t, 2), "id": rid})
     finally:
         shutil.rmtree(framedir, ignore_errors=True)
 

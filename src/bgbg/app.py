@@ -2519,6 +2519,8 @@ class Window(Adw.ApplicationWindow):
         else:
             req = self._jobs.get(rid)
         job = req.job if req is not None else None
+        if msg.get("device"):           # a finished job: where it actually ran
+            self._set_device(msg["device"]["provider"], msg["device"]["label"])
         if job is Job.OPEN:
             self._on_open_reply(req.source, msg)
             return False
@@ -2533,8 +2535,9 @@ class Window(Adw.ApplicationWindow):
             self._offer_engines(msg.get("engines") or ["ort"], msg.get("settings"))
             provs = msg.get("providers") or []
             if provs:
+                # Installed is not proven: the first run says where it really ran.
                 self._set_device(provs[0],
-                                 PROVIDER_LABELS.get(provs[0], provs[0]))
+                                 PROVIDER_LABELS.get(provs[0], provs[0]) + " · not used yet")
             self._seg_available = bool(msg.get("seg"))
             self._seg_models = msg.get("seg_models") or []
             self._apply_seg_models()
@@ -2555,7 +2558,8 @@ class Window(Adw.ApplicationWindow):
                 self.status.set_text(
                     "Loading %s… (the first run is slower)" % msg["model"])
         elif t == "notice":
-            self._toast(msg["message"])
+            # Stays: it explains a slow run, or why files were left out.
+            self.toasts.add_toast(Adw.Toast(title=msg["message"], timeout=0))
         elif t == "device":
             self._set_device(msg["provider"], msg["label"])
             if msg.get("gpu") and not self._gpu_notified:
