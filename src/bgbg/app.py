@@ -1688,6 +1688,10 @@ class Window(Adw.ApplicationWindow):
     def _on_output_changed(self, *_):
         """A background setting changed: the shown result follows, live."""
         self._seg_bg_changed()
+        # A change still running is for settings that no longer hold, even
+        # when this one goes back to what's shown: drop it now, not at the send.
+        if self._abandon_jobs({Job.RECOMPOSITE}) is Abandoned.SOME:
+            self._recomposite_over()
         if self._kept is None:
             self._mark_stale()           # a result made before it could be kept
             return
