@@ -297,6 +297,10 @@ function Remove-Inventory {
       inventory doesn't list stay where they are, and so do the folders that
       hold them.
 
+      A listed folder with an inventory of its own goes by that one first:
+      the release's runtime lists its worker, and Enable-AmdRocm.ps1 adds
+      files only the worker's inventory knows.
+
     .OUTPUTS
       The paths of what is left under $Root, relative; empty when $Root is gone.
     #>
@@ -311,6 +315,7 @@ function Remove-Inventory {
 
     $cache = @{}
     $targets = New-Object System.Collections.Generic.List[string]
+    $nested = New-Object System.Collections.Generic.List[string]
     foreach ($rel in [IO.File]::ReadAllLines($inventory, $script:Utf8NoBom)) {
         if (-not $rel) { continue }
         if ([IO.Path]::IsPathRooted($rel) -or ($rel -split '[\\/]') -contains '..') {
@@ -321,7 +326,11 @@ function Remove-Inventory {
         $dir = [IO.Path]::GetDirectoryName($full)
         if (-not $cache.ContainsKey($dir)) { Assert-NoReparseBelow -Root $rootFull -Path $dir -Cache $cache }
         $targets.Add($full)
+        if ($rel.EndsWith('\') -and [IO.File]::Exists([IO.Path]::Combine($full, $script:InventoryName))) {
+            $nested.Add($full.TrimEnd('\'))
+        }
     }
+    foreach ($folder in $nested) { $null = Remove-Inventory $folder }
 
     # .NET calls rather than cmdlets in these loops: per file, Test-Path and
     # Remove-Item take minutes on a tree that size.
@@ -763,36 +772,44 @@ function Complete-Worker {
     Write-Inventory $WorkerDir
 }
 
-function Switch-Worker {
+function Switch-OwnedFolder {
     <#
     .SYNOPSIS
-      Put the probed worker at $Staged in place of $WorkerDir.
+      Put the probed folder at $Staged in place of $Path: a worker, or the
+      release's runtime.
 
     .DESCRIPTION
-      The old worker is renamed aside first and removed by its inventory only
-      once the new one is in place, so at every step one complete worker
-      exists. Files someone added to the old worker stay, in the renamed
+      The old folder is renamed aside first and removed by its inventory only
+      once the new one is in place, so at every step one complete copy
+      exists. Files someone added to the old folder stay, in the renamed
       folder, and are reported.
     #>
-    param([Parameter(Mandatory)][string]$WorkerDir, [Parameter(Mandatory)][string]$Staged)
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Staged)
     $old = $null
-    if (Test-Path -LiteralPath $WorkerDir) {
-        if (-not (Test-Inventory $WorkerDir)) {
-            throw "$WorkerDir has no $($script:InventoryName), so it may not be bg-be-gone's; not replacing it"
+    if (Test-Path -LiteralPath $Path) {
+        if (-not (Test-Inventory $Path)) {
+            throw "$Path has no $($script:InventoryName), so it may not be bg-be-gone's; not replacing it"
         }
-        $old = New-UniqueName $WorkerDir '.old'
-        Rename-Item -LiteralPath $WorkerDir (Split-Path -Leaf $old) -ErrorAction Stop
+        $old = New-UniqueName $Path '.old'
+        Rename-Item -LiteralPath $Path (Split-Path -Leaf $old) -ErrorAction Stop
     }
     try {
-        Rename-Item -LiteralPath $Staged (Split-Path -Leaf $WorkerDir) -ErrorAction Stop
+        Rename-Item -LiteralPath $Staged (Split-Path -Leaf $Path) -ErrorAction Stop
     } catch {
-        if ($old) { Rename-Item -LiteralPath $old (Split-Path -Leaf $WorkerDir) }
-        throw "Could not move the new worker into place (is bg-be-gone still running?): $_"
+        if ($old) { Rename-Item -LiteralPath $old (Split-Path -Leaf $Path) }
+        throw "Could not move $Staged into place (is bg-be-gone still running?): $_"
     }
+    # The rename above is the commit point: the new copy is live. Removing
+    # the old one is cleanup, so a failure there is reported, not thrown, and
+    # its inventory stays for the next run to finish the job.
     if ($old) {
-        $left = @(Remove-Inventory $old)
-        if ($left.Count) {
-            Write-Warning "Kept $($left.Count) file(s) in $old that the old worker's inventory doesn't list"
+        try {
+            $left = @(Remove-Inventory $old)
+            if ($left.Count) {
+                Write-Warning "Kept $($left.Count) file(s) in $old that its inventory doesn't list"
+            }
+        } catch {
+            Write-Warning "$Path is in place; the old copy at $old is not fully removed yet: $_"
         }
     }
 }
@@ -940,6 +957,6 @@ Export-ModuleMember -Function Write-Utf8File, Invoke-NativeShown, New-UniqueName
     Remove-Inventory, Write-LegacyInventory, Get-OwnedDataFile, Remove-OwnedData, Register-DataUser, Unregister-DataUser, Test-InstallAt, Get-OtherDataUser,
     Get-WorkerPython, New-WorkerPython,
     Install-LockedPackage, New-WorkerStartInfo, Invoke-WorkerPython, Test-Worker,
-    Write-WorkerRecord, Complete-Worker, Switch-Worker, Get-LaunchCommand, Install-LaunchModule,
+    Write-WorkerRecord, Complete-Worker, Switch-OwnedFolder, Get-LaunchCommand, Install-LaunchModule,
     ConvertTo-CommandLine,
     New-AppShortcut, Read-AppShortcut, New-AppIcon

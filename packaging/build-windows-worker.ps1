@@ -76,6 +76,6 @@ try {
     throw
 }
 
-Switch-Worker -WorkerDir $Dest -Staged $staged
+Switch-OwnedFolder -Path $Dest -Staged $staged
 Write-Host "==> Worker ready ($Variant): $(Get-WorkerPython $Dest)"
 Get-Content -LiteralPath (Join-Path $Dest 'versions.json')

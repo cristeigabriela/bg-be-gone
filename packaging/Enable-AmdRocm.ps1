@@ -140,7 +140,7 @@ function Enable-Rocm {
         throw
     }
 
-    Switch-Worker -WorkerDir $WorkerDir -Staged $staged
+    Switch-OwnedFolder -Path $WorkerDir -Staged $staged
     $torch = (Get-Content -LiteralPath (Join-Path $WorkerDir 'versions.json') -Raw | ConvertFrom-Json).packages.torch
     Write-Host "==> ROCm enabled ($Gfx, torch $torch). BiRefNet now runs on PyTorch."
 }
