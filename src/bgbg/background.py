@@ -16,9 +16,17 @@ STRENGTH_DEFAULT = 20   # ~10 px on a 512 px photo, ~80 px on a 4000 px one
 # Strength is in thousandths of the picture's shorter side: 20 blurs by 2% of it.
 _PER_STRENGTH = 1 / 1000
 
-# Below this share of background nearby, the masked average is mostly
-# rounding noise, so the plain blur takes over: that's under the subject, unseen.
-_MIN_SHARE = 2 / 255
+# Below this share of background nearby there's next to nothing to average,
+# so the plain blur takes over: that's under the subject, unseen.
+_MIN_SHARE = 1 / 1024
+
+# Box blurs stacked to approximate a Gaussian, as Pillow's own GaussianBlur does.
+_BOX_PASSES = 3
+
+# A wide blur keeps no detail finer than a few pixels of its sigma, so it's
+# worked out on a copy shrunk to about this many pixels per sigma, then
+# scaled back up: 25 times less work for a 4000 px photo's default blur.
+_PIXELS_PER_SIGMA = 4
 
 
 def blur_radius(strength: float, size: tuple) -> float:
@@ -50,17 +58,80 @@ def blur_behind(picture, alpha, strength):
     """
     # Imported here: the frontend reads this module but has no numpy.
     import numpy as np
-    from PIL import Image, ImageFilter
+    from PIL import Image
 
-    blur = ImageFilter.GaussianBlur(blur_radius(strength, picture.size))
-    rgb = picture.convert("RGB")
-    weight = alpha.point(lambda a: 255 - a)
-    w = np.asarray(weight, np.float32) / 255
-    behind = np.asarray(rgb, np.float32) * w[..., None]
-    behind = Image.fromarray((behind + 0.5).astype(np.uint8), "RGB")
-    total = np.asarray(behind.filter(blur), np.float32)
-    share = np.asarray(weight.filter(blur), np.float32)[..., None] / 255
-    plain = np.asarray(rgb.filter(blur), np.float32)
-    masked = total / np.maximum(share, _MIN_SHARE)
-    out = np.where(share >= _MIN_SHARE, masked, plain)
-    return Image.fromarray((np.clip(out, 0, 255) + 0.5).astype(np.uint8), "RGB")
+    # In floating point throughout, rounded once at the end: Pillow blurs
+    # only 8-bit images, and rounding the weighted colours first shifts them.
+    sigma = blur_radius(strength, picture.size)
+    full = picture.size
+    step = max(1, int(sigma / _PIXELS_PER_SIGMA))
+    small = (max(1, round(full[0] / step)), max(1, round(full[1] / step)))
+    sigma /= full[0] / small[0]
+
+    def down(plane):
+        return _resize(np, Image, plane, small, Image.Resampling.BOX)
+
+    rgb = np.asarray(picture.convert("RGB"), np.float32)
+    weight = 1 - np.asarray(alpha, np.float32) / 255
+    share = _gaussian(down(weight), sigma)
+    near = share >= _MIN_SHARE
+    channels = []
+    for c in range(3):
+        plane = rgb[..., c]
+        masked = _gaussian(down(plane * weight), sigma) / np.maximum(share, _MIN_SHARE)
+        if not near.all():
+            masked = np.where(near, masked, _gaussian(down(plane), sigma))
+        channels.append(_resize(np, Image, masked, full, Image.Resampling.BILINEAR))
+    out = np.stack(channels, axis=-1)
+    return Image.fromarray(np.floor(np.clip(out, 0, 255) + 0.5).astype(np.uint8), "RGB")
+
+
+def _resize(np, Image, plane, size, resample):
+    """A float plane resized to `size` (w, h), staying in floating point."""
+    if plane.shape[::-1] == tuple(size):
+        return plane
+    image = Image.fromarray(np.ascontiguousarray(plane, np.float32), "F")
+    return np.asarray(image.resize(size, resample), np.float32)
+
+
+def _gaussian(plane, sigma):
+    """`plane` (a 2-D float array) blurred by a Gaussian of `sigma` pixels.
+
+    Three box blurs in each direction, sized to add up to that Gaussian
+    (Kutskir's "fastest Gaussian blur"), with the edges extended. Each box is
+    a difference of running sums, so the cost doesn't grow with sigma.
+    """
+    import numpy as np
+
+    for width in _box_widths(sigma, _BOX_PASSES):
+        for axis in (0, 1):
+            plane = _box(np, plane, (width - 1) // 2, axis)
+    return plane
+
+
+def _box_widths(sigma, passes):
+    """Odd box widths whose `passes` stacked box blurs approximate the Gaussian."""
+    import math
+
+    ideal = math.sqrt(12 * sigma * sigma / passes + 1)
+    lower = int(ideal)
+    if lower % 2 == 0:
+        lower -= 1
+    upper = lower + 2
+    n_lower = round((12 * sigma * sigma - passes * lower * lower - 4 * passes * lower
+                     - 3 * passes) / (-4 * lower - 4))
+    return [lower if i < n_lower else upper for i in range(passes)]
+
+
+def _box(np, plane, r, axis):
+    """The mean of each 2r+1 window along `axis`, edges extended."""
+    if r <= 0:
+        return plane
+    pad = [(0, 0), (0, 0)]
+    pad[axis] = (r + 1, r)                 # one extra in front: the running sum's zero
+    padded = np.pad(plane, pad, mode="edge")
+    sums = np.cumsum(padded, axis=axis, dtype=np.float64)
+    n = plane.shape[axis]
+    ahead = np.take(sums, np.arange(2 * r + 1, 2 * r + 1 + n), axis=axis)
+    behind = np.take(sums, np.arange(0, n), axis=axis)
+    return ((ahead - behind) / (2 * r + 1)).astype(np.float32)

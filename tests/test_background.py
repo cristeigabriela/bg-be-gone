@@ -59,3 +59,14 @@ def test_the_background_next_to_the_subject_keeps_its_own_colour(x):
     behind = blur_behind(picture, alpha, STRENGTH_MAX)
     assert min(behind.getpixel((x, 100))) >= 250, \
         "the white next to the disc stays white: the disc isn't blurred into it"
+
+
+def test_a_uniform_background_blurs_to_itself_under_a_partly_transparent_subject():
+    """Blurring a uniform colour can't change it, whatever the alpha: the
+    weighted average of one value is that value. Rounding the weighted colour
+    to 8 bits before dividing once turned 1 into 2 here."""
+    picture = Image.new("RGB", (64, 64), (1, 1, 1))
+    alpha = Image.new("L", (64, 64), 127)
+    behind = blur_behind(picture, alpha, STRENGTH_DEFAULT)
+    assert {colour for _, colour in behind.getcolors()} == {(1, 1, 1)}, \
+        "every pixel keeps the uniform colour"
