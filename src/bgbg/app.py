@@ -705,6 +705,9 @@ class Window(Adw.ApplicationWindow):
         self._abandoned = {}
         self._preparing = {}           # Prep -> token of the input encode under way
         self._inputs_made = 0          # encoded inputs so far, to name each one's file
+        self._animations_made = 0      # animation results so far, to name each one's file
+        self._animations = set()       # animation results in the temp folder
+        self._animation_saves = {}     # animation result -> saves still reading it
         self._encoded_inputs = set()   # paths _prepare_input wrote, the only ones it deletes
         self._saves_writing = 0        # saves being rendered off the UI thread
         self._quit = Quit.NOT_ASKED
@@ -2175,7 +2178,7 @@ class Window(Adw.ApplicationWindow):
         self.source_path = path
         self._source_animation = animation
         self.res_panel.view.clear()
-        self.result_output = None
+        self._replace_result(None)
         self.save_btn.set_sensitive(False)
         self.gen_btn.set_sensitive(not self.busy)   # a batch may still be running
         if self._worker_state is not WorkerState.UP:
@@ -2206,8 +2209,12 @@ class Window(Adw.ApplicationWindow):
         result = self.result_output
         if result and formats.can_animate(result):
             fmt = formats.format_of(result)
-            self._ask_save_path("_nobg", (fmt,), lambda target, choices: self._save_result(
-                target, choices, lambda path, _: shutil.copyfile(result, path), fmt))
+            release = self._hold_animation(result)
+            self._ask_save_path(
+                "_nobg", (fmt,), lambda target, choices: self._save_result(
+                    target, choices, lambda path, _: shutil.copyfile(result, path), fmt,
+                    finished=release),
+                dismissed=release)
             return
         # The shown result and its rotate/flip, taken at the press: the encode
         # runs later, off the UI thread, where a 4K PNG can't freeze the window.
@@ -2222,7 +2229,33 @@ class Window(Adw.ApplicationWindow):
                             lambda target, choices: self._save_result(
                                 target, choices, render, formats.PNG))
 
-    def _save_result(self, target, choices, render, rendered):
+    def _replace_result(self, path):
+        """Make `path` the result Save offers; an animation it replaces goes
+        once no save reads it."""
+        old, self.result_output = self.result_output, path
+        if old is not None and old != path and old not in self._animation_saves:
+            self._remove_animation(old)
+
+    def _hold_animation(self, path):
+        """Keep animation result `path` for a save until the returned release()."""
+        self._animation_saves[path] = self._animation_saves.get(path, 0) + 1
+
+        def release():
+            left = self._animation_saves.pop(path) - 1
+            if left:
+                self._animation_saves[path] = left
+            elif path != self.result_output:
+                self._remove_animation(path)
+        return release
+
+    def _remove_animation(self, path):
+        """Delete an animation result, and its first-frame preview, if it is one."""
+        if path in self._animations:
+            self._animations.discard(path)
+            _remove_quietly(path)
+            _remove_quietly(path + ".preview.png")
+
+    def _save_result(self, target, choices, render, rendered, finished=None):
         """Write a result to `target` off the UI thread, whole or not at all.
 
         render(path, png_options) writes the result, in format `rendered`, to
@@ -2257,6 +2290,8 @@ class Window(Adw.ApplicationWindow):
 
         def written(result):
             self._saves_writing -= 1
+            if finished is not None:
+                finished()                   # render is done with what it read
             if isinstance(result, (OSError, GLib.Error)):
                 self._report_save_failure(target, result)
             elif isinstance(result, Exception):
@@ -2269,8 +2304,9 @@ class Window(Adw.ApplicationWindow):
         self._saves_writing += 1
         offmain.run(work, written)
 
-    def _ask_save_path(self, stem_suffix, choices, save):
-        """Ask where to save, offering `choices`, then call save(target, choices).
+    def _ask_save_path(self, stem_suffix, choices, save, dismissed=None):
+        """Ask where to save, offering `choices`, then call save(target, choices),
+        or dismissed() when no file was chosen.
 
         The name's suffix picks the format. The default is the source's own
         format when it is one of the choices, so a WebP comes back as a WebP.
@@ -2297,15 +2333,17 @@ class Window(Adw.ApplicationWindow):
             try:
                 f = d.save_finish(res)
             except GLib.Error:
+                if dismissed is not None:
+                    dismissed()
                 return
             target = formats.save_target(f.get_path(), choices, default)
             if formats.overwrites_unasked(target):
-                self._confirm_overwrite(target, lambda: save(target, choices))
+                self._confirm_overwrite(target, lambda: save(target, choices), dismissed)
             else:
                 save(target, choices)
         dlg.save(self, None, done)
 
-    def _confirm_overwrite(self, target, save):
+    def _confirm_overwrite(self, target, save, dismissed=None):
         """Ask before replacing a file the dialog never asked about.
 
         The dialog confirmed the typed name; save_target then changed its
@@ -2324,6 +2362,8 @@ class Window(Adw.ApplicationWindow):
         def answered(_dlg, response):
             if response == "replace":
                 save()
+            elif dismissed is not None:
+                dismissed()
         dlg.connect("response", answered)
         dlg.present(self)
 
@@ -2511,7 +2551,10 @@ class Window(Adw.ApplicationWindow):
         # still would; process the original file (all frames) not the preview.
         # The result keeps the source's format: a WebP keeps soft alpha edges.
         fmt = formats.format_of(self.source_path)
-        out = os.path.join(self.tmpdir, "result" + fmt.suffix)
+        # A file of its own: a save of the previous animation may still read
+        # that one (see _hold_animation).
+        self._animations_made += 1
+        out = os.path.join(self.tmpdir, "result-%d%s" % (self._animations_made, fmt.suffix))
         v = self.src_panel.view
         self._set_busy(True, cancel=True)
         self.src_panel.view.set_scanning(True)
@@ -2623,7 +2666,7 @@ class Window(Adw.ApplicationWindow):
                 self._toast("%s ready — the first run optimises GPU kernels and "
                             "is slower; later runs are fast." % msg["label"])
         elif t == "done_single":
-            self.result_output = msg["output"]
+            self._replace_result(msg["output"])
             self._result_alpha = req.alpha
             # Save waits for the decode: until then the panel shows the old result.
             self.save_btn.set_sensitive(False)
@@ -2652,7 +2695,8 @@ class Window(Adw.ApplicationWindow):
             # for GIF); otherwise the worker's first-frame PNG stands in.
             if not self.res_panel.view.load_file(msg["output"]):
                 self.res_panel.view.load_file(msg["preview"])
-            self.result_output = msg["output"]
+            self._animations.add(msg["output"])
+            self._replace_result(msg["output"])
             self._result_alpha = req.alpha
             self.save_btn.set_sensitive(True)
             self.status.set_text("Done: %d frames in %.1fs — Save the %s."
