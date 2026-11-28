@@ -42,7 +42,8 @@ Responses (one JSON object per line on stdout):
   {"type":"device","provider":P,"label":L,"gpu":bool,"id":N}
   {"type":"progress","done":i,"total":n,"name":str,"id":N}
   {"type":"done_single","output":P,"preview":P,"seconds":f,"id":N}
-  {"type":"done_batch","count":n,"seconds":f,"outdir":P,"id":N}
+  {"type":"done_batch","count":n,"total":n,"failed":[{"name","message"}],
+   "skipped":[{"name","message"}],"renamed":n,"seconds":f,"outdir":P,"id":N}
   {"type":"gif_progress","done":i,"total":n,"id":N}
   {"type":"gif_done","output":P,"preview":P,"frames":n,"seconds":f,"id":N}
   {"type":"converted","output":P,"frames":n,"id":N}
@@ -87,6 +88,7 @@ from PIL import Image, ImageFilter, UnidentifiedImageError  # noqa: E402
 from engines import ort as ort_engine  # noqa: E402
 from engines import selection  # noqa: E402
 from engines import torch_birefnet  # noqa: E402  (imports no torch itself)
+import batchnames  # noqa: E402
 import formats  # noqa: E402
 
 # HEIC/HEIF (phone photos) needs libheif; pi-heif is its decode-only build.
@@ -267,6 +269,13 @@ class UnsupportedOutputError(WorkerError, ValueError):
                              % os.path.basename(path))
 
 
+class NoImagesError(WorkerError):
+    def __init__(self, folder, user_message):
+        super().__init__(f"no images to process in {folder}")
+        self.folder = folder
+        self.user_message = user_message
+
+
 def _causes(exc):
     """`exc` and every exception it was raised from, outermost first."""
     seen = []
@@ -296,6 +305,8 @@ def describe_error(exc, req):
     name = os.path.basename(req.get("input") or "") or "The file"
     for e in _causes(exc):
         if isinstance(e, WorkerError):
+            return e.user_message
+        if isinstance(e, batchnames.BatchPatternError):
             return e.user_message
         if isinstance(e, UnidentifiedImageError):
             return f"{name} isn't an image bg-be-gone can read."
@@ -472,50 +483,91 @@ def _webp_frames(path):
         return 1
 
 
+def _batch_skip_reason(path):
+    """Why a batch leaves out an image it can read, or None to process it.
+
+    Batch keeps one frame per file, so animations go through the Single page,
+    which keeps them all. A GIF is left out even as a still, as before.
+    """
+    if not path.lower().endswith(formats.BATCH_SUFFIXES):
+        return "it's a GIF; open it on the Single page, which keeps every frame."
+    if _webp_frames(path) > 1:
+        return "it's an animated WebP; open it on the Single page, which keeps every frame."
+    return None
+
+
 def handle_batch(req):
     rid = req.get("id")
     indir = req["input_dir"]
     outdir = req["output_dir"]
-    os.makedirs(outdir, exist_ok=True)
-    files = sorted(f for f in glob.glob(os.path.join(indir, "*"))
-                   if f.lower().endswith(formats.BATCH_SUFFIXES)
-                   and os.path.isfile(f))
-    # Batch would keep only an animation's first frame, as with GIFs.
-    animated = [f for f in files if _webp_frames(f) > 1]
-    files = [f for f in files if f not in animated]
-    if animated:
+    pattern = req.get("pattern") or "{name}_nobg"
+    batchnames.check_pattern(pattern)      # before any work, so nothing half-runs
+    images = sorted(f for f in glob.glob(os.path.join(indir, "*"))
+                    if f.lower().endswith(formats.READ_SUFFIXES) and os.path.isfile(f))
+    files, skipped = [], []                # skipped: [{"name", "message"}], in order
+    for f in images:
+        reason = _batch_skip_reason(f)
+        if reason is None:
+            files.append(f)
+        else:
+            skipped.append({"name": os.path.basename(f), "message": reason})
+    if skipped:
         out({"type": "notice", "id": rid, "message":
-             "Skipped %d animated WebP (%s): open them on the Single page."
-             % (len(animated), ", ".join(os.path.basename(f) for f in animated))})
+             "Skipped %d GIF or animated WebP (%s): open them on the Single page."
+             % (len(skipped), ", ".join(s["name"] for s in skipped))})
     total = len(files)
     if total == 0:
-        out({"type": "error", "message": "No images found in input folder.",
-             "id": rid})
-        return
-    pattern = req.get("pattern") or "{name}_nobg"
+        found = "No images found in the input folder."
+        if skipped:
+            found += " Skipped %d GIF or animated WebP: open them on the Single page." \
+                % len(skipped)
+        raise NoImagesError(indir, found)
+    os.makedirs(outdir, exist_ok=True)
     get_session(req["model"], rid)         # load + emit the device message
     alpha = req.get("alpha", False)
     bg = req.get("bg", "transparent")
     blur = req.get("blur", 20)
+    taken = batchnames.taken_by(files)     # a source is never an output
+    renamed = 0                            # results written under a numbered name
+    failed = []                            # [{"name", "message"}], in order
     t = time.time()
     for i, f in enumerate(files, 1):
         if _cancel.is_set():               # stop before starting the next file
             out({"type": "canceled", "scope": "batch", "done": i - 1,
                  "total": total, "id": rid})
             return
-        name = os.path.splitext(os.path.basename(f))[0]
-        try:
-            stem = pattern.format(name=name, n=i)
-        except Exception:
-            stem = name + "_nobg"
-        dst = os.path.join(outdir, stem + ".png")
         out({"type": "progress", "done": i - 1, "total": total,
              "name": os.path.basename(f), "id": rid})
-        process_one(req["model"], rid, f, dst, alpha, bg, blur,
-                    want_preview=False)
+        # One file that can't be read must not cost the rest of the run.
+        part = None
+        try:
+            stem = batchnames.stem_for(pattern, f, i)
+            # The result is written into a file of the batch's own, and gets
+            # its name only once complete, from a call that never replaces a
+            # file: one that appears under that name meanwhile is kept.
+            part = batchnames.new_part(outdir, stem)
+            process_one(req["model"], rid, f, part, alpha, bg, blur,
+                        want_preview=False)
+            dst = batchnames.publish(part, outdir, stem, taken)
+            part = None
+        except Exception as e:  # noqa: BLE001 - reported per file, run goes on
+            print(f"batch: {f} failed:", file=sys.stderr)
+            traceback.print_exc()
+            sys.stderr.flush()
+            if part is not None:           # only ever the batch's own file
+                try:
+                    os.remove(part)
+                except OSError as rm_err:
+                    print(f"batch: could not remove {part}: {rm_err}", file=sys.stderr)
+            failed.append({"name": os.path.basename(f),
+                           "message": describe_error(e, {"input": f})})
+            continue
+        if os.path.basename(dst) != stem + ".png":
+            renamed += 1
     out({"type": "progress", "done": total, "total": total, "name": "",
          "id": rid})
-    out({"type": "done_batch", "count": total,
+    out({"type": "done_batch", "count": total - len(failed), "total": total,
+         "failed": failed, "skipped": skipped, "renamed": renamed,
          "seconds": round(time.time() - t, 1), "outdir": outdir, "id": rid})
 
 

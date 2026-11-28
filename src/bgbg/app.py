@@ -34,6 +34,7 @@ from viewer import (  # noqa: E402
     Transform,
     transform_pixbuf,
 )
+import batchnames  # noqa: E402
 import formats  # noqa: E402
 from engines import selection  # noqa: E402  (standard library only)
 import offmain  # noqa: E402
@@ -99,6 +100,13 @@ class Prep(enum.Enum):
 
     SINGLE = "single"            # Generate's input
     SEGMENT = "segment"          # Segment's model load
+
+
+_PATTERN_HINT = ("<small>Tokens: <tt>{name}</tt> original filename, "
+                 "<tt>{n}</tt> index. Output is PNG in the output folder; a name "
+                 "that's taken gets a number.</small>")
+# Failed or skipped files a batch summary lists by name, so the dialog fits on screen.
+_MAX_LISTED = 15
 
 
 class WorkerState(enum.Enum):
@@ -1641,14 +1649,14 @@ class Window(Adw.ApplicationWindow):
 
         self.pattern_row = Adw.EntryRow(title="Rename pattern")
         self.pattern_row.set_text("{name}_nobg")
+        self.pattern_row.connect("changed", lambda *_: self._check_pattern())
         grp.add(self.pattern_row)
         box.append(grp)
 
         hint = Gtk.Label(xalign=0, wrap=True)
         hint.add_css_class("dim-label")
-        hint.set_markup(
-            "<small>Tokens: <tt>{name}</tt> original filename, "
-            "<tt>{n}</tt> index. Output is PNG in the output folder.</small>")
+        hint.set_markup(_PATTERN_HINT)
+        self.pattern_hint = hint
         box.append(hint)
 
         run_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -2030,10 +2038,30 @@ class Window(Adw.ApplicationWindow):
             self._sync_batch()
         dlg.select_folder(self, None, done)
 
+    def _pattern_problem(self):
+        """Why the rename pattern can't name files, or None."""
+        try:
+            batchnames.check_pattern(self.pattern_row.get_text().strip() or "{name}_nobg")
+        except batchnames.BatchPatternError as e:
+            return e.user_message
+        return None
+
+    def _check_pattern(self):
+        problem = self._pattern_problem()
+        if problem:
+            self.pattern_row.add_css_class("error")
+            self.pattern_hint.set_text(problem)
+        else:
+            self.pattern_row.remove_css_class("error")
+            self.pattern_hint.set_markup(_PATTERN_HINT)
+        self._sync_batch()
+
     def _sync_batch(self):
         self.run_btn.set_sensitive(
             bool(self.batch_input and self.batch_output) and not self.busy
             and self._worker_state is WorkerState.UP)
+        if self._pattern_problem() is not None:
+            self.run_btn.set_sensitive(False)   # Run waits for a pattern that works
 
     # ---------- actions ----------
     def _set_busy(self, busy, spin=True, cancel=False):
@@ -2252,11 +2280,8 @@ class Window(Adw.ApplicationWindow):
         elif t == "done_batch":
             self.progress.set_fraction(1.0)
             self.progress.set_text("done")
-            self.batch_status.set_text(
-                "Finished %d images in %.1fs → %s" %
-                (msg["count"], msg["seconds"], msg["outdir"]))
             self._set_busy(False, spin=False)
-            self._toast("Batch finished: %d images" % msg["count"])
+            self._on_batch_done(msg)
         elif t == "seg_ready":
             self._seg_set_busy(False)
             self.seg_loaded_for = req.loads
@@ -2330,6 +2355,53 @@ class Window(Adw.ApplicationWindow):
         elif t == "error":
             self._on_job_error(job, msg["message"])
         return False
+
+    def _on_batch_done(self, msg):
+        """Summarise a finished batch; list what failed or was skipped."""
+        failed, skipped = msg["failed"], msg["skipped"]
+        parts = ["%d done" % msg["count"]]
+        if failed:
+            parts.append("%d failed" % len(failed))
+        if skipped:
+            parts.append("%d skipped" % len(skipped))
+        summary = ", ".join(parts)
+        renamed = msg["renamed"]
+        if renamed:
+            summary += " (%d numbered, so nothing was overwritten)" % renamed
+        self.batch_status.set_text("%s in %.1fs → %s" % (summary, msg["seconds"], msg["outdir"]))
+        if not (failed or skipped):
+            toast = Adw.Toast(title="Batch finished: " + summary, timeout=5)
+            toast.set_button_label("Open folder")
+            toast.connect("button-clicked", lambda *_: self._open_folder(msg["outdir"]))
+            self.toasts.add_toast(toast)
+            return
+        lines = []
+        for title, entries in (("Failed", failed), ("Skipped", skipped)):
+            if not entries:
+                continue
+            lines.append(title + ":")
+            lines += ["%s: %s" % (e["name"], e["message"]) for e in entries[:_MAX_LISTED]]
+            if len(entries) > _MAX_LISTED:
+                lines.append("…and %d more; the log has them all."
+                             % (len(entries) - _MAX_LISTED))
+        dlg = Adw.AlertDialog(heading="Batch finished: " + summary, body="\n".join(lines))
+        dlg.add_response("close", "Close")
+        dlg.add_response("open", "Open folder")
+        dlg.set_default_response("close")
+        dlg.connect("response", lambda d, r: self._open_folder(msg["outdir"])
+                    if r == "open" else None)
+        dlg.present(self)
+
+    def _open_folder(self, path):
+        launcher = Gtk.FileLauncher.new(Gio.File.new_for_path(path))
+
+        def done(launcher, res):
+            try:
+                launcher.launch_finish(res)
+            except GLib.Error as e:
+                self._report_failure("opening " + path, e, "Could not open %s: %s."
+                                     % (path, e.message))
+        launcher.launch(self, None, done)
 
     def _on_job_error(self, job, text):
         """Show a failed job's message on its own page, and keep it on screen."""
