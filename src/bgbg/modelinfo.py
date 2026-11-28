@@ -243,10 +243,7 @@ def row_subtitle(pick: Pick, info: ModelInfo | None, engine: Engine,
         "928 MB download · ~3.1 GB VRAM".
     """
     label = info.name if info else (name or "unknown model")
-    if device is Device.CPU:
-        vram = "on the CPU"
-    else:
-        vram = vram_text(info.vram_mib(engine) if info else None)
+    vram = _vram_part(info, engine, device)
     size = info.download_bytes(engine) if info else None
     if pick is Pick.MANUAL:
         parts = [size_text(size) + " download"] if size else []
@@ -258,3 +255,26 @@ def row_subtitle(pick: Pick, info: ModelInfo | None, engine: Engine,
         parts = [lead, label, vram]
     text = " · ".join(parts)
     return "%s (%s)" % (text, why) if why else text
+
+
+def model_summary(label: str, info: ModelInfo | None, engine: Engine,
+                  device: Device = Device.GPU) -> str:
+    """A model and its VRAM on one line, for a folded section's subtitle.
+
+    Args:
+        label: how to name the model, e.g. "SAM 2.1 Large (Auto)".
+        info: the model, or None for one this module doesn't know.
+        engine: the engine the app asked for; ``info`` says which one runs it.
+        device: where the model runs; on the CPU its VRAM doesn't apply.
+
+    Returns:
+        e.g. "SAM 2.1 Large (Auto) · ~3.0 GB VRAM", or "MobileSAM · on the CPU".
+    """
+    return "%s · %s" % (label, _vram_part(info, engine, device))
+
+
+def _vram_part(info: ModelInfo | None, engine: Engine, device: Device) -> str:
+    """The VRAM a row names, the same in every row: "on the CPU" when it runs there."""
+    if device is Device.CPU:
+        return "on the CPU"
+    return vram_text(info.vram_mib(engine) if info else None)

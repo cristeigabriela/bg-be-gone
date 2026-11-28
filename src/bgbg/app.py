@@ -37,7 +37,7 @@ from viewer import (  # noqa: E402
 )
 import batchnames  # noqa: E402
 import formats  # noqa: E402
-from gi.repository import Graphene, Gsk, Pango  # noqa: E402
+from gi.repository import GObject, Graphene, Gsk, Pango  # noqa: E402
 import modelinfo  # noqa: E402
 from modelinfo import Device, Pick  # noqa: E402
 from engines import selection  # noqa: E402  (standard library only)
@@ -411,6 +411,23 @@ progressbar.footer-progress.unknown > trough > progress {
   from { background-position: -24px 0; }
   to   { background-position: 110px 0; }
 }
+
+/* Source | Result: the handle is the gap between the two cards, with no line.
+   It keeps a 12 px grab area and the resize cursor; hovering or dragging it
+   shows a short grip, a shape rather than a colour change. */
+paned.card-split > separator {
+  min-width: 12px;
+  background: none;
+  box-shadow: none;
+  border: none;
+}
+paned.card-split > separator:hover,
+paned.card-split > separator:active {
+  background-image: image(alpha(@window_fg_color, 0.35));
+  background-size: 4px 40px;
+  background-position: center;
+  background-repeat: no-repeat;
+}
 """
 
 
@@ -460,15 +477,28 @@ def model_picker(title, sections, describe):
         entry.append(text)
         entry.append(check)
         item.set_child(entry)
-        item.connect("notify::selected",
-                     lambda it, _pspec: check.set_opacity(1 if it.get_selected() else 0))
+
+    # The check marks the row's choice. Not the list item's own selected
+    # state: the open list selects whatever the pointer is over.
+    checks = {}             # each bound entry's check -> the key it shows
+
+    def show_check(check):
+        chosen = row.get_selected_item()
+        mark = chosen is not None and checks.get(check) == chosen.get_string()
+        check.set_opacity(1 if mark else 0)
 
     def bind_entry(_factory, item):
-        _short, name, subtitle = describe(item.get_item().get_string())
+        key = item.get_item().get_string()
+        _short, name, subtitle = describe(key)
         text = item.get_child().get_first_child()
         text.get_first_child().set_label(name)
         text.get_last_child().set_label(subtitle)
-        text.get_next_sibling().set_opacity(1 if item.get_selected() else 0)
+        check = text.get_next_sibling()
+        checks[check] = key
+        show_check(check)
+
+    def unbind_entry(_factory, item):
+        checks.pop(item.get_child().get_last_child(), None)
 
     def setup_header(_factory, header):
         # Indented to line up with the entries' text: list headers get no row padding.
@@ -484,10 +514,12 @@ def model_picker(title, sections, describe):
         label.set_label(headers.get(header.get_item().get_string(), ""))
         header_labels.add(label)
 
-    def factory(setup, bind):
+    def factory(setup, bind, unbind=None):
         f = Gtk.SignalListItemFactory()
         f.connect("setup", setup)
         f.connect("bind", bind)
+        if unbind is not None:
+            f.connect("unbind", unbind)
         return f
 
     row = Adw.ComboRow(title=title, model=model)
@@ -495,8 +527,9 @@ def model_picker(title, sections, describe):
     def refresh():
         # New factories rebind every entry, and the row's own value.
         row.set_factory(factory(setup_value, bind_value))
-        row.set_list_factory(factory(setup_entry, bind_entry))
+        row.set_list_factory(factory(setup_entry, bind_entry, unbind_entry))
     refresh()
+    row.connect("notify::selected", lambda *_: [show_check(c) for c in list(checks)])
     # Section headers need libadwaita 1.6; older ones list the same models unheaded.
     if not headers or not hasattr(row, "set_header_factory"):
         return row, refresh
@@ -1060,8 +1093,10 @@ class Window(Adw.ApplicationWindow):
         tv.add_top_bar(self.worker_banner)
 
         body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        body.append(self._build_sidebar())
-        body.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        # libadwaita's sidebar surface sets it off from the pages, with no line.
+        sidebar = self._build_sidebar()
+        sidebar.add_css_class("sidebar-pane")
+        body.append(sidebar)
         self.stack.set_hexpand(True)
         body.append(self.stack)
         tv.set_content(body)
@@ -1308,10 +1343,20 @@ class Window(Adw.ApplicationWindow):
         self.footer_progress.add_css_class("footer-progress")
         self.footer_progress.set_valign(Gtk.Align.CENTER)
         self.footer_progress.set_size_request(150, -1)
-        self.footer_progress.set_show_text(True)
         self.footer_progress.set_visible(False)
         self._footer_motion = ProgressMotion(self.footer_progress)
         centre.append(self.footer_progress)
+        # The bar's count ("12 / 30") sits beside it, not drawn above it, so
+        # the bar's middle lines up with the text's at any font size. It
+        # shows the bar's own text, and comes and goes (and fades) with it.
+        count = Gtk.Label(valign=Gtk.Align.CENTER)
+        count.add_css_class("status-label")
+        count.add_css_class("numeric")
+        for prop in ("text", "visible", "opacity"):
+            self.footer_progress.bind_property(
+                prop, count, "label" if prop == "text" else prop,
+                GObject.BindingFlags.SYNC_CREATE)
+        centre.append(count)
         bar.set_center_widget(centre)
 
         self.footer_context = Gtk.Label(label="")
@@ -1654,16 +1699,18 @@ class Window(Adw.ApplicationWindow):
                 pick, modelinfo.SEG_MODELS.get(loaded["rung"]), selection.Engine.ORT,
                 why=_seg_reason(loaded), name=loaded.get("model"),
                 device=Device.GPU if loaded.get("gpu") else Device.CPU)
-            adv = "Model: %s" % self._seg_model_name()
-            if pick is Pick.AUTO:
-                adv += " (Auto)"
+            label = self._seg_model_name() + (" (Auto)" if pick is Pick.AUTO else "")
+            adv = "Model: " + modelinfo.model_summary(
+                label, modelinfo.SEG_MODELS.get(loaded["rung"]), selection.Engine.ORT,
+                device=Device.GPU if loaded.get("gpu") else Device.CPU)
         elif choice == SEG_AUTO:
             text = "Auto · picks by free VRAM when you segment"
             adv = "Model: Auto"
         else:
             text = modelinfo.row_subtitle(Pick.MANUAL, modelinfo.SEG_MODELS.get(choice),
                                           selection.Engine.ORT)
-            adv = "Model: %s" % self._seg_model_name()
+            adv = "Model: " + modelinfo.model_summary(
+                self._seg_model_name(), modelinfo.SEG_MODELS.get(choice), selection.Engine.ORT)
         self.seg_model_row.set_subtitle(text)
         self.seg_adv.set_subtitle(adv)
 
@@ -1900,6 +1947,7 @@ class Window(Adw.ApplicationWindow):
         page.append(self.seg_mode_toggle)
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, wide_handle=True)
+        paned.add_css_class("card-split")
         paned.set_vexpand(True)
         self.seg_panel = Panel(
             "Source — click objects", transforms=False,
@@ -2344,6 +2392,7 @@ class Window(Adw.ApplicationWindow):
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL,
                           wide_handle=True)
+        paned.add_css_class("card-split")
         paned.set_vexpand(True)
         self.src_panel = Panel("Source", on_change=self._on_source_change)
         self.res_panel = Panel(

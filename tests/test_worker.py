@@ -22,11 +22,12 @@ from workerpipe import BACKGROUND_PIXEL, REPLY_TIMEOUT_S, SUBJECT_PIXEL, TESTDAT
 def engine_env(tmp_path):
     """An environment that names no engine anywhere, whatever this machine has set.
 
-    An empty config folder, no BGBG_ENGINE, a profile that isn't there, and a
-    gpu.env that sets nothing.
+    An empty config folder (XDG's, and %LOCALAPPDATA%'s on Windows), no
+    BGBG_ENGINE, a profile that isn't there, and a gpu.env that sets nothing.
     """
     env = {k: v for k, v in os.environ.items() if k != "BGBG_ENGINE"}
     env["XDG_CONFIG_HOME"] = str(tmp_path / "config")
+    env["LOCALAPPDATA"] = str(tmp_path / "local")
     env["BGBG_PROFILE"] = str(tmp_path / "no-profile.json")
     env["BGBG_GPU_ENV"] = str(TESTDATA / "gpu-env" / "empty.env")
     return env

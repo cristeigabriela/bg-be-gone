@@ -2,7 +2,8 @@
 import pytest
 
 from engines.selection import Engine
-from modelinfo import Device, Family, Measured, ModelInfo, Pick, row_subtitle, size_text
+from modelinfo import (Device, Family, Measured, ModelInfo, Pick, model_summary, row_subtitle,
+                       size_text)
 
 ONNX_BYTES = 972_666_916     # 928 MB, BiRefNet's ONNX export
 PTH_BYTES = 885_082_437      # 844 MB, its PyTorch checkpoint
@@ -79,3 +80,21 @@ def test_a_model_row_names_the_pick_and_its_cost(pick, info, engine, why, name, 
 )
 def test_download_sizes_read_like_the_file_manager(n_bytes, expected):
     assert size_text(n_bytes) == expected, "sizes are in binary units, as Windows and GNOME show"
+
+
+@pytest.mark.parametrize(
+    "label, info, device, expected",
+    [
+        # Auto's pick, folded away under Advanced, still says what it costs.
+        ("Both Model (Auto)", BOTH_ENGINES, Device.GPU, "Both Model (Auto) · ~3.1 GB VRAM"),
+        # On the CPU its VRAM doesn't apply, as in the model row.
+        ("Both Model (fallback)", BOTH_ENGINES, Device.CPU, "Both Model (fallback) · on the CPU"),
+        # A model this table doesn't know.
+        ("SAM 3 Huge", None, Device.GPU, "SAM 3 Huge · VRAM unknown"),
+    ],
+    ids=["gpu", "cpu", "unknown model"],
+)
+def test_a_folded_summary_names_the_model_and_the_same_vram_as_its_row(label, info, device,
+                                                                         expected):
+    got = model_summary(label, info, Engine.ORT, device=device)
+    assert got == expected, "the summary uses the model row's VRAM wording"

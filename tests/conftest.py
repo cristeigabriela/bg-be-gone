@@ -9,6 +9,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "bgbg"))
 
 from workerpipe import Worker  # noqa: E402
 
+# Where the app keeps its settings, logs and downloaded models: %LOCALAPPDATA%
+# on Windows, the XDG folders elsewhere.
+_APP_FOLDERS = ("LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME")
+
+
+@pytest.fixture(autouse=True)
+def _scratch_app_folders(tmp_path, monkeypatch):
+    """Point the app's folders at the test's own, for it and the workers it starts.
+
+    Otherwise a test reads this machine's real settings (an Engine choice
+    turns into a start-up notice) and can write into an installed app's
+    folders. A test that sets one of these itself still wins.
+    """
+    for name in _APP_FOLDERS:
+        monkeypatch.setenv(name, str(tmp_path / "app-folders" / name.lower()))
+
 
 @pytest.fixture
 def worker(tmp_path):
