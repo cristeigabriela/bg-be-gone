@@ -47,7 +47,7 @@ function Test-Runtime {
     param([string]$Root)
     $ready = Test-Worker -WorkerDir (Join-Path $Root 'worker') -AppDir (Join-Path $Root 'app\src\bgbg')
     Write-Host "Worker ready: $($ready.providers -join ', ')"
-    & (Join-Path $Root 'bin\python.exe') -I -c $FrontendProbe
+    Invoke-NativeShown (Join-Path $Root 'bin\python.exe') @('-I', '-c', $FrontendProbe)
     if ($LASTEXITCODE -ne 0) { throw "The frontend's Python can't load GTK and libadwaita ($LASTEXITCODE)" }
 }
 
@@ -56,6 +56,8 @@ function Install-Runtime {
     $Staged = [IO.Path]::GetFullPath($Staged).TrimEnd('\')
     if ([IO.Path]::GetDirectoryName($Staged) -ne $App) { throw "$Staged is not inside $App" }
     if (-not (Test-Inventory $Staged)) { throw "$Staged has no inventory; it isn't a release Setup extracted" }
+    # The old runtime is renamed aside in the swap, which fails if it runs.
+    if (Test-Path -LiteralPath $Runtime) { Assert-InstallIdle -Roots @($Runtime) }
     try {
         Test-Runtime $Staged
     } catch {
@@ -71,6 +73,9 @@ function Uninstall-Runtime {
     # A failed or interrupted run can leave a staged or renamed copy beside it.
     $leftovers = Get-ChildItem -LiteralPath $App -Directory -Filter 'runtime.*' -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match '^runtime\.(new|old)-[0-9a-f]{8}$' -and (Test-Inventory $_.FullName) }
+    $folders = @(@($Runtime) + @($leftovers | ForEach-Object FullName) | Where-Object { Test-Path -LiteralPath $_ })
+    # Nothing is removed while bg-be-gone runs or a file of it is open.
+    if ($folders.Count) { Assert-InstallIdle -Roots $folders }
     foreach ($folder in @($Runtime) + @($leftovers | ForEach-Object FullName)) {
         if (-not (Test-Path -LiteralPath $folder)) { continue }
         if (-not (Test-Inventory $folder)) {
