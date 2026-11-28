@@ -2003,11 +2003,33 @@ class Window(Adw.ApplicationWindow):
             files = value.get_files()
         except Exception:
             return False
-        if files and files[0].get_path():
-            self._load_source(files[0].get_path())
-            self.stack.set_visible_child_name("single")
+        paths = [f.get_path() for f in files if f.get_path()]
+        if not paths:
+            return False
+        page = self.stack.get_visible_child_name()
+        first = paths[0]
+        if os.path.isdir(first):
+            if page == "batch":
+                self.batch_input = first
+                self.in_row.set_subtitle(first)
+                self._remember(batch_input=first)
+                self._sync_batch()
+                self.batch_status.set_text("Input folder: " + first)
+            else:
+                self._toast("That's a folder. Drop it on the Batch page to process "
+                            "every image in it.")
             return True
-        return False
+        self._load_source(first)
+        # Stay on the page the image was dropped on; only Batch has no image
+        # view, so an image dropped there opens on Single.
+        if page == "batch":
+            self.stack.set_visible_child_name("single")
+        if len(paths) > 1:
+            rest = ("the other file was" if len(paths) == 2
+                    else "the other %d files were" % (len(paths) - 1))
+            self._toast("Opened %s; %s left out. Use Batch for several images."
+                        % (os.path.basename(first), rest))
+        return True
 
     def _animation_of(self, path):
         if not formats.can_animate(path):
