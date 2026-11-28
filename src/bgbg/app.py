@@ -112,6 +112,24 @@ _PATTERN_HINT = ("<small>Tokens: <tt>{name}</tt> original filename, "
 _MAX_LISTED = 15
 
 
+class Quit(enum.Enum):
+    """Whether a quit is waiting for something before the window closes."""
+
+    NOT_ASKED = "not_asked"
+    AFTER_SAVES = "after_saves"      # once the saves being written are done
+    AFTER_BATCH = "after_batch"      # once the cancelled batch has stopped
+
+
+# How long "Stop and quit" waits for the cancelled batch to stop: the file in
+# progress finishes first, and the worker deletes its own unfinished file.
+_BATCH_STOP_WAIT_MS = 3000
+
+
+class SaveOutcome(enum.Enum):
+    WRITTEN = "written"
+    FAILED = "failed"
+
+
 class WorkerState(enum.Enum):
     UP = "up"          # started; requests go through
     DOWN = "down"      # failed to start or exited: nothing would answer
@@ -688,6 +706,9 @@ class Window(Adw.ApplicationWindow):
         self._preparing = {}           # Prep -> token of the input encode under way
         self._inputs_made = 0          # encoded inputs so far, to name each one's file
         self._encoded_inputs = set()   # paths _prepare_input wrote, the only ones it deletes
+        self._saves_writing = 0        # saves being rendered off the UI thread
+        self._quit = Quit.NOT_ASKED
+        self._quit_timer = 0           # the wait for a stopping batch, while one runs
         self.busy = False
         self.batch_input = None
         self.batch_output = None
@@ -2233,14 +2254,17 @@ class Window(Adw.ApplicationWindow):
             return staging
 
         def written(result):
+            self._saves_writing -= 1
             if isinstance(result, (OSError, GLib.Error)):
                 self._report_save_failure(target, result)
             elif isinstance(result, Exception):
+                self._after_save(SaveOutcome.FAILED)
                 raise result                 # a bug, not a save failure
             elif direct:
                 self._report_saved(target, choices)
             else:
                 self._save_via_worker(result, target, choices, staging=result)
+        self._saves_writing += 1
         offmain.run(work, written)
 
     def _ask_save_path(self, stem_suffix, choices, save):
@@ -2304,10 +2328,29 @@ class Window(Adw.ApplicationWindow):
     def _report_saved(self, target, choices):
         self._toast(_saved_notice(target, choices))
         self._remember(save_folder=os.path.dirname(target.path))
+        self._after_save(SaveOutcome.WRITTEN)
 
     def _report_save_failure(self, target, exc):
         self._report_failure("saving " + target.path, exc, "Could not save %s: %s." % (
             os.path.basename(target.path), plain_reason(exc)))
+        self._after_save(SaveOutcome.FAILED)
+
+    def _saves_running(self):
+        """Saves still being written: rendered off the UI thread, or re-encoded
+        by the worker."""
+        return self._saves_writing + len(self._rids(Job.SAVE))
+
+    def _after_save(self, outcome):
+        """A save ended: close now if a quit was waiting for the last one."""
+        if self._quit is not Quit.AFTER_SAVES:
+            return
+        if outcome is SaveOutcome.FAILED:
+            # Stay open, so the error is seen, whatever the other saves do.
+            self._quit = Quit.NOT_ASKED
+            return
+        if not self._saves_running():
+            self._quit = Quit.NOT_ASKED
+            self.close()
 
     def _save_via_worker(self, src, target, choices, staging):
         """Have the worker re-encode `src` as `target`; `staging` is ours to delete.
@@ -2329,6 +2372,7 @@ class Window(Adw.ApplicationWindow):
             _remove_quietly(part)
             self._toast_error("Could not save %s: the background process isn't running."
                               % os.path.basename(target.path))
+            self._after_save(SaveOutcome.FAILED)
 
     def _on_save_reply(self, pending, msg):
         _remove_quietly(pending.staging)
@@ -2337,6 +2381,7 @@ class Window(Adw.ApplicationWindow):
             _log.warning("saving %s failed: %s", pending.target.path, msg["message"])
             self._toast_error("Could not save %s: %s" % (
                 os.path.basename(pending.target.path), msg["message"]))
+            self._after_save(SaveOutcome.FAILED)
             return
         try:
             os.replace(pending.part, pending.target.path)
@@ -2524,6 +2569,8 @@ class Window(Adw.ApplicationWindow):
         else:
             req = self._jobs.get(rid)
         job = req.job if req is not None else None
+        if job is Job.BATCH and t in _JOB_ENDS and self._quit is Quit.AFTER_BATCH:
+            GLib.idle_add(self._finish_quit)   # once this last reply is handled
         if msg.get("device"):           # a finished job: where it actually ran
             self._set_device(msg["device"]["provider"], msg["device"]["label"])
         if job is Job.OPEN:
@@ -2918,6 +2965,58 @@ class Window(Adw.ApplicationWindow):
         launcher.launch(self, None, done)
 
     def _on_close(self, *_):
+        if self._quit is Quit.AFTER_BATCH:
+            return True                 # already stopping the batch to quit
+        if self._saves_running():
+            # Quitting now could cut a save short: finish it, then close.
+            self._quit = Quit.AFTER_SAVES
+            self._toast("Finishing the save, then quitting…")
+            return True
+        if self._has_job(Job.BATCH):
+            # Closing stops the batch; a minutes-long run deserves a question.
+            dlg = Adw.AlertDialog(
+                heading="A batch is running",
+                body="Quitting stops it. The images done so far stay in the output folder.")
+            dlg.add_response("keep", "Keep running")
+            dlg.add_response("quit", "Stop and quit")
+            dlg.set_response_appearance("quit", Adw.ResponseAppearance.DESTRUCTIVE)
+            dlg.set_default_response("keep")
+            dlg.set_close_response("keep")
+
+            def answered(d, response):
+                if response == "quit":
+                    self._stop_batch_then_quit()
+            dlg.connect("response", answered)
+            dlg.present(self)
+            return True
+        self._shut_down()
+        return False
+
+    def _stop_batch_then_quit(self):
+        """Cancel the batch, and quit once it has stopped, or after a short wait.
+
+        Stopping it lets the worker delete its own unfinished file; shutting
+        the worker down mid-file left that hidden file behind. The wait runs on
+        the main loop, so the window stays responsive.
+        """
+        self._quit = Quit.AFTER_BATCH
+        self._cancel_jobs(Job.BATCH)
+        self.batch_status.set_text("Stopping the batch, then quitting…")
+        self._quit_timer = GLib.timeout_add(_BATCH_STOP_WAIT_MS, self._finish_quit)
+
+    def _finish_quit(self):
+        """Quit after a batch stop: its last reply came, or the wait ran out."""
+        if self._quit is not Quit.AFTER_BATCH:
+            return False
+        self._quit = Quit.NOT_ASKED
+        if self._quit_timer:
+            GLib.source_remove(self._quit_timer)
+            self._quit_timer = 0
+        self._shut_down()
+        self.destroy()                  # no second close-request, no second question
+        return False
+
+    def _shut_down(self):
         if self.is_maximized():
             self._remember(window_maximized=True)
         else:
@@ -2925,7 +3024,6 @@ class Window(Adw.ApplicationWindow):
                            window_height=self.get_height())
         self.worker.shutdown()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
-        return False
 
 
 class App(Adw.Application):
