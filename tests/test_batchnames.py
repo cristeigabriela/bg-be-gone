@@ -3,6 +3,8 @@
 Publishing: a finished result takes a free name and never replaces a file.
 """
 import enum
+import os
+import sys
 
 import pytest
 
@@ -36,6 +38,35 @@ def test_publishing_never_replaces_a_file_that_took_the_name(tmp_path, disk):
     assert published == str(tmp_path / "cat_nobg (2).png"), "the result takes the next number"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["cat_nobg (2).png", "cat_nobg.png"], \
         "the unfinished part file is gone"
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="Windows' rename never replaces a file; POSIX's rename does")
+def test_without_hard_links_a_file_written_just_before_the_move_is_kept(tmp_path, monkeypatch):
+    """On exFAT, a sync client could write the name between the claim and the
+    move, and the result then replaced that file."""
+    def no_link(src, dst):
+        raise PermissionError(1, "Operation not permitted", dst)
+    monkeypatch.setattr(batchnames.os, "link", no_link)
+    target = tmp_path / "cat_nobg.png"
+    synced = []
+
+    def client_writes_first(real):
+        """os.replace or os.rename, with a sync client writing the name just before."""
+        def move(src, dst):
+            if os.path.abspath(dst) == str(target) and not synced:
+                synced.append(dst)
+                target.write_bytes(b"a photo the sync client wrote")
+            return real(src, dst)
+        return move
+    monkeypatch.setattr(batchnames.os, "replace", client_writes_first(os.replace))
+    monkeypatch.setattr(batchnames.os, "rename", client_writes_first(os.rename))
+    part = batchnames.new_part(str(tmp_path), "cat_nobg", ".png")
+    with open(part, "wb") as f:
+        f.write(b"the finished result")
+    published = batchnames.publish(part, str(tmp_path), "cat_nobg", ".png", set())
+    assert target.read_bytes() == b"a photo the sync client wrote", "the synced file is kept"
+    assert published == str(tmp_path / "cat_nobg (2).png"), "the result takes the next number"
 
 
 @pytest.mark.parametrize("existing, sources", [

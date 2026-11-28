@@ -168,12 +168,24 @@ def _move_no_replace(src, dst):
         raise
     except OSError:
         # No hard links on this disk (FAT, exFAT, some network shares).
-        # NOTE: claim-then-replace has a race the link doesn't: a file put at
-        # `dst` between the two calls would be replaced.
-        os.close(os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
-        os.replace(src, dst)
+        _rename_no_replace(src, dst)
         return
     os.remove(src)
+
+
+if os.name == "nt":
+    def _rename_no_replace(src, dst):
+        """Windows' rename fails with FileExistsError when `dst` exists, in one step."""
+        os.rename(src, dst)
+else:
+    def _rename_no_replace(src, dst):
+        """Claim `dst`, then move `src` over the claim.
+
+        NOTE: this has a race the link doesn't: a file put at `dst` between
+        the two calls would be replaced. POSIX's rename replaces silently.
+        """
+        os.close(os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
+        os.replace(src, dst)
 
 
 def taken_by(files):
