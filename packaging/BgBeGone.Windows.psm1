@@ -408,8 +408,9 @@ function Test-InstallAt {
     whether shared data is kept.
     #>
     param([Parameter(Mandatory)][string]$Path)
+    # The last is a Setup install's runtime (setup-runtime.ps1).
     foreach ($marker in 'bg-be-gone-install.json', 'BgBeGone.cmd', 'BgBeGone.vbs',
-                        'worker\python.exe', 'worker\pyvenv.cfg') {
+                        'worker\python.exe', 'worker\pyvenv.cfg', 'runtime\bg-be-gone-files.txt') {
         if (Test-Path -LiteralPath (Join-Path $Path $marker) -PathType Leaf) { return $true }
     }
     $false
