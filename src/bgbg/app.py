@@ -26,7 +26,11 @@ gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("Adw", "1")
 from gi.repository import Gtk, Gdk, GdkPixbuf, Gio, GLib, Adw  # noqa: E402
 
-from viewer import ImageView  # noqa: E402
+from viewer import (  # noqa: E402
+    ImageView,
+    Loaded,
+    Transform,
+)
 import formats  # noqa: E402
 from engines import selection  # noqa: E402  (standard library only)
 
@@ -1821,10 +1825,18 @@ class Window(Adw.ApplicationWindow):
                 self._toast("%s ready — the first run optimises GPU kernels and "
                             "is slower; later runs are fast." % msg["label"])
         elif t == "done_single":
-            self.res_panel.view.load_file(msg["output"])
             self.result_output = msg["output"]
             self._result_alpha = self._generating_alpha.pop(rid, formats.Alpha.TRANSPARENT)
-            self.save_btn.set_sensitive(True)
+            # Save waits for the decode: until then the panel shows the old result.
+            self.save_btn.set_sensitive(False)
+            output = msg["output"]
+
+            def decoded(loaded):
+                if loaded is not Loaded.SHOWN or self.result_output != output:
+                    return            # failed, or a newer result replaced it
+                self.save_btn.set_sensitive(True)
+
+            self.res_panel.view.load_file_async(output, done=decoded)
             self.status.set_text("Done in %.2fs." % msg["seconds"])
             self._set_busy(False)
         elif t == "gif_progress":
@@ -1904,15 +1916,21 @@ class Window(Adw.ApplicationWindow):
             self.seg_status.set_text("Finding objects…")
             self._footer_progress(msg["done"], msg["total"])
         elif t == "seg_objects":
-            self._seg_set_busy(False)
             self.seg_objects = msg["objects"]
+            status = "%d objects — hover to highlight, click to keep." % msg["count"]
+
+            def shown(loaded):
+                # Busy until the layers are on screen, so nothing is clicked
+                # before there is anything to click.
+                self._seg_set_busy(False)
+                if loaded is Loaded.SHOWN:
+                    self._update_seg_preview()
+                    self._seg_base_status = status
+                    self.seg_status.set_text(status)
+
             self.seg_panel.view.set_seg_layers(
                 msg["objects"], msg["label_map"],
-                msg.get("general_map"), msg.get("depth_map"))
-            self._update_seg_preview()
-            self._seg_base_status = (
-                "%d objects — hover to highlight, click to keep." % msg["count"])
-            self.seg_status.set_text(self._seg_base_status)
+                msg.get("general_map"), msg.get("depth_map"), done=shown)
         elif t == "seg_mask":
             self._seg_set_busy(False)
             self.seg_point_mask = msg["mask"]
@@ -1929,7 +1947,7 @@ class Window(Adw.ApplicationWindow):
                 if (msg.get("id") != getattr(self, "_seg_preview_rid", None)
                         or not self._seg_has_selection()):
                     return False
-                self.seg_res_panel.view.load_file(out, keep_transform=True)
+                self.seg_res_panel.view.load_file_async(out, transform=Transform.KEEP)
                 self.seg_result_output = out
                 self.seg_save_btn.set_sensitive(True)
             else:                                    # explicit Save → file dialog
