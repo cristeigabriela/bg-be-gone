@@ -460,15 +460,28 @@ def model_picker(title, sections, describe):
         entry.append(text)
         entry.append(check)
         item.set_child(entry)
-        item.connect("notify::selected",
-                     lambda it, _pspec: check.set_opacity(1 if it.get_selected() else 0))
+
+    # The check marks the row's choice. Not the list item's own selected
+    # state: the open list selects whatever the pointer is over.
+    checks = {}             # each bound entry's check -> the key it shows
+
+    def show_check(check):
+        chosen = row.get_selected_item()
+        mark = chosen is not None and checks.get(check) == chosen.get_string()
+        check.set_opacity(1 if mark else 0)
 
     def bind_entry(_factory, item):
-        _short, name, subtitle = describe(item.get_item().get_string())
+        key = item.get_item().get_string()
+        _short, name, subtitle = describe(key)
         text = item.get_child().get_first_child()
         text.get_first_child().set_label(name)
         text.get_last_child().set_label(subtitle)
-        text.get_next_sibling().set_opacity(1 if item.get_selected() else 0)
+        check = text.get_next_sibling()
+        checks[check] = key
+        show_check(check)
+
+    def unbind_entry(_factory, item):
+        checks.pop(item.get_child().get_last_child(), None)
 
     def setup_header(_factory, header):
         # Indented to line up with the entries' text: list headers get no row padding.
@@ -484,10 +497,12 @@ def model_picker(title, sections, describe):
         label.set_label(headers.get(header.get_item().get_string(), ""))
         header_labels.add(label)
 
-    def factory(setup, bind):
+    def factory(setup, bind, unbind=None):
         f = Gtk.SignalListItemFactory()
         f.connect("setup", setup)
         f.connect("bind", bind)
+        if unbind is not None:
+            f.connect("unbind", unbind)
         return f
 
     row = Adw.ComboRow(title=title, model=model)
@@ -495,8 +510,9 @@ def model_picker(title, sections, describe):
     def refresh():
         # New factories rebind every entry, and the row's own value.
         row.set_factory(factory(setup_value, bind_value))
-        row.set_list_factory(factory(setup_entry, bind_entry))
+        row.set_list_factory(factory(setup_entry, bind_entry, unbind_entry))
     refresh()
+    row.connect("notify::selected", lambda *_: [show_check(c) for c in list(checks)])
     # Section headers need libadwaita 1.6; older ones list the same models unheaded.
     if not headers or not hasattr(row, "set_header_factory"):
         return row, refresh
