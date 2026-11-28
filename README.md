@@ -79,11 +79,19 @@ cd bg-be-gone
 ./install.sh
 ```
 
-`install.sh` detects your GPU vendor, builds the worker environment, and
-registers the app. Launch `bg-be-gone`, open it from your app menu, or right-click
-an image and choose *Open With*. The first background removal downloads its model
-(~1 GB for BiRefNet) to `~/.u2net/`; the first segmentation downloads a SAM model
-(~110–770 MB depending on your GPU/VRAM) to `~/.cache/bg-be-gone/models/`.
+`install.sh` checks that GTK 4 and libadwaita load, detects your GPU vendor,
+builds the worker environment, and registers the app. Launch `bg-be-gone`, open
+it from your app menu, or right-click an image and choose *Open With*.
+
+The installer offers to download the default background-removal model now
+(BiRefNet General, ~970 MB, to `~/.u2net/`), so the first run works offline; it
+asks on a terminal, with yes as the default. Pass `--no-model-download` to skip
+it, and the first background removal downloads it instead. The first
+segmentation downloads a SAM model (~110–770 MB depending on your GPU/VRAM) to
+`~/.cache/bg-be-gone/models/`.
+
+The app runs from the cloned folder, so keep it where it is. After moving it,
+run `./install.sh` again.
 
 For a lean install with **only** segmentation (no rembg/BiRefNet):
 
