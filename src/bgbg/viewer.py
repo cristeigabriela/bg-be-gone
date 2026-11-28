@@ -124,6 +124,25 @@ def _ease_out_back(p):
     return 1.0 + (c + 1.0) * p ** 3 + c * p ** 2
 
 
+def transform_pixbuf(pb, transform):
+    """`pb` with an ImageView.transform() baked in: flip horizontal, flip
+    vertical, then rotate clockwise. Safe off the UI thread."""
+    rot, fh, fv = transform
+    if fh:
+        pb = pb.flip(True)
+    if fv:
+        pb = pb.flip(False)
+    angle = {
+        0: GdkPixbuf.PixbufRotation.NONE,
+        1: GdkPixbuf.PixbufRotation.CLOCKWISE,
+        2: GdkPixbuf.PixbufRotation.UPSIDEDOWN,
+        3: GdkPixbuf.PixbufRotation.COUNTERCLOCKWISE,
+    }[rot % 4]
+    if angle != GdkPixbuf.PixbufRotation.NONE:
+        pb = pb.rotate_simple(angle)
+    return pb
+
+
 class ImageView(Gtk.Widget):
     def __init__(self, on_change=None):
         super().__init__()
@@ -399,20 +418,11 @@ class ImageView(Gtk.Widget):
         """Return the pixbuf with rotate/flip baked in (no zoom/pan)."""
         if self.pixbuf is None:
             return None
-        pb = self.pixbuf
-        if self.fh:
-            pb = pb.flip(True)
-        if self.fv:
-            pb = pb.flip(False)
-        angle = {
-            0: GdkPixbuf.PixbufRotation.NONE,
-            1: GdkPixbuf.PixbufRotation.CLOCKWISE,
-            2: GdkPixbuf.PixbufRotation.UPSIDEDOWN,
-            3: GdkPixbuf.PixbufRotation.COUNTERCLOCKWISE,
-        }[self.rot % 4]
-        if angle != GdkPixbuf.PixbufRotation.NONE:
-            pb = pb.rotate_simple(angle)
-        return pb
+        return transform_pixbuf(self.pixbuf, self.transform())
+
+    def transform(self):
+        """The view's rotate/flip, as transform_pixbuf takes it."""
+        return (self.rot, self.fh, self.fv)
 
     def is_transformed(self):
         return self.rot != 0 or self.fh or self.fv

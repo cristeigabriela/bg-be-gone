@@ -10,6 +10,7 @@ import sys
 import enum
 import json
 import logging
+import secrets
 import shutil
 import tempfile
 import threading
@@ -31,6 +32,7 @@ from viewer import (  # noqa: E402
     ImageView,
     Loaded,
     Transform,
+    transform_pixbuf,
 )
 import formats  # noqa: E402
 from engines import selection  # noqa: E402  (standard library only)
@@ -50,28 +52,6 @@ def _alpha_of(bg):
     if bg == "transparent":
         return formats.Alpha.TRANSPARENT
     return formats.Alpha.FLATTENED
-
-
-def _run_off_main(work, done):
-    """Call work() on a thread, then done(error) on the GTK thread.
-
-    `error` is the GLib.Error work() raised, or None. Encoding a full-size
-    snapshot to PNG on the GTK thread froze the window while it ran.
-    """
-    def thread():
-        try:
-            work()
-            error = None
-        except GLib.Error as e:
-            error = e
-
-        def deliver():
-            done(error)
-            return False                    # once
-        # Above redraw priority, so a running animation can't starve it.
-        GLib.idle_add(deliver, priority=GLib.PRIORITY_DEFAULT)
-
-    threading.Thread(target=thread, daemon=True).start()
 
 
 class Job(enum.Enum):
@@ -135,7 +115,33 @@ class _PendingSave:
 
     target: formats.SaveTarget
     choices: tuple
-    staging: Optional[str]   # our temporary PNG to delete afterwards, if any
+    staging: str             # our temporary copy of the result, deleted afterwards
+    part: str                # the temp file beside the target the worker writes
+
+
+# PNG options for render(path, png_options) in Window._save_result: the saved
+# file gets GdkPixbuf's defaults; a hand-off to the worker, read once, is fast.
+_PNG_FINAL = ([], [])
+_PNG_HANDOFF = (["compression"], ["1"])
+
+
+def _part_beside(target):
+    """An empty temp file next to `target`, named in its format, to save into.
+
+    Beside it, so os.replace() swaps it in whole; in its format's suffix, so
+    the worker, which picks the format from the name, writes the right one.
+    Not mkstemp: its files are private (0600), and this one becomes the
+    saved image, which gets the usual permissions the umask allows.
+    """
+    folder, name = os.path.split(target.path)
+    while True:
+        part = os.path.join(folder, ".%s.%s.part%s" % (
+            name, secrets.token_hex(4), target.format.suffix))
+        try:
+            os.close(os.open(part, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
+            return part
+        except FileExistsError:
+            continue
 
 
 @dataclass
@@ -1452,10 +1458,17 @@ class Window(Adw.ApplicationWindow):
     def _seg_save_file(self, src, alpha):
         """Offer the export at `src`, whose background `alpha` describes."""
         def save(target, choices):
-            if target.format is formats.PNG:
-                self._save_copy(src, target, choices)
-            else:
-                self._save_via_worker(src, target, choices, staging=None)
+            # The result panel's rotate/flip goes into the file, as on Single.
+            view = self.seg_res_panel.view
+            transform, transformed = view.transform(), view.is_transformed()
+
+            def render(path, png_options):
+                if not transformed:
+                    shutil.copyfile(src, path)
+                else:
+                    pb = transform_pixbuf(GdkPixbuf.Pixbuf.new_from_file(src), transform)
+                    pb.savev(path, "png", *png_options)
+            self._save_result(target, choices, render, formats.PNG)
         self._ask_save_path("_object", formats.save_formats(alpha), save)
 
     def _on_seg_cancel(self):
@@ -1775,36 +1788,66 @@ class Window(Adw.ApplicationWindow):
         # its own format; a still result is the current pixbuf.
         result = self.result_output
         if result and formats.can_animate(result):
-            self._ask_save_path("_nobg", (formats.format_of(result),),
-                                lambda target, choices: self._save_copy(result, target, choices))
+            fmt = formats.format_of(result)
+            self._ask_save_path("_nobg", (fmt,), lambda target, choices: self._save_result(
+                target, choices, lambda path, _: shutil.copyfile(result, path), fmt))
             return
-        pb = self.res_panel.view.export_pixbuf()
-        if pb is None:
+        # The shown result and its rotate/flip, taken at the press: the encode
+        # runs later, off the UI thread, where a 4K PNG can't freeze the window.
+        view = self.res_panel.view
+        shown, transform = view.pixbuf, view.transform()
+        if shown is None:
             return
 
-        def save(target, choices):
-            if target.format is formats.PNG:
+        def render(path, png_options):
+            transform_pixbuf(shown, transform).savev(path, "png", *png_options)
+        self._ask_save_path("_nobg", formats.save_formats(self._result_alpha),
+                            lambda target, choices: self._save_result(
+                                target, choices, render, formats.PNG))
+
+    def _save_result(self, target, choices, render, rendered):
+        """Write a result to `target` off the UI thread, whole or not at all.
+
+        render(path, png_options) writes the result, in format `rendered`, to
+        `path`, on a background thread. A failed or interrupted save leaves the
+        old file whole:
+
+        - in the target's format: render writes a temp file beside the target,
+          which replaces it once complete.
+        - in another format: render stages a copy, and the worker re-encodes it
+          into a temp file beside the target (see _save_via_worker). Pillow
+          encodes WebP and JPEG on every platform; GdkPixbuf needs a loader for WebP.
+        """
+        direct = rendered is target.format
+
+        def work():
+            if direct:
+                part = _part_beside(target)
                 try:
-                    pb.savev(target.path, "png", [], [])
-                except GLib.Error as e:
-                    self._toast("Save failed: %s" % e.message)
-                    return
-                self._toast(_saved_notice(target, choices))
-                return
-            # Pillow encodes WebP and JPEG on every platform; GdkPixbuf needs a
-            # loader for WebP. Hand the worker a lossless copy to re-encode,
-            # written off the GTK thread: a full-size PNG froze the window.
-            fd, staging = tempfile.mkstemp(suffix=".png", dir=self.tmpdir)
+                    render(part, _PNG_FINAL)
+                    os.replace(part, target.path)
+                finally:
+                    _remove_quietly(part)
+                return None
+            fd, staging = tempfile.mkstemp(suffix=rendered.suffix, dir=self.tmpdir)
             os.close(fd)
+            try:
+                render(staging, _PNG_HANDOFF)
+            except BaseException:
+                _remove_quietly(staging)
+                raise
+            return staging
 
-            def staged(error):
-                if error is not None:
-                    _remove_quietly(staging)
-                    self._toast("Save failed: %s" % error.message)
-                    return
-                self._save_via_worker(staging, target, choices, staging=staging)
-            _run_off_main(lambda: pb.savev(staging, "png", ["compression"], ["1"]), staged)
-        self._ask_save_path("_nobg", formats.save_formats(self._result_alpha), save)
+        def written(result):
+            if isinstance(result, (OSError, GLib.Error)):
+                self._report_save_failure(target, result)
+            elif isinstance(result, Exception):
+                raise result                 # a bug, not a save failure
+            elif direct:
+                self._report_saved(target, choices)
+            else:
+                self._save_via_worker(result, target, choices, staging=result)
+        offmain.run(work, written)
 
     def _ask_save_path(self, stem_suffix, choices, save):
         """Ask where to save, offering `choices`, then call save(target, choices).
@@ -1860,34 +1903,49 @@ class Window(Adw.ApplicationWindow):
         dlg.connect("response", answered)
         dlg.present(self)
 
-    def _save_copy(self, src, target, choices):
-        try:
-            shutil.copyfile(src, target.path)
-        except OSError as e:
-            self._toast("Save failed: %s" % e)
-            return
+    def _report_saved(self, target, choices):
         self._toast(_saved_notice(target, choices))
 
+    def _report_save_failure(self, target, exc):
+        self._report_failure("saving " + target.path, exc, "Could not save %s: %s." % (
+            os.path.basename(target.path), plain_reason(exc)))
+
     def _save_via_worker(self, src, target, choices, staging):
-        """Have the worker re-encode `src` as `target`; `staging` is ours to delete."""
-        rid = self._send_job(Job.SAVE, {"op": "convert", "input": src, "output": target.path},
-                             save=_PendingSave(target, choices, staging))
+        """Have the worker re-encode `src` as `target`; `staging` is ours to delete.
+
+        The worker writes a temp file beside the target, which replaces the
+        target once the worker says it's done, so a failed encode leaves the
+        old file whole.
+        """
+        try:
+            part = _part_beside(target)
+        except OSError as e:
+            _remove_quietly(staging)
+            self._report_save_failure(target, e)
+            return
+        rid = self._send_job(Job.SAVE, {"op": "convert", "input": src, "output": part},
+                             save=_PendingSave(target, choices, staging, part))
         if rid == -1:
-            if staging is not None:
-                _remove_quietly(staging)
+            _remove_quietly(staging)
+            _remove_quietly(part)
             self._toast_error("Could not save %s: the background process isn't running."
                               % os.path.basename(target.path))
-            return
 
     def _on_save_reply(self, pending, msg):
-        if pending.staging is not None:
-            _remove_quietly(pending.staging)
+        _remove_quietly(pending.staging)
         if msg["type"] == "error":
+            _remove_quietly(pending.part)
             _log.warning("saving %s failed: %s", pending.target.path, msg["message"])
             self._toast_error("Could not save %s: %s" % (
                 os.path.basename(pending.target.path), msg["message"]))
             return
-        self._toast(_saved_notice(pending.target, pending.choices))
+        try:
+            os.replace(pending.part, pending.target.path)
+        except OSError as e:
+            _remove_quietly(pending.part)
+            self._report_save_failure(pending.target, e)
+            return
+        self._report_saved(pending.target, pending.choices)
 
     def _on_pick_input(self, *_):
         dlg = Gtk.FileDialog(title="Input folder")
