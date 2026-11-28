@@ -100,6 +100,39 @@ GTK frontend runs on MSYS2's UCRT64 GTK4/libadwaita; the ML worker runs on
 its own standalone CPython 3.12. GPU acceleration uses **DirectML** (any
 DirectX 12 GPU: NVIDIA, AMD or Intel), with a CPU fallback.
 
+### Prebuilt
+
+Each [release](../../releases) attaches two files per variant:
+`bg-be-gone-<ver>-<variant>-win64-setup.exe` (installer) and
+`bg-be-gone-<ver>-<variant>-win64.zip` (portable). `SHA256SUMS` lists their
+checksums.
+
+| Variant | Use |
+| --- | --- |
+| `directml` | Any DirectX 12 GPU. The usual choice. |
+| `cpu` | Any machine. |
+| `cuda` | NVIDIA cards before the RTX 50 series; on RTX 50 use `directml`. |
+| `seg` | Lean, segmentation only (no background removal). |
+
+The files are not code-signed yet, so SmartScreen warns when you run them
+("Windows protected your PC"): choose *More info*, then *Run anyway*.
+
+- **The installer** adds a Start Menu entry and an *Open with* entry for
+  the image types bg-be-gone reads. It offers to download the default model
+  (BiRefNet General, about 1 GB) during setup; untick it to have the app
+  download it on first use.
+- **ROCm:** the `directml` installer also offers it when it finds an RX
+  6700/6750 XT. It downloads AMD's PyTorch build (about 4 GB) on top. A
+  failed ROCm setup leaves the DirectML build working.
+- **Upgrades** install beside the old version and switch over only once
+  the new one starts; if it doesn't, the old one stays.
+- **Uninstall** removes only the files Setup installed. Models and settings
+  in `%LOCALAPPDATA%\bg-be-gone` stay.
+- **The zip** runs from any folder: start `BgBeGone.cmd`, which keeps a
+  console open with the app's output, or point a shortcut at
+  `bin\pythonw.exe -m bg_be_gone_launch`. Its `tools\Enable-AmdRocm.ps1`
+  adds ROCm.
+
 ### From source
 
 Requirements: [uv](https://docs.astral.sh/uv/) and git. No admin rights.

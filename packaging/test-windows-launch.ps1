@@ -5,8 +5,9 @@
 
 .DESCRIPTION
   -Shortcut opens a .lnk through the shell, as the Start Menu does. -Bundle
-  runs a release bundle's launch command (pythonw.exe on winlaunch.py), as
-  Setup's shortcuts and "Open with" do. Either way BGBG_SELFTEST makes the
+  runs a release bundle's launch command (pythonw.exe -m bg_be_gone_launch),
+  as Setup's shortcuts do. -OpenWith opens -Open through a ProgID's open
+  command, as Explorer's Open with menu does. Each way, BGBG_SELFTEST makes the
   app write the worker's ready message to a file and quit, and BGBG_APP_ID
   gives it its own single-instance id, so a bg-be-gone already running on
   this desktop never receives the test's window.
@@ -16,6 +17,9 @@
 
 .PARAMETER Bundle
   An unpacked release bundle's folder (the one holding bin\ and app\).
+
+.PARAMETER OpenWith
+  A ProgID Setup registered (bg-be-gone.Image), to open -Open with.
 
 .PARAMETER Open
   A file to pass as the image to open, as "Open with" does.
@@ -27,13 +31,17 @@
 param(
     [string]$Shortcut,
     [string]$Bundle,
+    [string]$OpenWith,
     [string]$Open,
     [Parameter(Mandatory = $true)][ValidateSet('bgremove', 'seg')][string]$Expect,
     [int]$TimeoutSeconds = 420
 )
 
 $ErrorActionPreference = 'Stop'
-if ([bool]$Shortcut -eq [bool]$Bundle) { throw "Pass one of -Shortcut or -Bundle" }
+if (@($Shortcut, $Bundle, $OpenWith | Where-Object { $_ }).Count -ne 1) {
+    throw 'Pass one of -Shortcut, -Bundle or -OpenWith'
+}
+if ($OpenWith -and -not $Open) { throw '-OpenWith needs -Open' }
 Import-Module (Join-Path $PSScriptRoot 'BgBeGone.Windows.psm1') -Force
 
 $result = Join-Path ([IO.Path]::GetTempPath()) "bgbg-selftest-$PID.json"
@@ -50,13 +58,17 @@ if ($Shortcut) {
     Write-Host "==> shell open $Shortcut"
     $start = @{ FilePath = $Shortcut }
     if ($Open) { $start.ArgumentList = ConvertTo-CommandLine @($Open) }
+    Start-Process @start
+} elseif ($OpenWith) {
+    Write-Host "==> open $Open with $OpenWith"
+    Add-Type -Path (Join-Path $PSScriptRoot 'OpenWith.cs')
+    [BgBeGone.OpenWith]::Open($Open, $OpenWith)
 } else {
     $launch = Get-LaunchCommand -GtkRoot $Bundle -Mode Module
     $arguments = $launch.Arguments + @($Open | Where-Object { $_ })
     Write-Host "==> $($launch.Program) $(ConvertTo-CommandLine $arguments)"
-    $start = @{ FilePath = $launch.Program; ArgumentList = ConvertTo-CommandLine $arguments }
+    Start-Process -FilePath $launch.Program -ArgumentList (ConvertTo-CommandLine $arguments)
 }
-Start-Process @start
 
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 while (-not (Test-Path -LiteralPath $result)) {
