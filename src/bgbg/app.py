@@ -669,6 +669,12 @@ class Window(Adw.ApplicationWindow):
         self.seg_objects = []
         self.seg_points = []           # accumulated [x, y, label] in point mode
         self.seg_point_mask = None     # last point-mode mask path
+        self._seg_point_contour = None  # its outline, to show it again
+        self._seg_maps = None          # (label, general, depth) map paths of seg_objects
+        self._seg_shown_mode = "everything"
+        self._seg_stash = {}           # mode -> what it found, while the other mode shows
+        self._seg_input = None         # the file Segment's masks were made from
+        self._seg_layers_loading = None  # token of the objects being decoded, if any
         self.seg_result_output = None
         self._seg_rows = {}            # object id -> layer-list row widgets
         self._settings_path = None     # the worker's settings.json, from its "ready"
@@ -1159,14 +1165,16 @@ class Window(Adw.ApplicationWindow):
 
     def _unload(self, scope):
         """Ask the worker to release a model. For segmentation, also drop the
-        cached encode + overlays and invalidate any in-flight load so a later
-        pass re-encodes cleanly."""
+        cached encode and invalidate any in-flight load so a later pass
+        re-encodes cleanly.
+
+        Segment's found objects and selection stay: they are files on disk and
+        cost no VRAM, and Save works from them without the model.
+        """
         if scope == "seg":
             self.seg_loaded_for = None
             self.seg_pending = None
             self._abandon_jobs({Job.SEG_LOAD})  # its reply would re-mark it loaded
-            if getattr(self, "seg_panel", None) is not None:
-                self._seg_clear_overlays()
         if self.worker.ok:
             self.worker.send({"op": "unload", "scope": scope})
 
@@ -1306,6 +1314,11 @@ class Window(Adw.ApplicationWindow):
         self.seg_status.set_text("Preparing segmentation model…")
 
         def send(inp):
+            # Segment's extracts read this input again later, so it stays until
+            # the next one replaces it.
+            if self._seg_input != inp:
+                self._remove_temp_input(self._seg_input)
+            self._seg_input = inp
             # Tracked as a job, so a reply that lands after we've left or
             # unloaded is dropped instead of re-marking the model as resident.
             # The masks go in our temp folder: the input can be the user's photo.
@@ -1387,7 +1400,8 @@ class Window(Adw.ApplicationWindow):
         self._ensure_seg_loaded(self._do_seg_everything)
 
     def _do_seg_everything(self):
-        self._seg_clear_overlays()
+        # The objects already found stay up until the new ones replace them,
+        # so a cancelled re-run costs nothing.
         self._seg_set_busy(True, cancel=True)
         self.seg_panel.view.set_scanning(True)
         self.seg_status.set_text("Finding objects…")
@@ -1416,16 +1430,60 @@ class Window(Adw.ApplicationWindow):
         self.seg_panel.view.set_seg_selection([o["id"] for o in self.seg_objects])
         self._update_seg_selection_ui()
 
-    def _seg_clear_overlays(self):
+    def _seg_forget_overlays(self):
+        """Take the current mode's objects or click selection off the page."""
+        if self._seg_layers_loading is not None:   # objects still decoding: dropped
+            self._seg_layers_loading = None
+            self._seg_set_busy(False)
         self.seg_panel.view.clear_seg(keep_mode=True)
         self.seg_objects = []
+        self._seg_maps = None
         self.seg_points = []
         self.seg_point_mask = None
+        self._seg_point_contour = None
         self.seg_result_output = None
         self.seg_res_panel.view.clear()
         self.seg_save_btn.set_sensitive(False)
+
+    def _seg_clear_overlays(self):
+        """The Clear button: the one deliberate way to drop what Segment found."""
+        self._seg_forget_overlays()
         if not self.seg_busy:
             self.seg_status.set_text("Cleared.")
+
+    def _seg_snapshot(self, mode):
+        """What `mode` has on the page, to put back when the user returns to it."""
+        if mode == "point":
+            if self.seg_point_mask is None:
+                return None
+            return {"points": list(self.seg_points), "mask": self.seg_point_mask,
+                    "contour": self._seg_point_contour}
+        if not self.seg_objects:
+            return None
+        return {"objects": self.seg_objects, "maps": self._seg_maps,
+                "selection": self.seg_panel.view.get_seg_selection()}
+
+    def _seg_restore(self, mode, state):
+        """Put back a _seg_snapshot of `mode`, if there is one."""
+        if state is None:
+            return
+        view = self.seg_panel.view
+        if mode == "point":
+            self.seg_points = state["points"]
+            self.seg_point_mask = state["mask"]
+            self._seg_point_contour = state["contour"]
+            view.set_point_mask(state["mask"], state["contour"])
+            self._update_seg_preview()
+            self.seg_status.set_text("Your click selection is back — Save, or click to refine.")
+            return
+        self.seg_objects = state["objects"]
+        self._seg_maps = state["maps"]
+
+        def shown(loaded):
+            if loaded is Loaded.SHOWN:     # else the user moved on before it showed
+                view.set_seg_selection(state["selection"])
+                self._update_seg_selection_ui()
+        view.set_seg_layers(state["objects"], *state["maps"], done=shown)
 
     def _update_seg_selection_ui(self):
         self._update_seg_preview()
@@ -1475,11 +1533,15 @@ class Window(Adw.ApplicationWindow):
 
     def _seg_extract_req(self, outp):
         bg, blur = self._extract_bg()
-        req = {"op": "seg_extract", "bg": bg, "blur": blur, "output": outp}
+        # Mask files and the image by path, not object ids: the worker may have
+        # dropped its objects (a reload, a restart) while the page kept them.
+        req = {"op": "seg_extract", "bg": bg, "blur": blur, "output": outp,
+               "input": self._seg_input}
         if self._seg_mode() == "point":
             req["mask"] = self.seg_point_mask
         else:
-            req["ids"] = list(self.seg_panel.view.get_seg_selection())
+            sel = set(self.seg_panel.view.get_seg_selection())
+            req["masks"] = [o["mask"] for o in self.seg_objects if o["id"] in sel]
         return req
 
     def _update_seg_preview(self):
@@ -1553,8 +1615,18 @@ class Window(Adw.ApplicationWindow):
 
     def _on_seg_mode_changed(self, *_):
         mode = self._seg_mode()
+        old = self._seg_shown_mode
+        self._seg_shown_mode = mode
+        # A run started in the other mode would land in this one: stop it. A
+        # load keeps going, for the next run, but runs nothing.
+        if self._has_job(Job.SEG_RUN, Job.SEG_PREVIEW):
+            self._abandon_jobs({Job.SEG_RUN, Job.SEG_PREVIEW})
+            self._seg_set_busy(False)
+        self.seg_pending = None
+        # Each mode keeps what it found, for when the user switches back.
+        self._seg_stash[old] = self._seg_snapshot(old)
+        self._seg_forget_overlays()
         self.seg_panel.view.set_seg_mode(mode)
-        self._seg_clear_overlays()
         self.seg_everything_btn.set_visible(mode == "everything")
         self.seg_selall_btn.set_visible(mode == "everything")
         if mode == "point":
@@ -1563,6 +1635,8 @@ class Window(Adw.ApplicationWindow):
         else:
             self.seg_status.set_text(
                 "Click Segment everything, then pick the objects to keep.")
+        # After the hint, so a restored selection's own status wins.
+        self._seg_restore(mode, self._seg_stash.pop(mode, None))
         self._update_footer()
 
     def _on_seg_model_changed(self, *_):
@@ -1844,7 +1918,10 @@ class Window(Adw.ApplicationWindow):
         if getattr(self, "seg_panel", None) is not None:
             self.seg_panel.view.load_file(preview)
             self.seg_res_panel.view.clear()
-            self._seg_clear_overlays()
+            self._seg_forget_overlays()
+            self._seg_stash = {}            # the other mode's finds were for the old image
+            self._remove_temp_input(self._seg_input)
+            self._seg_input = None
             self.seg_loaded_for = None
             self.seg_result_output = None
             self.seg_save_btn.set_sensitive(False)
@@ -2320,9 +2397,17 @@ class Window(Adw.ApplicationWindow):
             self._footer_progress(msg["done"], msg["total"])
         elif t == "seg_objects":
             self.seg_objects = msg["objects"]
+            self._seg_maps = (msg["label_map"], msg.get("general_map"), msg.get("depth_map"))
             status = "%d objects — hover to highlight, click to keep." % msg["count"]
 
+            # A new image, Clear or a mode switch drops this load and ends the
+            # wait itself (_seg_forget_overlays); the token says if it still counts.
+            token = self._seg_layers_loading = object()
+
             def shown(loaded):
+                if self._seg_layers_loading is not token:
+                    return
+                self._seg_layers_loading = None
                 # Busy until the layers are on screen, so nothing is clicked
                 # before there is anything to click.
                 self._seg_set_busy(False)
@@ -2337,6 +2422,7 @@ class Window(Adw.ApplicationWindow):
         elif t == "seg_mask":
             self._seg_set_busy(False)
             self.seg_point_mask = msg["mask"]
+            self._seg_point_contour = msg.get("contour")
             self.seg_panel.view.set_point_mask(msg["mask"], msg.get("contour"))
             self._update_seg_preview()
             self.seg_status.set_text(
@@ -2356,8 +2442,9 @@ class Window(Adw.ApplicationWindow):
                 self.seg_status.set_text("Ready — choose where to save.")
                 self._seg_save_file(out, req.alpha)
         elif t == "seg_canceled":
+            # The model stays loaded, so the next run starts at once; leaving
+            # the page is what frees it.
             self._seg_set_busy(False)
-            self._unload("seg")            # free the SAM model + cached encode
             self.seg_status.set_text("Cancelled.")
         elif t == "error":
             self._on_job_error(job, msg["message"])

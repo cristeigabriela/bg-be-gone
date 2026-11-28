@@ -25,7 +25,8 @@ Requests (one JSON object per line on stdin):
    "maskdir":D,"id":N}
   {"op":"seg_everything","points_per_side":int?,"id":N}
   {"op":"seg_point","points":[[x,y,label],...],"use_prev":bool,"id":N}
-  {"op":"seg_extract","ids":[...]|"mask":P,"bg":BG,"blur":int,"output":P,"id":N}
+  {"op":"seg_extract","masks":[P,...]|"mask":P|"ids":[...],"input":P,"bg":BG,
+   "blur":int,"output":P,"id":N}             # needs no model loaded
   {"op":"seg_cancel","id":N}                 # the same as cancel
   {"op":"engine_status","id":N}              # waits for PyTorch's start-up, if any
   {"op":"shutdown"}
@@ -697,7 +698,9 @@ def handle_gif(req):
 # Segmentation
 # ---------------------------------------------------------------------------
 _cancel = threading.Event()
-_seg = None  # {session, image, rung, size, maskdir, objects, prev_low}
+# {session, image, input, rung, size, maskdir, objects, prev_low}; an unload
+# sets only session (and prev_low) to None.
+_seg = None
 
 
 class _Canceled(Exception):
@@ -744,8 +747,8 @@ def handle_seg_load(req):
         return
     session, rung = pick.session, pick.rung
     prov = session.provider()
-    _seg = {"session": session, "image": pil, "rung": rung, "size": pil.size,
-            "maskdir": maskdir, "objects": [], "prev_low": None}
+    _seg = {"session": session, "image": pil, "input": path, "rung": rung,
+            "size": pil.size, "maskdir": maskdir, "objects": [], "prev_low": None}
     out({"type": "seg_ready", "rung": rung, "model": seg.MODELS[rung]["label"],
          "provider": prov, "label": ort_engine.PROVIDER_LABELS.get(prov, prov),
          "gpu": prov in ort_engine.GPU_PROVIDERS, "mode": pick.mode,
@@ -753,7 +756,7 @@ def handle_seg_load(req):
 
 
 def _require_seg(rid):
-    if _seg is None:
+    if _seg is None or _seg["session"] is None:
         out({"type": "error", "message": "Load an image to segment first.",
              "id": rid})
         return False
@@ -806,24 +809,36 @@ def handle_seg_point(req):
 
 
 def handle_seg_extract(req):
+    """Composite the given masks of an image. Needs no model: after an unload,
+    or in a restarted worker, the window still has its masks and the image."""
     rid = req.get("id")
-    if not _require_seg(rid):
-        return
     dst = req["output"]
     bg = req.get("bg", "transparent")
     blur = int(req.get("blur", 20))
     if req.get("mask"):
         paths = [req["mask"]]
-    else:
+    elif "masks" in req:
+        paths = list(req["masks"])
+    elif _require_seg(rid):             # an older frontend names object ids
         ids = set(req.get("ids") or [])
         paths = [o["mask"] for o in _seg["objects"] if o["id"] in ids]
+    else:
+        return
     if not paths:
         out({"type": "error", "message": "Nothing selected to extract.",
              "id": rid})
         return
+    src = req.get("input")
+    if _seg is not None and (src is None or src == _seg["input"]):
+        image = _seg["image"]
+    elif src:
+        image = open_image(src).convert("RGB")
+    else:
+        _require_seg(rid)
+        return
     t = time.time()
     alpha = seg.load_union(paths)
-    seg.composite_extract(_seg["image"], alpha, bg, dst, blur=blur)
+    seg.composite_extract(image, alpha, bg, dst, blur=blur)
     out({"type": "seg_extracted", "output": dst,
          "seconds": round(time.time() - t, 2), "id": rid})
 
@@ -839,8 +854,11 @@ def handle_unload(req):
     if scope in ("bg", "all") and (_sessions or _cpu_sessions):
         _drop_bg_sessions()
         freed.append("bg")
-    if scope in ("seg", "all") and _seg is not None:
-        _seg = None
+    if scope in ("seg", "all") and _seg is not None and _seg["session"] is not None:
+        # Only the model: the image and masks stay, so Save still works from
+        # the objects the window kept.
+        _seg["session"] = None
+        _seg["prev_low"] = None
         freed.append("seg")
     if freed:
         gc.collect()
