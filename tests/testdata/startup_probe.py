@@ -12,6 +12,7 @@ Prints one JSON object:
 - ``unusable``: the providers the platform had ruled out when onnxruntime loaded.
 - ``exec_ld_library_path``: LD_LIBRARY_PATH as this process image started with
   it, which shows the loader re-exec happened (Linux only; null elsewhere).
+- ``u2net_home``: U2NET_HOME when onnxruntime loaded, which rembg reads next.
 - ``models_dir`` and ``config_path``: where segmentation keeps its models and
   config.
 """
@@ -41,6 +42,7 @@ class _WatchOnnxruntime(importlib.abc.MetaPathFinder):
         if name == "onnxruntime" and not seen:
             seen["unusable"] = sorted(sys.modules["plat"].unusable_providers())
             seen["exec_ld_library_path"] = (_exec_environ() or {}).get("LD_LIBRARY_PATH")
+            seen["u2net_home"] = os.environ.get("U2NET_HOME")
         return None    # the normal finders do the import
 
 

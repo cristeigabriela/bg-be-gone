@@ -1,0 +1,3 @@
+# What building the release bundle needs on top of msys2-ucrt64.txt, in the
+# same format. ntldd lists a DLL's dependencies for build-windows-gtk.sh.
+0e54f74f0d679092467592ce56d25b9675cd383a9aa9c2bff7edaefa695ac316  mingw-w64-ucrt-x86_64-ntldd-r19.7fb9365-4-any.pkg.tar.zst

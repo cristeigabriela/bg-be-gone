@@ -93,6 +93,57 @@ For a lean install with **only** segmentation (no rembg/BiRefNet):
 
 Uninstall with `./uninstall.sh` (add `--purge` to also remove the environment).
 
+## Windows
+
+bg-be-gone runs on Windows 11. Windows 10 should work but is untested. The
+GTK frontend runs on MSYS2's UCRT64 GTK4/libadwaita; the ML worker runs on
+its own standalone CPython 3.12, on the CPU.
+
+### From source
+
+Requirements: [uv](https://docs.astral.sh/uv/) and git. No admin rights.
+
+```powershell
+git clone https://github.com/cristeigabriela/bg-be-gone
+cd bg-be-gone
+.\install.ps1
+```
+
+If PowerShell refuses with "running scripts is disabled on this system", run
+`powershell -ExecutionPolicy Bypass -File .\install.ps1` instead.
+
+`install.ps1` sets up bg-be-gone's own copy of MSYS2 (about 1 GB, under
+`%LOCALAPPDATA%\bg-be-gone`), with GTK pinned to the version bg-be-gone was
+tested on. It builds the worker, adds a Start Menu shortcut, and downloads the
+default model (BiRefNet General, about 1 GB). Re-running it updates in place;
+a failed worker build keeps the previous one. It never overwrites a file it
+didn't create: if one is in the way, it stops before changing anything.
+Options:
+
+- `-Variant cpu|seg`: `seg` is the lean, segmentation-only build.
+- `-Msys2Root C:\msys64`: use an MSYS2 you already have. bg-be-gone never
+  changes it; the install checks it has the GTK packages and version needed,
+  and prints the `pacman` command to run if not.
+- `-Prefix <folder>`, `-ShortcutName <name>` and `-AppId <id>`: a second
+  install beside the usual one, with its own Start Menu entry and its own
+  window (by default a second launch opens in the running app).
+- `-SkipModelDownload`: let the app download the model on first use.
+
+Install paths may hold spaces, accents and even `%` signs. One Windows limit
+remains: the shell expands `%VAR%` in a file handed to a shortcut, so a photo
+under a folder named like `%TEMP%` has to be opened from the app instead of
+dropped on its Start Menu entry. With `-Msys2Root`, the install folder itself
+must not hold a `%`: the shortcut then names it on its command line.
+
+`.\uninstall.ps1` removes what `install.ps1` created, as recorded in
+`<Prefix>\bg-be-gone-install.json`: in each folder it built, exactly the files
+that folder's inventory lists. Files anyone else put there stay, and nothing
+is removed through a junction or symbolic link. Add `-Purge` to also remove
+the downloaded models (BiRefNet about 1 GB; SAM 110-770 MB), settings, and the
+log. Every install of a user shares those, in `%LOCALAPPDATA%\bg-be-gone`, so
+`-Purge` keeps them while another install still uses them, and says which.
+An MSYS2 passed with `-Msys2Root` is never touched.
+
 ## AppImage
 
 Each [release](../../releases) attaches several AppImages — pick one for your

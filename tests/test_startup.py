@@ -27,7 +27,7 @@ ROCM_DROPPED = ["MIGraphXExecutionProvider", "ROCMExecutionProvider"]
 def probe(extra_env, gpu_env, *args, python=sys.executable):
     """Run the start-up probe; return what it saw when onnxruntime loaded."""
     env = {k: v for k, v in os.environ.items()
-           if k not in {"BGBG_NO_ROCM", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"}}
+           if k not in {"BGBG_NO_ROCM", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "U2NET_HOME"}}
     env.update(extra_env, BGBG_GPU_ENV=str(GPU_ENV / gpu_env))
     done = subprocess.run([str(python), str(PROBE), str(SRC), *args],
                           capture_output=True, text=True, env=env, timeout=TIMEOUT_S)
@@ -35,6 +35,8 @@ def probe(extra_env, gpu_env, *args, python=sys.executable):
     return json.loads(done.stdout.strip().splitlines()[-1])
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="gpu.env and the ROCm device-code check are Linux's start-up")
 @pytest.mark.parametrize(
     "extra_env, gpu_env, gfx, provider, expected",
     [
@@ -62,6 +64,8 @@ def test_rocm_is_ruled_out_before_onnxruntime_is_imported(
         "the ROCm decision must already be made when onnxruntime loads"
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="gpu.env and the ROCm device-code check are Linux's start-up")
 def test_gpu_env_can_move_the_cache_and_config_folders():
     """gpu.env is read before the folders are, as it was before the seam."""
     seen = probe({}, "moved-folders.env")
@@ -93,3 +97,18 @@ def test_bundled_cuda_libraries_are_on_the_loader_path_before_onnxruntime_loads(
     on_path = (seen["exec_ld_library_path"] or "").split(os.pathsep)
     assert str(cuda_libs) in on_path, \
         "the process that imports onnxruntime must have started with the CUDA libraries on its path"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="%LOCALAPPDATA% and U2NET_HOME are Windows'")
+def test_on_windows_the_folders_and_kill_switch_are_settled_before_onnxruntime_loads(tmp_path):
+    """rembg reads U2NET_HOME as it is imported, right after onnxruntime, so the
+    worker must have chosen it by then; its default would be %USERPROFILE%."""
+    local = tmp_path / "Local"
+    seen = probe({"LOCALAPPDATA": str(local), "BGBG_NO_ROCM": "1"}, "empty.env")
+    data = local / "bg-be-gone"
+    assert seen["u2net_home"] == str(data / "u2net"), \
+        "rembg's models must go to the app's own folder"
+    assert seen["unusable"] == ROCM_DROPPED, "BGBG_NO_ROCM means the same on Windows"
+    assert seen["models_dir"] == str(data / "models"), "SAM models live under %LOCALAPPDATA%"
+    assert seen["config_path"] == str(data / "config" / "seg.json"), \
+        "the config lives under %LOCALAPPDATA%"

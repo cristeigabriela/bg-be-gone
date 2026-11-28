@@ -25,13 +25,13 @@ from gi.repository import Gtk, Gdk, GdkPixbuf, Gio, GLib, Adw  # noqa: E402
 
 from viewer import ImageView  # noqa: E402
 import formats  # noqa: E402
+import plat  # noqa: E402
 
 APP_ID = "io.github.cristeigabriela.BgBeGone"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-VENV_PY = (os.environ.get("BGBG_VENV_PYTHON")
-           or os.path.expanduser("~/.local/share/bg-be-gone/venv/bin/python"))
+VENV_PY = os.environ.get("BGBG_VENV_PYTHON") or plat.default_worker_python()
 WORKER = os.environ.get("BGBG_WORKER", os.path.join(APP_DIR, "worker.py"))
-LOG = os.path.join(GLib.get_user_cache_dir(), "bg-be-gone-worker.log")
+LOG = plat.worker_log_path()
 APP_VERSION = os.environ.get("BGBG_VERSION", "1.1.0")
 _log = logging.getLogger("bgbg")
 
@@ -102,6 +102,25 @@ def _saved_notice(target, choices):
         reason = "this result can't be saved as %s" % target.typed.name
     return "Saved %s as %s: %s." % (name, target.format.name, reason)
 
+
+# Start-up check for CI: with BGBG_SELFTEST set to a file path, the app writes
+# the worker's "ready" message (or why it never came) there as JSON, then quits.
+SELFTEST = os.environ.get("BGBG_SELFTEST")
+# The app is single-instance per application id, so a test launch with the
+# real id would open its window inside a bg-be-gone the user already runs.
+# BGBG_APP_ID gives a test its own instance; the icon keeps APP_ID.
+INSTANCE_ID = os.environ.get("BGBG_APP_ID", APP_ID)
+_SELFTEST_TIMEOUT_S = 300   # generous: ready took 9 s locally; CI runners are slower
+
+
+def _finish_selftest(win, result):
+    result = dict(result, opened=win.get_application().opened)
+    # Written aside and renamed, so a watcher never reads half a file.
+    with open(SELFTEST + ".part", "w", encoding="utf-8") as f:
+        json.dump(result, f)
+    os.replace(SELFTEST + ".part", SELFTEST)
+    win.close()        # close-request shuts the worker down, then the app exits
+    return False       # one-shot when used as a GLib timeout
 
 SUBJECTS = [
     ("General (objects, scenes)", "birefnet-general"),
@@ -278,7 +297,8 @@ class Worker:
             self._logf = open(LOG, "a")
             self.proc = subprocess.Popen(
                 [VENV_PY, WORKER], stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=self._logf, text=True, bufsize=1)
+                stdout=subprocess.PIPE, stderr=self._logf, text=True, bufsize=1,
+                creationflags=plat.subprocess_flags(), env=plat.worker_env())
             threading.Thread(target=self._reader, daemon=True).start()
             self.ok = True
         except Exception as e:
@@ -293,7 +313,10 @@ class Worker:
                 msg = json.loads(line)
             except Exception:
                 continue
-            GLib.idle_add(self._on_message, msg)
+            # Above redraw priority: at the default idle priority, a reply could
+            # wait for as long as the Segment outlines kept animating, which on
+            # Windows starved it until the next input event.
+            GLib.idle_add(self._on_message, msg, priority=GLib.PRIORITY_DEFAULT)
 
     def send(self, req):
         if not self.ok:
@@ -427,7 +450,9 @@ class Panel:
             self.placeholder.set_visible(not has)
             self.zoom_badge.set_visible(has)
             return False
-        GLib.idle_add(apply)
+        # Still deferred past the current snapshot, but not starved by an
+        # animation like the worker replies above.
+        GLib.idle_add(apply, priority=GLib.PRIORITY_DEFAULT)
         if self._ext_change:
             self._ext_change()
 
@@ -436,7 +461,8 @@ class Panel:
         # never relayout mid-snapshot.
         if percent != self._last_pct:
             self._last_pct = percent
-            GLib.idle_add(self.zoom_badge.set_text, "%d%%" % percent)
+            GLib.idle_add(self.zoom_badge.set_text, "%d%%" % percent,
+                          priority=GLib.PRIORITY_DEFAULT)
 
 
 class Window(Adw.ApplicationWindow):
@@ -1681,6 +1707,8 @@ class Window(Adw.ApplicationWindow):
                 if self._seg_available:
                     self.stack.set_visible_child_name("segment")
             self._sync_sidebar_page()
+            if SELFTEST:
+                _finish_selftest(self, {"ok": True, "ready": msg})
         elif t == "loading":
             self.status.set_text(
                 "Loading %s… (the first run is slower)" % msg["model"])
@@ -1886,9 +1914,13 @@ class Window(Adw.ApplicationWindow):
 
 class App(Adw.Application):
     def __init__(self):
-        super().__init__(application_id=APP_ID,
-                         flags=Gio.ApplicationFlags.HANDLES_OPEN)
+        flags = Gio.ApplicationFlags.HANDLES_OPEN
+        if SELFTEST:
+            # A self-test never registers with, or hands off to, another instance.
+            flags |= Gio.ApplicationFlags.NON_UNIQUE
+        super().__init__(application_id=INSTANCE_ID, flags=flags)
         self._pending_open = None
+        self.opened = None             # the last file handed in to open; the self-test reports it
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -1897,6 +1929,7 @@ class App(Adw.Application):
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        plat.frontend_started(APP_ID)
         about = Gio.SimpleAction.new("about", None)
         about.connect("activate", self._on_about)
         self.add_action(about)
@@ -1916,13 +1949,19 @@ class App(Adw.Application):
             win._load_source(self._pending_open)
             self._pending_open = None
         win.present()
+        if SELFTEST:
+            if not win.worker.ok:
+                _finish_selftest(win, {"ok": False, "error": win.worker.error})
+            else:
+                GLib.timeout_add_seconds(_SELFTEST_TIMEOUT_S, _finish_selftest, win,
+                                         {"ok": False, "error": "no ready from the worker"})
         # Env-gated demo helper: auto-run Generate once, for screenshots/tests.
         if os.environ.get("BGBG_AUTOGEN") and win.src_panel.view.has_image():
             GLib.timeout_add(1400, lambda: (win._on_generate(), False)[1])
 
     def do_open(self, files, n, hint):
         if files:
-            self._pending_open = files[0].get_path()
+            self._pending_open = self.opened = files[0].get_path()
         self.do_activate()
 
     def _on_about(self, *_):
@@ -1940,6 +1979,9 @@ class App(Adw.Application):
 
 
 def main():
+    # On Windows the log sits in the app's own data folder, which the first
+    # start has to make; GLib's cache folder on Linux already exists.
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
     # Shares the worker's log file, so one file tells the whole story.
     logging.basicConfig(filename=LOG, level=logging.INFO,
                         format="%(asctime)s frontend %(levelname)s: %(message)s")
