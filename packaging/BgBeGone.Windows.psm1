@@ -902,6 +902,10 @@ function New-AppShortcut {
     .DESCRIPTION
       No working folder: the shell expands %VAR% in it too, and the app needs
       none. The icon is shown as stored, without expansion (ShellLink.cs).
+
+      The shortcut's folder is made if missing: a fresh profile has no Start
+      Menu\Programs yet. A failure throws, so an install that can't write its
+      shortcut stops instead of reporting success.
     #>
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -909,8 +913,13 @@ function New-AppShortcut {
         [Parameter(Mandatory)][string]$Icon
     )
     Import-ShellLink
-    [BgBeGone.ShellLink]::Save($Path, $Command.Program, (ConvertTo-CommandLine $Command.Arguments),
-        '', $Icon, 'Local image background remover and object segmenter')
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) -ErrorAction Stop | Out-Null
+    try {
+        [BgBeGone.ShellLink]::Save($Path, $Command.Program, (ConvertTo-CommandLine $Command.Arguments),
+            '', $Icon, 'Local image background remover and object segmenter')
+    } catch {
+        throw "Could not write the shortcut $($Path): $($_.Exception.Message)"
+    }
 }
 
 function Read-AppShortcut {
