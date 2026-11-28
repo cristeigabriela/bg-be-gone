@@ -1315,6 +1315,10 @@ class Window(Adw.ApplicationWindow):
         for rid in rids:
             self.worker.cancel(rid)
             self._abandoned[rid] = self._jobs.pop(rid)
+        if rids and not self._jobs:
+            # The last job went without a reply of its own to end it: an
+            # Engine change that waited for it gets its turn here.
+            GLib.idle_add(self._replace_worker_when_idle)
         return Abandoned.SOME if rids else Abandoned.NONE
 
     def _release_domain(self, domain):
