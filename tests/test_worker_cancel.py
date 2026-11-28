@@ -35,3 +35,16 @@ def test_cancelling_a_queued_request_skips_it_and_spares_the_running_one(worker,
     assert ended[first]["type"] == "done_single", "the running request was not the one cancelled"
     assert ended[queued]["type"] == "canceled", "the queued request is skipped"
     assert not (tmp_path / "queued.png").exists(), "a skipped request writes nothing"
+
+
+def test_a_cancel_for_a_request_that_already_ended_is_dropped(worker, tmp_path):
+    """A cancel that crossed its request's last reply was kept for good: ids
+    only grow, so no later request ever took it back out."""
+    rid = worker.send(single(tmp_path, "out.png"))
+    assert replies_for(worker, [rid])[rid]["type"] == "done_single"
+    worker.write({"op": "cancel", "id": rid})
+    later = worker.send(single(tmp_path, "later.png"))   # read after the cancel
+    assert replies_for(worker, [later])[later]["type"] == "done_single", \
+        "a late cancel touches no other request"
+    assert f"cancel for request {rid} dropped" in worker.log_text(), \
+        "the worker drops a cancel for a request it no longer has"

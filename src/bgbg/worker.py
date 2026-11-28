@@ -79,6 +79,7 @@ plat.prepare_process()
 import gc  # noqa: E402
 import json  # noqa: E402
 import contextlib  # noqa: E402
+import enum  # noqa: E402
 import errno  # noqa: E402
 import time  # noqa: E402
 import queue  # noqa: E402
@@ -1104,26 +1105,42 @@ def _dispatch(req):
         out({"type": "error", "message": describe_error(e, req), "id": rid})
 
 
+class CancelOutcome(enum.Enum):
+    """What a cancel found when it arrived."""
+
+    STOPPING = "stopping"        # the request was running: its event is set
+    SKIPPED = "skipped"          # still queued: it is skipped when it comes up
+    DROPPED = "dropped"          # neither: it already ended, or never came
+
+
 class _Cancels:
     """Which requests a cancel has reached, by request id.
 
-    The stdin thread hands cancels in as they arrive; the worker thread runs
-    one request at a time. A cancel for the running request sets that
-    request's own event. One for a request still queued is kept, and the
-    request is skipped when it comes up.
+    The stdin thread hands requests and cancels in as they arrive; the worker
+    thread runs one request at a time. A cancel for the running request sets
+    that request's own event. One for a request still queued is kept, and the
+    request is skipped when it comes up. Any other cancel is dropped: request
+    ids only grow, so one kept for an ended request would stay for good.
     """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._running = None        # (request id, its Event) while one runs
-        self._queued = set()        # ids cancelled before they started
+        self._waiting = set()       # ids queued and not yet started
+        self._skipped = set()       # ids cancelled before they started
+
+    def queue(self, rid):
+        """`rid` is queued: a cancel for it is kept until it comes up."""
+        with self._lock:
+            self._waiting.add(rid)
 
     def start(self, rid):
         """Begin request `rid`: its cancel Event, or None if it was cancelled
         while queued and must be skipped."""
         with self._lock:
-            if rid in self._queued:
-                self._queued.discard(rid)
+            self._waiting.discard(rid)
+            if rid in self._skipped:
+                self._skipped.discard(rid)
                 return None
             event = threading.Event()
             self._running = (rid, event)
@@ -1137,8 +1154,11 @@ class _Cancels:
         with self._lock:
             if self._running is not None and self._running[0] == rid:
                 self._running[1].set()
-            else:
-                self._queued.add(rid)
+                return CancelOutcome.STOPPING
+            if rid in self._waiting:
+                self._skipped.add(rid)
+                return CancelOutcome.SKIPPED
+            return CancelOutcome.DROPPED
 
 
 _cancels = _Cancels()
@@ -1190,9 +1210,11 @@ def main():
         if op in ("cancel", "seg_cancel"):
             if req.get("id") is None:
                 sys.stderr.write("a cancel that names no request is ignored\n")
-            else:
-                _cancels.cancel(req["id"])
+            elif _cancels.cancel(req["id"]) is CancelOutcome.DROPPED:
+                sys.stderr.write(f"cancel for request {req['id']} dropped: "
+                                 "it isn't queued or running\n")
             continue
+        _cancels.queue(req.get("id"))
         q.put(req)
 
 
