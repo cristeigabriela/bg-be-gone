@@ -47,9 +47,8 @@ class Face(enum.Enum):
 
 
 class Thumb(enum.Enum):
-    """A thumbnail that isn't a picture (yet)."""
+    """What a thumbnail request answers instead of a picture."""
 
-    LOADING = "loading"
     BROKEN = "broken"        # neither GdkPixbuf nor the worker could read it
 
 
@@ -62,6 +61,10 @@ class Editing(enum.Enum):
 
 class GalleryItem(GObject.Object):
     """One image of the folder, and everything a tile shows about it.
+
+    It holds paths and state, never a picture: the tile showing it holds
+    its textures while bound, and Thumbnails' cache bounds the rest, so a
+    folder of thousands costs no more memory than the cache.
 
     Emits "changed" whenever any of it changes; the tile bound to it redraws.
     """
@@ -81,16 +84,20 @@ class GalleryItem(GObject.Object):
         self.output = None           # DONE: the file written
         self.result_thumb = None     # DONE: the worker's small PNG of the result
         self.face = Face.SOURCE
-        self.source = Thumb.LOADING  # a Gdk.Texture once decoded
-        self.result = Thumb.LOADING
+        self.broken = set()          # the faces neither GdkPixbuf nor the worker could read
 
     @property
     def selectable(self):
         return self.animation is formats.Animation.STILL
 
+    def picture_path(self, face):
+        """The file a face's thumbnail is decoded from, or None (no result yet)."""
+        return self.path if face is Face.SOURCE else self.result_thumb
+
     def reset_result(self):
         """Forget the last run's result picture, before a new run."""
-        self.result = Thumb.LOADING
+        self.result_thumb = None
+        self.broken.discard(Face.RESULT)
         self.face = Face.SOURCE
 
     def changed(self):
@@ -343,6 +350,10 @@ class _Tile(Gtk.Overlay):
         self._item = None
         self._handler = 0
         self._syncing = False
+        # While bound, per face: (the file decoded, its texture), and the file
+        # asked for and not back yet. Unbinding lets both go.
+        self._textures = {}
+        self._asked = {}
         self.add_css_class("batch-tile")
         self.set_overflow(Gtk.Overflow.HIDDEN)
 
@@ -403,14 +414,44 @@ class _Tile(Gtk.Overlay):
     def bind(self, item):
         self._item = item
         self._handler = item.connect("changed", lambda *_: self.sync())
-        self._gallery.want_thumbnail(item, Face.SOURCE)
         self.sync()
 
     def unbind(self):
         if self._item is not None and self._handler:
             self._item.disconnect(self._handler)
         self._item, self._handler = None, 0
+        self._textures.clear()
+        self._asked.clear()
+        self._picture.set_paintable(None)
         self._spinner.set_visible(False)        # a hidden spinner doesn't animate
+
+    def _texture(self, item, face):
+        """The face's texture, if this tile holds it for the file the face
+        shows now; otherwise None, and it is asked for."""
+        path = item.picture_path(face)
+        held = self._textures.get(face)
+        if held is not None and held[0] == path:
+            return held[1]
+        self._textures.pop(face, None)
+        if path is None or face in item.broken or self._asked.get(face) == path:
+            return None
+        self._asked[face] = path
+
+        def apply(texture):
+            # Only while this tile shows that item, and the face still that
+            # file: a decode for an earlier run's result lands nowhere.
+            if self._item is not item or item.picture_path(face) != path:
+                return
+            self._asked.pop(face, None)
+            if texture is Thumb.BROKEN:
+                item.broken.add(face)
+            else:
+                self._textures[face] = (path, texture)
+            if not self._syncing:           # a cache hit answers inside sync()
+                self.sync()
+        self._gallery.thumbnails.request(path, apply)
+        held = self._textures.get(face)
+        return held[1] if held is not None else None
 
     def sync(self):
         """Show the bound item as it is now."""
@@ -430,12 +471,12 @@ class _Tile(Gtk.Overlay):
         self._name.set_text(item.name)
 
         face = item.face if item.state is TileState.DONE else Face.SOURCE
-        shown = item.result if face is Face.RESULT else item.source
-        self._picture.set_paintable(shown if isinstance(shown, Gdk.Texture) else None)
+        shown = self._texture(item, face)
+        self._picture.set_paintable(shown)
         # A dimmed picture would let it show through.
-        self._placeholder.set_visible(not isinstance(shown, Gdk.Texture))
+        self._placeholder.set_visible(shown is None)
         self._placeholder.set_from_icon_name(
-            "image-missing-symbolic" if shown is Thumb.BROKEN else "image-x-generic-symbolic")
+            "image-missing-symbolic" if face in item.broken else "image-x-generic-symbolic")
         self._flip.set_visible(item.state is TileState.DONE)
         self._flip.set_active(face is Face.RESULT)
         self._flip.set_tooltip_text("Show the original" if face is Face.RESULT
@@ -621,26 +662,14 @@ class Gallery:
         return [item for item in self.items if item.selectable]
 
     # ---- thumbnails ----
-    def want_thumbnail(self, item, face):
-        """Decode the picture a tile needs, unless it is there already."""
-        if face is Face.SOURCE:
-            if item.source is not Thumb.LOADING:
-                return
-
-            def apply(texture):
-                item.source = texture
-                item.changed()
-            self._thumbs.request(item.path, apply)
-        elif item.result is Thumb.LOADING and item.result_thumb:
-            def apply(texture):
-                item.result = texture
-                item.changed()
-            self._thumbs.request(item.result_thumb, apply)
+    @property
+    def thumbnails(self):
+        """Where the tiles get their pictures."""
+        return self._thumbs
 
     def flip(self, item, face):
+        """Show the result or the source; the tile asks for the picture."""
         item.face = face
-        if face is Face.RESULT:
-            self.want_thumbnail(item, Face.RESULT)
         item.changed()
 
     # ---- the grid ----
