@@ -13,6 +13,7 @@ Run as a script, it starts another script with :func:`worker_env` (see
 :func:`main`), which is how the install scripts probe a worker.
 """
 import glob
+import logging
 import os
 import subprocess
 import sys
@@ -224,6 +225,22 @@ def worker_env(environ=None):
     return env
 
 
+_render_choice = None   # wincompose.Choice, from frontend_starting()
+
+
+def _start_marker():
+    from . import wincompose
+    return os.path.join(data_dir(), wincompose.START_MARKER)
+
+
+def frontend_starting():
+    """Called before GTK initialises: render on the GPU through Direct
+    Composition, unless the last such start never showed its window."""
+    global _render_choice
+    from . import wincompose
+    _render_choice = wincompose.choose_renderer(_start_marker())
+
+
 def frontend_started(app_id):
     """Called once GTK is up. Windows has no .desktop file to name the window
     icon, so the taskbar would show Python's.
@@ -237,6 +254,29 @@ def frontend_started(app_id):
     if icons and os.path.isdir(icons):
         Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(icons)
     Gtk.Window.set_default_icon_name(app_id)
+    if _render_choice is None:
+        return
+    from . import wincompose
+    if _render_choice.renderer is wincompose.Renderer.DCOMP:
+        wincompose.watch_gl_windows()   # transparent corners on every surface
+    else:
+        logging.warning("rendering with Cairo: %s", _render_choice.reason)
+
+
+def frontend_handed_off():
+    """Called when this start passed its files to a running bg-be-gone: it
+    ends without a window, and that's a start that went fine."""
+    from . import wincompose
+    if _render_choice is not None and _render_choice.renderer is wincompose.Renderer.DCOMP:
+        wincompose.start_confirmed(_start_marker())
+
+
+def frontend_window(window):
+    """Called with the main window once presented: its first frame shows the
+    Direct Composition start went fine."""
+    from . import wincompose
+    if _render_choice is not None and _render_choice.renderer is wincompose.Renderer.DCOMP:
+        wincompose.confirm_on_first_frame(window, _start_marker())
 
 
 # ---------------------------------------------------------------------------
