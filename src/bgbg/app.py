@@ -1828,10 +1828,17 @@ class Window(Adw.ApplicationWindow):
         if not self._seg_has_selection():
             self._toast("Pick at least one object first.")
             return
+        if self._worker_state is not WorkerState.UP:
+            return
         self._seg_set_busy(True)
         self.seg_status.set_text("Preparing export…")
         req = self._seg_extract_req(os.path.join(self.tmpdir, "seg_result.png"))
-        self._send_job(Job.SEG_SAVE, req, alpha=_alpha_of(req["bg"]))
+        if self._send_job(Job.SEG_SAVE, req, alpha=_alpha_of(req["bg"])) == -1:
+            # No reply will come to end the busy state: end it here.
+            self._seg_set_busy(False)
+            self.seg_status.set_text("Couldn't save: the background process isn't running.")
+            self._toast_error("Could not save the selection: the background process "
+                              "isn't running.")
 
     def _seg_save_file(self, src, alpha):
         """Offer the export at `src`, whose background `alpha` describes."""
@@ -2132,7 +2139,8 @@ class Window(Adw.ApplicationWindow):
         self.gen_btn.set_sensitive(not self.busy and self.src_panel.view.has_image() and up)
         self.save_btn.set_sensitive(self.result_output is not None)
         self.seg_everything_btn.set_sensitive(not self.seg_busy and up)
-        self.seg_save_btn.set_sensitive(self.seg_result_output is not None)
+        # Save selection renders in the worker: without one it can't finish.
+        self.seg_save_btn.set_sensitive(self.seg_result_output is not None and up)
 
     def _drop_old_source_jobs(self):
         """A new image replaces the source: drop what is still on its way for
