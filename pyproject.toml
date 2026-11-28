@@ -4,6 +4,10 @@ version = "1.1.0"
 description = "Local image background remover and object segmentation (GTK4)"
 requires-python = ">=3.9"
 license = { text = "MIT" }
+classifiers = [
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+]
 # The GTK frontend runs on the system Python (PyGObject); the worker venv holds
 # the ML stack. install.sh drives pip directly, so these extras are primarily
 # documentation + a future `pip install .[seg]`.
