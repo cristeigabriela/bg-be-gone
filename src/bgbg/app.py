@@ -3313,6 +3313,10 @@ class Window(Adw.ApplicationWindow):
                 gone = self._abandoned.pop(rid)
                 self._remove_temp_input(gone.input)
                 self._drop_kept(gone.kept)
+            if t == "recomposited":
+                # Written for nothing: a newer change replaced it.
+                for written in {msg["output"], msg.get("preview") or msg["output"]}:
+                    _remove_quietly(written)
             return False
         if t in _JOB_ENDS:
             req = self._jobs.pop(rid, None)
