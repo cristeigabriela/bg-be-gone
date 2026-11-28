@@ -38,4 +38,7 @@ def test_a_cancel_stops_a_first_download_and_leaves_no_model(start_worker, tmp_p
         if reply.get("type") in ("done_single", "canceled", "error"):
             break
     assert reply["type"] == "canceled", "the download stops: %s" % reply
-    assert list(models.iterdir()) == [], "neither the model nor a partial download is left"
+    # Files only: rembg 2.0.88 keeps a model in <home>/models/<name>/, a folder
+    # pooch makes before it downloads, and that folder is no model.
+    left = [p for p in models.rglob("*") if p.is_file()]
+    assert left == [], "neither the model nor a partial download is left"
