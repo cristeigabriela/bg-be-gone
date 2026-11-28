@@ -152,6 +152,15 @@ class _InFlight:
     loads: Optional[tuple] = None            # SEG_LOAD: the (source, model) it loads
 
 
+def plain_reason(exc):
+    """The OS's own words for an OSError, else the exception's first line."""
+    if isinstance(exc, OSError) and exc.strerror:
+        return exc.strerror
+    if isinstance(exc, GLib.Error):
+        return exc.message
+    return (str(exc).splitlines() or [type(exc).__name__])[0]
+
+
 def _remove_quietly(path):
     """Delete a temporary file of ours; one already gone is fine."""
     try:
@@ -631,7 +640,11 @@ class Window(Adw.ApplicationWindow):
         header.pack_end(help_btn)
         menu = Gio.Menu()
         menu.append("How to use…", "app.help")
+        menu.append("Open log", "win.open-log")
         menu.append("About bg-be-gone", "app.about")
+        open_log = Gio.SimpleAction.new("open-log", None)
+        open_log.connect("activate", self._on_open_log)
+        self.add_action(open_log)
         menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic",
                                   menu_model=menu)
         header.pack_end(menu_btn)
@@ -1231,7 +1244,8 @@ class Window(Adw.ApplicationWindow):
 
         def failed(e):
             self._seg_set_busy(False)
-            self._toast("Could not prepare image: %s" % e)
+            self._report_failure("preparing the Segment input", e,
+                                 "Could not prepare the image: %s." % plain_reason(e))
 
         self._prepare_input(Prep.SEGMENT, self.seg_panel.view, send, failed)
 
@@ -1711,13 +1725,12 @@ class Window(Adw.ApplicationWindow):
         self._release_source_actions()
         name = os.path.basename(pending.path)
         if msg["type"] == "error":
-            first = msg["message"].splitlines()[0]
-            _log.warning("can't open %s: %s", pending.path, first)
+            _log.warning("can't open %s: %s", pending.path, msg["message"])
             if pending.preview is not None:   # GdkPixbuf shows it, so it works as a still
                 self._show_source(pending.path, pending.preview, formats.Animation.STILL)
                 return
-            self.status.set_text("Error: " + first)
-            self._toast("Error: " + first)
+            self.status.set_text(msg["message"])
+            self._toast_error(msg["message"])
             return
         preview = pending.preview or msg["output"]
         if pending.preview is None and not self.src_panel.view.load_file(preview):
@@ -1862,16 +1875,17 @@ class Window(Adw.ApplicationWindow):
         if rid == -1:
             if staging is not None:
                 _remove_quietly(staging)
-            self._toast("Save failed: the worker isn't running.")
+            self._toast_error("Could not save %s: the background process isn't running."
+                              % os.path.basename(target.path))
             return
 
     def _on_save_reply(self, pending, msg):
         if pending.staging is not None:
             _remove_quietly(pending.staging)
         if msg["type"] == "error":
-            first = msg["message"].splitlines()[0]
-            _log.warning("saving %s failed: %s", pending.target.path, first)
-            self._toast("Save failed: " + first)
+            _log.warning("saving %s failed: %s", pending.target.path, msg["message"])
+            self._toast_error("Could not save %s: %s" % (
+                os.path.basename(pending.target.path), msg["message"]))
             return
         self._toast(_saved_notice(pending.target, pending.choices))
 
@@ -1949,7 +1963,8 @@ class Window(Adw.ApplicationWindow):
         def failed(e):
             self.src_panel.view.set_scanning(False)
             self._set_busy(False)
-            self._toast("Could not prepare image: %s" % e)
+            self._report_failure("preparing the Generate input", e,
+                                 "Could not prepare the image: %s." % plain_reason(e))
 
         self._prepare_input(Prep.SINGLE, self.src_panel.view, send, failed)
 
@@ -2190,16 +2205,28 @@ class Window(Adw.ApplicationWindow):
             self._unload("seg")            # free the SAM model + cached encode
             self.seg_status.set_text("Cancelled.")
         elif t == "error":
-            first = msg["message"].splitlines()[0]
-            self.status.set_text("Error: " + first)
-            self.batch_status.set_text("Error: " + first)
-            if getattr(self, "seg_busy", False):
-                self._seg_set_busy(False)
-                self.seg_status.set_text("Error: " + first)
-            self._toast("Error: " + first)
-            self._set_busy(False)
-            self._set_busy(False, spin=False)
+            self._on_job_error(job, msg["message"])
         return False
+
+    def _on_job_error(self, job, text):
+        """Show a failed job's message on its own page, and keep it on screen."""
+        if job is Job.SEG_PREVIEW:
+            # The live preview only: a Segment run may still be going.
+            self.seg_status.set_text(text)
+        elif job in _SEG_JOBS:
+            self.seg_pending = None
+            self._seg_set_busy(False)
+            self.seg_status.set_text(text)
+        elif job is Job.BATCH:
+            self.batch_status.set_text(text)
+            self._set_busy(False, spin=False)
+        elif job is Job.SINGLE:
+            self.status.set_text(text)
+            self._set_busy(False)
+        else:                       # a reply to no request we track
+            for label in (self.status, self.batch_status, self.seg_status):
+                label.set_text(text)
+        self._toast_error(text)
 
     def _on_help(self, *_):
         dlg = Adw.Dialog()
@@ -2250,6 +2277,28 @@ class Window(Adw.ApplicationWindow):
 
     def _toast(self, text):
         self.toasts.add_toast(Adw.Toast(title=text, timeout=3))
+
+    def _report_failure(self, what, exc, text):
+        """A frontend failure: traceback to the log, `text` on screen."""
+        _log.error("%s failed", what, exc_info=exc)
+        self._toast_error(text)
+
+    def _toast_error(self, text):
+        """A toast that stays until dismissed, with a way to the log."""
+        toast = Adw.Toast(title=text, timeout=0)
+        toast.set_button_label("Open log")
+        toast.set_action_name("win.open-log")
+        self.toasts.add_toast(toast)
+
+    def _on_open_log(self, *_):
+        launcher = Gtk.FileLauncher.new(Gio.File.new_for_path(LOG))
+
+        def done(launcher, res):
+            try:
+                launcher.launch_finish(res)
+            except GLib.Error as e:
+                self._toast("Could not open the log (%s): %s" % (e.message, LOG))
+        launcher.launch(self, None, done)
 
     def _on_close(self, *_):
         self.worker.shutdown()

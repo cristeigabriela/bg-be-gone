@@ -72,6 +72,7 @@ plat.prepare_process()
 
 import gc  # noqa: E402
 import json  # noqa: E402
+import errno  # noqa: E402
 import time  # noqa: E402
 import queue  # noqa: E402
 import shutil  # noqa: E402
@@ -79,6 +80,7 @@ import tempfile  # noqa: E402
 import threading  # noqa: E402
 import traceback  # noqa: E402
 import warnings  # noqa: E402
+import urllib.error  # noqa: E402
 
 from PIL import Image, ImageFilter, UnidentifiedImageError  # noqa: E402
 # Imports onnxruntime, then rembg when it is installed.
@@ -238,18 +240,83 @@ def _checkerboard(size, cell=24):
     return board
 
 
-class UnreadableImageError(OSError):
-    def __init__(self, path, reason):
+class WorkerError(Exception):
+    """Base for failures the worker can explain to the user itself.
+
+    Each carries `user_message`, the text the window shows, next to the usual
+    lowercase message that goes to the log.
+    """
+
+    user_message = "Something went wrong."
+
+
+class UnreadableImageError(WorkerError, OSError):
+    def __init__(self, path, reason, user_message):
         super().__init__(f"can't read {os.path.basename(path)}: {reason}")
         self.path = path
         self.reason = reason
+        self.user_message = user_message
 
 
-class UnsupportedOutputError(ValueError):
+class UnsupportedOutputError(WorkerError, ValueError):
     def __init__(self, path):
         super().__init__(f"can't save as {os.path.basename(path)}: "
                          "bg-be-gone writes PNG, WebP or JPEG")
         self.path = path
+        self.user_message = ("bg-be-gone can't save %s: it writes PNG, WebP or JPEG."
+                             % os.path.basename(path))
+
+
+def _causes(exc):
+    """`exc` and every exception it was raised from, outermost first."""
+    seen = []
+    while exc is not None and exc not in seen:
+        seen.append(exc)
+        exc = exc.__cause__ or exc.__context__
+    return seen
+
+
+def _is_network_error(exc):
+    """True when `exc` comes from a download that couldn't reach the server."""
+    network = (urllib.error.URLError, ConnectionError, TimeoutError)
+    try:
+        import requests      # what pooch, and so rembg's downloads, run on
+        network += (requests.ConnectionError, requests.Timeout)
+    except ImportError:
+        pass
+    return any(isinstance(e, network) for e in _causes(exc))
+
+
+def describe_error(exc, req):
+    """The text the window shows for `exc`, in words the user can act on.
+
+    The traceback goes to the log; this names the common failures plainly and
+    falls back to the exception's first line for the rest.
+    """
+    name = os.path.basename(req.get("input") or "") or "The file"
+    for e in _causes(exc):
+        if isinstance(e, WorkerError):
+            return e.user_message
+        if isinstance(e, UnidentifiedImageError):
+            return f"{name} isn't an image bg-be-gone can read."
+        if isinstance(e, FileNotFoundError):
+            return f"{os.path.basename(e.filename or '') or name} was not found."
+        if isinstance(e, PermissionError):
+            return f"No permission to use {e.filename or name}."
+        if isinstance(e, OSError) and e.errno == errno.ENOSPC:
+            return "Not enough disk space to write the result."
+        if isinstance(e, MemoryError):
+            return ("Not enough memory for this image. Close other apps, "
+                    "or try a smaller image.")
+    if _is_network_error(exc):
+        return ("No internet connection. The model is downloaded once, on its "
+                "first use: connect and try again.")
+    text = str(exc).lower()
+    if "out of memory" in text or "failed to allocate" in text:
+        return ("Not enough graphics memory (VRAM). Close other GPU apps, "
+                "or pick a smaller model.")
+    first = (str(exc).splitlines() or [""])[0] or type(exc).__name__
+    return "Something went wrong: " + first
 
 
 def open_image(path):
@@ -259,19 +326,30 @@ def open_image(path):
     file fail with its name, not later in the middle of a cut-out. Failures go
     to the worker log too, with the full path.
     """
+    name = os.path.basename(path)
     try:
         im = Image.open(path)
         im.load()
         return im
     except UnidentifiedImageError as e:
         if formats.format_of(path) is formats.HEIF and not _HAVE_HEIF:
-            reason = "HEIC/HEIF support (pi-heif) isn't installed; re-run the installer"
+            err = UnreadableImageError(
+                path, "HEIC/HEIF support (pi-heif) isn't installed; re-run the installer",
+                f"{name} is a HEIC/HEIF image, and HEIC support (pi-heif) isn't "
+                "installed. Run the installer again to add it.")
         else:
-            reason = "not an image format bg-be-gone reads"
-        err = UnreadableImageError(path, reason)
+            err = UnreadableImageError(path, "not an image format bg-be-gone reads",
+                                       f"{name} isn't an image bg-be-gone can read.")
+        cause = e
+    except FileNotFoundError as e:
+        err = UnreadableImageError(path, str(e), f"{name} was not found.")
+        cause = e
+    except PermissionError as e:
+        err = UnreadableImageError(path, str(e), f"No permission to read {name}.")
         cause = e
     except OSError as e:
-        err = UnreadableImageError(path, str(e))
+        # Typically a truncated or damaged file: Pillow's words say which.
+        err = UnreadableImageError(path, str(e), f"Can't read {name}: {e}.")
         cause = e
     print(f"decode failed: {path}: {cause}", file=sys.stderr, flush=True)
     raise err from cause
@@ -813,8 +891,12 @@ def _dispatch(req):
         if handler:
             handler(req)
     except Exception as e:  # noqa: BLE001
-        out({"type": "error",
-             "message": f"{e}\n{traceback.format_exc()}", "id": rid})
+        # stderr is the frontend's log file: the traceback is what a bug
+        # report needs, the window gets the plain version.
+        print(f"request {op} (id {rid}) failed:", file=sys.stderr)
+        traceback.print_exc()
+        sys.stderr.flush()
+        out({"type": "error", "message": describe_error(e, req), "id": rid})
 
 
 class _Cancels:

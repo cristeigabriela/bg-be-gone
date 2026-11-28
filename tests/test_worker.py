@@ -262,8 +262,8 @@ def test_an_unreadable_image_is_named_in_the_error_and_the_log(worker, tmp_path)
          "input": str(bad), "output": str(tmp_path / "x.png")},
         until={"done_single", "error"})
     assert reply["type"] == "error", "a text file can't be decoded"
-    assert reply["message"].startswith("can't read not_an_image.webp: "), \
-        "the error's first line, which the frontend shows, names the file"
+    assert reply["message"] == "not_an_image.webp isn't an image bg-be-gone can read.", \
+        "the error, which the frontend shows, names the file in plain words"
     assert str(bad) in (tmp_path / "worker.log").read_text(), \
         "the worker log has the file's full path"
 
