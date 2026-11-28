@@ -1801,9 +1801,13 @@ class Window(Adw.ApplicationWindow):
         shutil.rmtree(kept.folder, ignore_errors=True)
 
     def _seg_bg_changed(self, *_):
-        if getattr(self, "seg_panel", None) is not None and \
-                self.stack.get_visible_child_name() == "segment":
+        if getattr(self, "seg_panel", None) is None:
+            return
+        if self.stack.get_visible_child_name() == "segment":
             self._update_seg_preview()
+        elif self.seg_result_output is not None:
+            # Changed from another page: redrawn on the way back (_on_page_changed).
+            self._seg_preview_stale = True
 
     def get_settings(self):
         model = self._bg_model_key()
@@ -1940,6 +1944,11 @@ class Window(Adw.ApplicationWindow):
         new = self.stack.get_visible_child_name()
         old = getattr(self, "_cur_page", None)
         self._cur_page = new
+        if new == "segment" and getattr(self, "_seg_preview_stale", False):
+            # Save selection waits for the preview of the settings it'll use.
+            self._seg_preview_stale = False
+            self.seg_save_btn.set_sensitive(False)
+            self._update_seg_preview()
         # Free a domain's model when you leave it (keep it resident while you're
         # on its page, so re-runs stay fast).
         if old is not None and self._domain(old) != self._domain(new):
