@@ -389,6 +389,7 @@ class BatchPage:
         self.input: Optional[str] = None
         self.output: Optional[str] = None
         self._images = []                  # the scanned folder: [(path, Animation)]
+        self._scanned = None               # the folder the gallery shows, once read
         self._scan_token = None
         self._run = Run.IDLE
         self._runs = 0                     # runs so far, to name each one's thumbnail folder
@@ -706,6 +707,13 @@ class BatchPage:
         self.input = folder
         self.in_row.set_subtitle(folder)
         self.count_label.set_text("Reading…")
+        # Until this scan is in, the gallery shows no folder, so Run can't send
+        # the last folder's images with this one's name.
+        self._scanned = None
+        self.gallery.set_images([])
+        self.empty.set_title("Reading the folder…")
+        self.empty.set_description("")
+        self.gallery_stack.set_visible_child_name("empty")
         token = self._scan_token = object()
 
         def scanned(result):
@@ -713,6 +721,7 @@ class BatchPage:
                 return               # another folder was picked meanwhile
             images = [] if isinstance(result, Exception) else result
             self._images = images
+            self._scanned = folder
             self.count_label.set_text(_count_text(images))
             self.gallery.set_images(images)
             if images:
@@ -788,7 +797,7 @@ class BatchPage:
     # ---------- running ----------
     def can_run(self):
         return (self._run is Run.IDLE and not self._host.is_busy()
-                and self._host.worker_is_up() and self.input and self.output
+                and self._host.worker_is_up() and self._scanned and self.output
                 and self.gallery.selected() and self._pattern_problem() is None)
 
     def run(self):
@@ -799,7 +808,7 @@ class BatchPage:
         selected = self.gallery.selected()
         self._runs += 1
         req = {
-            "op": "batch", "input_dir": self.input, "output_dir": self.output,
+            "op": "batch", "input_dir": self._scanned, "output_dir": self.output,
             "files": [item.path for item in selected], "model": self._host.batch_model(),
             "alpha": out.matting is Matting.ON, "bg": out.bg, "blur": out.blur,
             "format": formats.batch_output_key(out.format), "pattern": self._pattern(),
