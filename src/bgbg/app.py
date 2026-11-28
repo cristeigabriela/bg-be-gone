@@ -286,6 +286,15 @@ ENGINES = [
     ("ONNX Runtime", selection.Engine.ORT),
     ("PyTorch", selection.Engine.TORCH),
 ]
+# The Output button's short name for each background.
+BG_SHORT_NAMES = {
+    "transparent": "Transparent",
+    "blur": "Blur",
+    "#ffffff": "White",
+    "#000000": "Black",
+    "#00b140": "Green screen",
+    "custom": "Custom",
+}
 BGS = [
     ("Transparent", "transparent"),
     ("Blur background", "blur"),
@@ -913,6 +922,7 @@ class Panel:
             b.connect("clicked", cb)
             tools.append(b)
         header.set_end_widget(tools)
+        self._tools = tools
         self.box.append(header)
 
         self.view = ImageView(on_change=self._changed)
@@ -969,6 +979,10 @@ class Panel:
 
     def hide_cursor_badge(self):
         self.cursor_badge.set_visible(False)
+
+    def add_tool(self, widget):
+        """Put `widget` first among the header's tools."""
+        self._tools.prepend(widget)
 
     def _reset(self, *_):
         self.view.reset_view()
@@ -1239,7 +1253,9 @@ class Window(Adw.ApplicationWindow):
     def _build_sidebar(self):
         scroller = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER)
-        scroller.set_size_request(280, -1)
+        # The Output rows used to widen it; without them, it keeps room for the
+        # Subject row's value and its cost.
+        scroller.set_size_request(360, -1)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         box.set_margin_top(16)
         box.set_margin_bottom(16)
@@ -1266,6 +1282,11 @@ class Window(Adw.ApplicationWindow):
         model_grp.add(self.model_row)
         self._refresh_bg_subtitles()
 
+        # It changes the cut-out itself, so it's part of what runs.
+        self.alpha_row = Adw.SwitchRow(
+            title="Alpha matting", subtitle="Cleaner edges, a little slower")
+        model_grp.add(self.alpha_row)
+
         # Shown only when the worker says it can run PyTorch, so an install
         # without it looks as it always did.
         self.model_adv = Adw.ExpanderRow(title="Advanced")
@@ -1281,12 +1302,20 @@ class Window(Adw.ApplicationWindow):
         box.append(model_grp)
         box.append(self._build_seg_group())
 
-        out_grp = Adw.PreferencesGroup(title="Output")
+        self._build_output_rows()
+        return scroller
+
+    def _build_output_rows(self):
+        """Background, Custom colour and Blur strength, in the list the Result
+        headers' Output popovers show (_output_button)."""
+        self.output_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.output_list.add_css_class("boxed-list")
+        self.output_list.set_size_request(320, -1)
         self.bg_row = Adw.ComboRow(
             title="Background",
             model=Gtk.StringList.new([b[0] for b in BGS]))
         self.bg_row.connect("notify::selected", lambda *_: self._sync_color())
-        out_grp.add(self.bg_row)
+        self.output_list.append(self.bg_row)
 
         self.color_row = Adw.ActionRow(title="Custom colour")
         self.color_btn = Gtk.ColorDialogButton.new(Gtk.ColorDialog())
@@ -1297,7 +1326,7 @@ class Window(Adw.ApplicationWindow):
         self.color_btn.set_valign(Gtk.Align.CENTER)
         self.color_row.add_suffix(self.color_btn)
         self.color_row.set_sensitive(False)
-        out_grp.add(self.color_row)
+        self.output_list.append(self.color_row)
 
         # A share of the picture's size (background.py), so it looks the same on any photo.
         self.blur_row = Adw.SpinRow(
@@ -1306,13 +1335,39 @@ class Window(Adw.ApplicationWindow):
                 value=background.STRENGTH_DEFAULT, lower=background.STRENGTH_MIN,
                 upper=background.STRENGTH_MAX, step_increment=1, page_increment=5))
         self.blur_row.set_visible(False)
-        out_grp.add(self.blur_row)
+        self.output_list.append(self.blur_row)
+        self._output_buttons = []
 
-        self.alpha_row = Adw.SwitchRow(
-            title="Alpha matting", subtitle="Cleaner edges, a little slower")
-        out_grp.add(self.alpha_row)
-        box.append(out_grp)
-        return scroller
+    def _output_button(self):
+        """The Output button for a Result header: the current background, as
+        text, and a popover with its settings, shared by every page."""
+        content = Adw.ButtonContent(icon_name="preferences-color-symbolic")
+        button = Gtk.MenuButton(child=content)
+        button.add_css_class("flat")
+        popover = Gtk.Popover()
+        button.set_popover(popover)
+
+        def show_rows(*_):
+            # One set of rows: they move into whichever popover opens.
+            holder = self.output_list.get_parent()
+            if holder is not popover:
+                if holder is not None:
+                    holder.set_child(None)
+                popover.set_child(self.output_list)
+        popover.connect("show", show_rows)
+        self._output_buttons.append((button, content))
+        self._sync_output_buttons()
+        return button
+
+    def _sync_output_buttons(self):
+        """Name the background on every Output button: in its label, tooltip
+        and accessible name, so it reads without the colour swatch."""
+        name = BG_SHORT_NAMES[BGS[self.bg_row.get_selected()][1]]
+        for button, content in getattr(self, "_output_buttons", []):
+            content.set_label(name)
+            button.set_tooltip_text("Background: %s" % name)
+            button.update_property([Gtk.AccessibleProperty.LABEL],
+                                   ["Output background: %s" % name])
 
     def _build_statusbar(self):
         """Persistent window footer: device (left), the active page's status/hint
@@ -1593,6 +1648,7 @@ class Window(Adw.ApplicationWindow):
         bg = BGS[self.bg_row.get_selected()][1]
         self.color_row.set_sensitive(bg == "custom")
         self.blur_row.set_visible(bg == "blur")
+        self._sync_output_buttons()
         self._mark_stale()
         self._seg_bg_changed()
 
@@ -1813,7 +1869,6 @@ class Window(Adw.ApplicationWindow):
         seg = self.stack.get_visible_child_name() == "segment"
         self.model_grp.set_visible(not seg)
         self.seg_grp.set_visible(seg and self._seg_available)
-        self.alpha_row.set_visible(not seg)
 
     def _accel_save(self):
         p = self.stack.get_visible_child_name()
@@ -1965,6 +2020,7 @@ class Window(Adw.ApplicationWindow):
             "Result", empty_icon="emblem-photos-symbolic",
             empty_title="Your selection appears here",
             empty_hint="Pick objects, then Save")
+        self.seg_res_panel.add_tool(self._output_button())
         paned.set_start_child(self.seg_panel.box)
         paned.set_end_child(self.seg_res_panel.box)
         paned.set_resize_start_child(True)
@@ -2403,6 +2459,7 @@ class Window(Adw.ApplicationWindow):
         self.res_panel = Panel(
             "Result", empty_icon="emblem-photos-symbolic",
             empty_title="Your cut-out appears here", empty_hint="Press Generate")
+        self.res_panel.add_tool(self._output_button())
         paned.set_start_child(self.src_panel.box)
         paned.set_end_child(self.res_panel.box)
         paned.set_resize_start_child(True)
