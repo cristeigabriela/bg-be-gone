@@ -124,12 +124,14 @@ bg-be-gone has three pages: **Single**, **Batch** and **Segment**. Open an image
 
 ### Batch: a whole folder
 
-Choose an input folder and an output folder, set a name pattern, and click **Run batch**.
+Choose an input folder (or drop one on the page) and an output folder. Its images show as tiles: untick the ones to leave out, choose how each is written, and click **Run batch**.
 
-- **Name pattern:** `{name}` is the original file name, and `{n}` the file's number.
+- **The gallery** shows 20 images at a time; the **+** tile shows 20 more. Click a tile, or its check, to keep it or leave it out.
+- **Output** is the batch's own: remove the background, blur it, or put the subject on a colour, written as PNG, WebP or JPEG (JPEG only with a blur or a colour). The preview shows it on a sample picture.
+- **Name pattern:** `{name}` is the original file name, and `{n}` the file's number. Beside it, the first image's result name shows as you type.
 - **Nothing is ever overwritten.** If a name is taken, the result gets ` (2)`, ` (3)` and so on. That holds even when the output folder is the input folder.
-- **A bad file doesn't stop the run.** The summary lists what finished, what failed and what was skipped, and why.
-- **Results are PNG.** Animated GIFs and WebPs are skipped; open them on the Single page.
+- **A bad file doesn't stop the run.** Each tile shows how its image went, and a finished one flips to show its result. The summary lists what failed or was skipped, and why.
+- **Animated GIFs and WebPs** are skipped; open them on the Single page.
 
 ### Segment: pick objects
 
