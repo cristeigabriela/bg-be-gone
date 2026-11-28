@@ -23,7 +23,7 @@ import os
 import sys
 from dataclasses import dataclass
 
-import plat
+import settings
 from engines import EngineError
 
 ENV_VAR = "BGBG_ENGINE"
@@ -110,8 +110,8 @@ def _from_env(environ) -> Engine:
 
 
 def default_settings_path() -> str:
-    # Read when called: gpu.env can move the config folder at start-up.
-    return os.path.join(plat.config_dir(), "settings.json")
+    # The window's own settings file: settings.py owns where it is.
+    return settings.default_path()
 
 
 def default_profile_path(environ=os.environ) -> str:
@@ -129,22 +129,14 @@ def read_setting(settings_path: str | None = None) -> Engine:
 def save_setting(engine: Engine, settings_path: str | None = None) -> None:
     """Write the in-app setting, keeping any other keys the file holds.
 
-    Written beside the file and renamed over it, so the worker never reads
-    half of one.
+    Through settings.update, the one writer of this file in the window: it is
+    replaced in one step, so the worker never reads half of one, and writes of
+    the window's other settings can't drop this key.
+
+    Raises:
+        settings.SettingsError: the file can't be read (it is left alone) or written.
     """
-    path = settings_path or default_settings_path()
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            data = {}
-    except (OSError, ValueError, RecursionError):
-        data = {}
-    data[_ENGINE_KEY] = engine.value
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path + ".part", "w", encoding="utf-8") as f:
-        json.dump(data, f)
-    os.replace(path + ".part", path)
+    settings.update(settings_path or default_settings_path(), **{_ENGINE_KEY: engine.value})
 
 
 def resolve(settings_path: str | None = None, environ=os.environ,

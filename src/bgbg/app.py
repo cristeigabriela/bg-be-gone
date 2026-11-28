@@ -9,6 +9,7 @@ import os
 import sys
 import enum
 import json
+import math
 import logging
 import secrets
 import shutil
@@ -38,6 +39,7 @@ import batchnames  # noqa: E402
 import formats  # noqa: E402
 from engines import selection  # noqa: E402  (standard library only)
 import offmain  # noqa: E402
+import settings  # noqa: E402
 
 APP_ID = "io.github.cristeigabriela.BgBeGone"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -170,6 +172,26 @@ class _InFlight:
     save: Optional[_PendingSave] = None      # SAVE: where the re-encoded result goes
     input: Optional[str] = None              # SINGLE: its input, deleted if we encoded it
     loads: Optional[tuple] = None            # SEG_LOAD: the (source, model) it loads
+
+
+# A remembered window side outside this range is not a size to restore.
+_MIN_WINDOW_SIDE, _MAX_WINDOW_SIDE = 200, 16384
+
+
+def _window_dimension(value):
+    """A remembered window width or height, or None when it isn't a sane one."""
+    if isinstance(value, int) and not isinstance(value, bool) \
+            and _MIN_WINDOW_SIDE <= value <= _MAX_WINDOW_SIDE:
+        return value
+    return None
+
+
+def _existing_folder(value):
+    """A remembered folder, or None when it isn't a path to one that exists."""
+    try:
+        return value if isinstance(value, str) and os.path.isdir(value) else None
+    except ValueError:              # a path with a NUL in it
+        return None
 
 
 def plain_reason(exc):
@@ -761,9 +783,93 @@ class Window(Adw.ApplicationWindow):
         self.add_controller(sc)
 
         self.connect("close-request", self._on_close)
+        self._restore_settings()
         if not self.worker.ok:
             self._show_worker_down("Could not start the background process (%s)."
                                    % self.worker.error)
+
+    # ---------- remembered settings ----------
+    def _restore_settings(self):
+        """Put back last launch's choices, then save each one as it changes.
+
+        The change handlers connect only after the restore, so restoring
+        writes nothing.
+        """
+        self._settings_error = None    # the first failed save, shown once
+        try:
+            self._settings = settings.load()
+        except settings.SettingsError as e:
+            _log.error("reading the settings failed", exc_info=e)
+            self._settings = {}
+        # Every value is checked before use: the file is hand-editable, and a bad
+        # one falls back to its default instead of keeping the window from opening.
+        s = self._settings
+        width, height = _window_dimension(s.get("window_width")), \
+            _window_dimension(s.get("window_height"))
+        if width and height:
+            self.set_default_size(width, height)
+        if s.get("window_maximized") is True:
+            self.maximize()
+        subjects = [v for _, v in SUBJECTS]
+        if s.get("subject") in subjects:
+            self.subject_row.set_selected(subjects.index(s["subject"]))
+        elif s.get("subject") == "custom":
+            self.subject_row.set_selected(len(SUBJECTS))
+        models = [v for _, v in MODELS]
+        if s.get("model") in models:
+            self.model_row.set_selected(models.index(s["model"]))
+        backgrounds = [v for _, v in BGS]
+        if s.get("background") in backgrounds:
+            self.bg_row.set_selected(backgrounds.index(s["background"]))
+        colour = Gdk.RGBA()
+        if isinstance(s.get("custom_colour"), str) and colour.parse(s["custom_colour"]):
+            self.color_btn.set_rgba(colour)
+        blur = s.get("blur")
+        if isinstance(blur, (int, float)) and not isinstance(blur, bool) and math.isfinite(blur):
+            self.blur_row.set_value(blur)          # the row clamps it to its range
+        for key, row in (("batch_input", self.in_row), ("batch_output", self.out_row)):
+            folder = _existing_folder(s.get(key))
+            if folder:
+                setattr(self, key, folder)
+                row.set_subtitle(folder)
+        self._sync_batch()
+
+        self.subject_row.connect("notify::selected", lambda *_: self._remember(
+            subject=("custom" if self.subject_row.get_selected() >= len(SUBJECTS)
+                     else SUBJECTS[self.subject_row.get_selected()][1])))
+        self.model_row.connect("notify::selected", lambda *_: self._remember(
+            model=MODELS[self.model_row.get_selected()][1]))
+        self.bg_row.connect("notify::selected", lambda *_: self._remember(
+            background=BGS[self.bg_row.get_selected()][1]))
+        self.color_btn.connect("notify::rgba", lambda *_: self._remember(
+            custom_colour=self.color_btn.get_rgba().to_string()))
+        self.blur_row.connect("notify::value", lambda *_: self._remember(
+            blur=int(self.blur_row.get_value())))
+
+    def _remember(self, **values):
+        """Save the `values` that changed; a failure is logged once and shown once."""
+        changed = {k: v for k, v in values.items() if self._settings.get(k) != v}
+        if not changed:
+            return
+        self._settings.update(changed)
+        try:
+            settings.update(**changed)
+        except settings.SettingsError as e:
+            if self._settings_error is None:
+                self._settings_error = e
+                self._report_failure("saving the settings", e,
+                                     "Could not save your settings: %s." % e.reason)
+
+    def _remembered_folder(self, key):
+        """A remembered folder as a Gio.File, if it still exists."""
+        folder = _existing_folder(self._settings.get(key))
+        return Gio.File.new_for_path(folder) if folder else None
+
+    def _source_folder(self):
+        """The folder of the opened image, unless it's one of ours (a paste)."""
+        if not self.source_path or self._in_tmpdir(self.source_path):
+            return None
+        return Gio.File.new_for_path(os.path.dirname(os.path.abspath(self.source_path)))
 
     # ---------- sidebar ----------
     def _build_sidebar(self):
@@ -990,8 +1096,8 @@ class Window(Adw.ApplicationWindow):
         label, engine = ENGINES[self.engine_row.get_selected()]
         try:
             selection.save_setting(engine, self._settings_path)
-        except OSError as err:
-            self._toast("Couldn't save the engine setting: %s" % err)
+        except settings.SettingsError as err:
+            self._toast("Couldn't save the engine setting: %s" % err.reason)
             return
         # A new worker reads the setting at start-up, so nothing of the old
         # engine (a PyTorch start-up in flight, its GPU context) carries over.
@@ -1788,6 +1894,9 @@ class Window(Adw.ApplicationWindow):
     def _on_open_image(self, *_):
         dlg = Gtk.FileDialog(title="Open image")
         dlg.set_filters(self._image_filters())
+        start = self._remembered_folder("open_folder")
+        if start is not None:
+            dlg.set_initial_folder(start)
 
         def done(d, res):
             try:
@@ -1795,6 +1904,7 @@ class Window(Adw.ApplicationWindow):
             except GLib.Error:
                 return
             self._load_source(f.get_path())
+            self._remember(open_folder=os.path.dirname(f.get_path()))
         dlg.open(self, None, done)
 
     def _on_drop(self, target, value, x, y):
@@ -2033,6 +2143,10 @@ class Window(Adw.ApplicationWindow):
         dlg.set_filters(filters)
         base = os.path.splitext(os.path.basename(self.source_path or "image"))[0]
         dlg.set_initial_name(base + stem_suffix + default.suffix)
+        # Next to the source image, else where the last save went.
+        start = self._source_folder() or self._remembered_folder("save_folder")
+        if start is not None:
+            dlg.set_initial_folder(start)
 
         def done(d, res):
             try:
@@ -2070,6 +2184,7 @@ class Window(Adw.ApplicationWindow):
 
     def _report_saved(self, target, choices):
         self._toast(_saved_notice(target, choices))
+        self._remember(save_folder=os.path.dirname(target.path))
 
     def _report_save_failure(self, target, exc):
         self._report_failure("saving " + target.path, exc, "Could not save %s: %s." % (
@@ -2114,6 +2229,9 @@ class Window(Adw.ApplicationWindow):
 
     def _on_pick_input(self, *_):
         dlg = Gtk.FileDialog(title="Input folder")
+        start = self._remembered_folder("batch_input")
+        if start is not None:
+            dlg.set_initial_folder(start)
 
         def done(d, res):
             try:
@@ -2122,11 +2240,16 @@ class Window(Adw.ApplicationWindow):
                 return
             self.batch_input = f.get_path()
             self.in_row.set_subtitle(self.batch_input)
+            self._remember(batch_input=self.batch_input)
             self._sync_batch()
         dlg.select_folder(self, None, done)
 
     def _on_pick_output(self, *_):
         dlg = Gtk.FileDialog(title="Output folder")
+        start = (self._remembered_folder("batch_output")
+                 or self._remembered_folder("batch_input"))
+        if start is not None:
+            dlg.set_initial_folder(start)
 
         def done(d, res):
             try:
@@ -2135,6 +2258,7 @@ class Window(Adw.ApplicationWindow):
                 return
             self.batch_output = f.get_path()
             self.out_row.set_subtitle(self.batch_output)
+            self._remember(batch_output=self.batch_output)
             self._sync_batch()
         dlg.select_folder(self, None, done)
 
@@ -2663,6 +2787,11 @@ class Window(Adw.ApplicationWindow):
         launcher.launch(self, None, done)
 
     def _on_close(self, *_):
+        if self.is_maximized():
+            self._remember(window_maximized=True)
+        else:
+            self._remember(window_maximized=False, window_width=self.get_width(),
+                           window_height=self.get_height())
         self.worker.shutdown()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         return False
