@@ -110,6 +110,18 @@ SWATCHES = (("White", "#ffffff"), ("Black", "#000000"), ("Green screen", "#00b14
 
 
 @dataclass(frozen=True)
+class _ExampleAsk:
+    """What the rename example names: everything its lookup reads, so a
+    lookup that finishes after any of it changed is known to be stale."""
+
+    source: str              # the run's first image, or a stand-in name
+    stem: str                # its result's name, before a number or suffix
+    suffix: str
+    outdir: Optional[str]
+    sources: tuple           # the run's images: their names are taken too
+
+
+@dataclass(frozen=True)
 class Output:
     """How a batch writes each image: the Output card's choices."""
 
@@ -392,6 +404,8 @@ class BatchPage:
         self._scanned = None               # the folder the gallery shows, once read
         self._chosen = DEFAULT_OUTPUT.chosen   # the format last picked; see _read_output
         self._format_handler = 0
+        self._example_wanted = None        # the newest _ExampleAsk, or None
+        self._example_resolving = None     # the _ExampleAsk being looked up, if one is
         self._scan_token = None
         self._run = Run.IDLE
         self._runs = 0                     # runs so far, to name each one's thumbnail folder
@@ -783,22 +797,49 @@ class BatchPage:
 
     def _update_example(self):
         """'cat.jpg → cat_nobg.png' for the run's first image, with the name the
-        run would give it now, taken names and all."""
+        run would give it now, taken names and all.
+
+        Finding that name asks the disk about each taken one, which on a
+        network share is slow, so it's done off the UI thread: one lookup at
+        a time, and the newest ask goes next, if any came meanwhile.
+        """
         if self._pattern_problem():
+            self._example_wanted = None
             self.example.set_text("")
             return
         selected = self.gallery.selected()
         source = selected[0].path if selected else "photo.jpg"
-        stem = batchnames.stem_for(self._pattern(), source, 1)
-        suffix = self._out.format.suffix
-        name = stem + suffix
-        if self.output:
-            taken = batchnames.taken_by([item.path for item in selected])
-            name = os.path.basename(batchnames.first_free(self.output, stem, suffix, taken))
-        self.example.set_text("%s → %s" % (os.path.basename(source), name))
-        self.example.set_tooltip_text(
-            None if name == stem + suffix
-            else "%s is taken, so the result gets a number." % (stem + suffix))
+        self._example_wanted = _ExampleAsk(
+            source, batchnames.stem_for(self._pattern(), source, 1),
+            self._out.format.suffix, self.output, tuple(item.path for item in selected))
+        if self._example_resolving is None:
+            self._resolve_example()
+
+    def _resolve_example(self):
+        ask = self._example_resolving = self._example_wanted
+        if ask is None:
+            return
+
+        def resolve():
+            if not ask.outdir:
+                return ask.stem + ask.suffix
+            taken = batchnames.taken_by(ask.sources)
+            return os.path.basename(batchnames.first_free(ask.outdir, ask.stem, ask.suffix,
+                                                          taken))
+
+        def resolved(name):
+            if self._example_wanted is not ask:
+                self._resolve_example()       # stale: the newest ask goes next
+                return
+            self._example_resolving = None
+            if isinstance(name, Exception):
+                _log.warning("can't name the example's result", exc_info=name)
+                name = ask.stem + ask.suffix
+            plain = ask.stem + ask.suffix
+            self.example.set_text("%s → %s" % (os.path.basename(ask.source), name))
+            self.example.set_tooltip_text(
+                None if name == plain else "%s is taken, so the result gets a number." % plain)
+        offmain.run(resolve, resolved)
 
     # ---------- selection ----------
     def _on_selection_changed(self):
