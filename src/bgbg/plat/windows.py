@@ -60,6 +60,11 @@ def config_dir():
     return os.path.join(data_dir(), "config")
 
 
+def kernel_cache_dir():
+    """Where the GPU stack keeps compiled kernels (MIOpen's, for ROCm PyTorch)."""
+    return os.path.join(data_dir(), "miopen")
+
+
 # ---------------------------------------------------------------------------
 # Worker start-up
 # ---------------------------------------------------------------------------
