@@ -52,7 +52,8 @@ Responses (one JSON object per line on stdout):
   {"type":"seg_download","done":i,"total":n,"id":N}
   {"type":"seg_step","rung":R,"message":str,"id":N}
   {"type":"seg_ready","rung":R,"model":L,"provider":P,"label":L,"gpu":bool,
-   "mode":auto|manual|fallback,"family":str,"id":N}
+   "mode":auto|manual|fallback,"family":str,"vram_free":MiB|null,"id":N}
+      # vram_free: what Auto's pick was based on; null when nothing was probed
   {"type":"seg_progress","done":i,"total":n,"id":N}
   {"type":"seg_objects","label_map":P,"count":n,"objects":[...],"id":N}
   {"type":"seg_mask","mask":P,"score":f,"bbox":[x,y,w,h],"id":N}
@@ -307,6 +308,8 @@ def describe_error(exc, req):
         if isinstance(e, WorkerError):
             return e.user_message
         if isinstance(e, batchnames.BatchPatternError):
+            return e.user_message
+        if _HAVE_SEG and isinstance(e, seg.SegAcquireError):
             return e.user_message
         if isinstance(e, UnidentifiedImageError):
             return f"{name} isn't an image bg-be-gone can read."
@@ -725,20 +728,28 @@ def handle_seg_load(req):
             raise _Canceled()
         out({"type": "seg_download", "done": done, "total": total, "id": rid})
 
+    # The previous image's model goes first: free VRAM is probed next, and a
+    # session still holding its memory would make the pick smaller than it
+    # should be, or need room for two models at once. Its masks are files.
+    if _seg is not None and _seg["session"] is not None:
+        _seg["session"] = None
+        _seg["prev_low"] = None
+        gc.collect()
     try:
-        session, rung, mode = seg.auto_select_session(
+        pick = seg.auto_select_session(
             ort_engine.preferred_providers(), _gpu_hint(), want=want, probe_image=pil,
             on_step=on_step, on_progress=on_progress)
     except _Canceled:
         out({"type": "seg_canceled", "id": rid})
         return
+    session, rung = pick.session, pick.rung
     prov = session.provider()
     _seg = {"session": session, "image": pil, "rung": rung, "size": pil.size,
             "maskdir": maskdir, "objects": [], "prev_low": None}
     out({"type": "seg_ready", "rung": rung, "model": seg.MODELS[rung]["label"],
          "provider": prov, "label": ort_engine.PROVIDER_LABELS.get(prov, prov),
-         "gpu": prov in ort_engine.GPU_PROVIDERS, "mode": mode, "family": session.family,
-         "id": rid})
+         "gpu": prov in ort_engine.GPU_PROVIDERS, "mode": pick.mode,
+         "family": session.family, "vram_free": pick.vram_free, "id": rid})
 
 
 def _require_seg(rid):

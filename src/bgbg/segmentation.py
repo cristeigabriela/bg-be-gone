@@ -7,8 +7,8 @@ background-removal worker (onnxruntime + numpy + pillow, no torch). Provides:
   auto-selection and step-down on OOM/failure.
 - ``SamSession`` — encode-once, then interactive point decoding or a numpy
   "segment everything" automatic mask generator (grid sampling + NMS).
-- Weight download-on-demand into ``~/.cache/bg-be-gone/models`` and last-good rung
-  persistence in ``~/.config/bg-be-gone/seg.json``.
+- Weight download-on-demand into ``~/.cache/bg-be-gone/models``. The model is
+  picked anew on every load; nothing about it is remembered.
 
 Runs inside the worker's venv. The GTK frontend never imports this (it has no
 numpy); masks are exchanged as PNG files on disk.
@@ -18,8 +18,11 @@ import zlib
 import json
 import colorsys
 import zipfile
+import urllib.error
 import urllib.request
 from collections import deque
+from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 from PIL import Image, ImageFilter
@@ -43,25 +46,36 @@ _STD = np.array([0.229, 0.224, 0.225], np.float32)
 # ---------------------------------------------------------------------------
 # Model registry / ladder
 # ---------------------------------------------------------------------------
+# Peak dedicated VRAM (MiB) each SAM 2.1 model used to segment everything on a
+# 1600x1598 photo, measured on DirectML on 2026-11-27.
+_MEASURED_PEAK_MIB = {"large": 3041, "base_plus": 2591, "small": 2392, "tiny": 2347}
+# Headroom over the measured peak: a bigger photo, another provider, the driver.
+_GATE_FACTOR = 1.25
+_GATE_SLACK_MIB = 512
+
+
+def _gate(rung):
+    """The free VRAM (MiB) Auto wants before it picks `rung`."""
+    return round(_MEASURED_PEAK_MIB[rung] * _GATE_FACTOR) + _GATE_SLACK_MIB
+
+
 # ``vram_gate`` is the minimum *free* VRAM (MiB) for auto-selection to pick this
-# rung. ``large`` is intentionally never auto-selected (manual override only) —
-# the auto default aims "high but not the highest", the SAM analogue of the
-# app's BiRefNet-General default.
+# rung: about 4.3 GB for Large, down to about 3.4 GB for Tiny.
 MODELS = {
     "large": dict(
-        family="sam2", label="SAM 2.1 Large", vram_gate=8000,
+        family="sam2", label="SAM 2.1 Large", vram_gate=_gate("large"),
         repo="vietanhdev/segment-anything-2.1-onnx-models",
         zip="sam2.1_hiera_large_20260221.zip", stem="sam2.1_hiera_large"),
     "base_plus": dict(
-        family="sam2", label="SAM 2.1 Base+", vram_gate=6000,
+        family="sam2", label="SAM 2.1 Base+", vram_gate=_gate("base_plus"),
         repo="vietanhdev/segment-anything-2.1-onnx-models",
         zip="sam2.1_hiera_base_plus_20260221.zip", stem="sam2.1_hiera_base_plus"),
     "small": dict(
-        family="sam2", label="SAM 2.1 Small", vram_gate=4000,
+        family="sam2", label="SAM 2.1 Small", vram_gate=_gate("small"),
         repo="vietanhdev/segment-anything-2.1-onnx-models",
         zip="sam2.1_hiera_small_20260221.zip", stem="sam2.1_hiera_small"),
     "tiny": dict(
-        family="sam2", label="SAM 2.1 Tiny", vram_gate=2500,
+        family="sam2", label="SAM 2.1 Tiny", vram_gate=_gate("tiny"),
         repo="vietanhdev/segment-anything-2.1-onnx-models",
         zip="sam2.1_hiera_tiny_20260221.zip", stem="sam2.1_hiera_tiny"),
     "mobile": dict(
@@ -72,8 +86,8 @@ MODELS = {
 
 # Order used when stepping DOWN after a failure (best → cheapest).
 LADDER = ["large", "base_plus", "small", "tiny", "mobile"]
-# Rungs auto-selection is allowed to choose (excludes ``large``).
-_AUTO_ORDER = ["base_plus", "small", "tiny"]
+# Rungs auto-selection may choose, best first; MobileSAM is the fallback.
+_AUTO_ORDER = ["large", "base_plus", "small", "tiny"]
 
 
 class SegError(Exception):
@@ -83,6 +97,52 @@ class SegError(Exception):
 class ComputeError(SegError):
     """A model ran but produced garbage (e.g. NaN from a broken GPU kernel).
     Retry the same model on CPU rather than dropping to a smaller one."""
+
+
+class SegAcquireError(SegError):
+    """Getting a model's files failed, as opposed to loading or running them.
+
+    It says nothing about whether the model fits, so it is never a reason to
+    step down to a smaller one. `user_message` is the text the window shows.
+    """
+
+
+class SegDownloadError(SegAcquireError):
+    """No SAM model could be loaded because its download failed (usually offline)."""
+
+    def __init__(self, rung):
+        super().__init__(f"could not download the {rung} model")
+        self.rung = rung
+        self.user_message = ("No internet connection. The Segment model is downloaded "
+                             "once, on its first use: connect and try again.")
+
+
+class SegDownloadIncompleteError(SegAcquireError):
+    """A download ended before the size the server announced."""
+
+    def __init__(self, url, done, total):
+        super().__init__(f"download of {url} ended at {done} of {total} bytes")
+        self.url = url
+        self.done = done
+        self.total = total
+        self.user_message = ("The Segment model's download stopped early (%d of %d MB). "
+                             "Try again." % (done >> 20, total >> 20))
+
+
+class SegModelArchiveError(SegAcquireError):
+    """A downloaded model archive can't be read; it has been removed."""
+
+    def __init__(self, path, reason):
+        super().__init__(f"bad model archive {path}: {reason}")
+        self.path = path
+        self.reason = reason
+        self.user_message = ("The downloaded Segment model was damaged, so it was removed. "
+                             "Try again to download it afresh.")
+
+
+def _is_download_error(exc):
+    """True when `exc` is a download that couldn't reach the server."""
+    return isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError))
 
 
 def _provider_name(p):
@@ -101,8 +161,10 @@ def load_config():
 
 
 def save_config(**kw):
+    """Merge `kw` into the config; a value of None removes that key."""
     cfg = load_config()
     cfg.update(kw)
+    cfg = {k: v for k, v in cfg.items() if v is not None}
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         tmp = CONFIG_PATH + ".tmp"
@@ -114,7 +176,7 @@ def save_config(**kw):
 
 
 def rung_for_vram(free_mb, gpu):
-    """Auto-select rung from free VRAM, capped at ``base_plus``."""
+    """Auto-select rung from free VRAM: the best one whose gate it clears."""
     if not gpu:
         return "mobile"
     for name in _AUTO_ORDER:
@@ -166,13 +228,22 @@ def ensure_model(rung, progress=None):
     if not os.path.exists(zip_p):
         _download(f"{_HF}/{spec['repo']}/resolve/main/{spec['zip']}", zip_p, progress)
     os.makedirs(out_dir, exist_ok=True)
-    with zipfile.ZipFile(zip_p) as z:
-        for member in z.namelist():
-            if member.endswith(".onnx"):
-                data = z.read(member)
-                target = enc_p if "encoder" in member else dec_p
-                with open(target, "wb") as f:
-                    f.write(data)
+    try:
+        with zipfile.ZipFile(zip_p) as z:
+            bad = z.testzip()          # every member's CRC, before anything is kept
+            if bad is not None:
+                raise zipfile.BadZipFile(f"{bad} fails its CRC check")
+            for member in z.namelist():
+                if member.endswith(".onnx"):
+                    target = enc_p if "encoder" in member else dec_p
+                    # Through a part file: is_cached trusts any file at target.
+                    with open(target + ".part", "wb") as f:
+                        f.write(z.read(member))
+                    os.replace(target + ".part", target)
+    except zipfile.BadZipFile as e:
+        # Kept, it would fail every later load the same way.
+        os.remove(zip_p)
+        raise SegModelArchiveError(zip_p, str(e)) from e
     try:
         os.remove(zip_p)
     except OSError:
@@ -479,11 +550,27 @@ class SamSession:
 # ---------------------------------------------------------------------------
 # Auto-selection with step-down
 # ---------------------------------------------------------------------------
+# Keys older versions kept in seg.json to remember a step-down. Nothing reads
+# them: a bad moment (another app holding VRAM, a driver hiccup) must not
+# lower the quality of later loads.
+_STALE_KEYS = ("rung", "stepped_down_at")
+
+
 def _looks_like_oom(exc):
     s = str(exc).lower()
     return any(k in s for k in ("out of memory", "oom", "cuda", "cublas",
                                 "cudnn", "failed to allocate", "hipmalloc",
                                 "rocm", "miopen"))
+
+
+@dataclass(frozen=True)
+class SamPick:
+    """The SAM session auto_select_session loaded, and how it was picked."""
+
+    session: "SamSession"
+    rung: str
+    mode: str                     # auto, manual or fallback
+    vram_free: Optional[int]      # MiB free when Auto picked; None when not probed
 
 
 def auto_select_session(providers, gpu, want="auto", probe_image=None,
@@ -497,46 +584,57 @@ def auto_select_session(providers, gpu, want="auto", probe_image=None,
                      actually reserves workspace and OOM/NaN surface).
     ``on_step``      called ``(rung, exc)`` each time an attempt is abandoned.
 
-    Failure handling differs by cause: an out-of-memory error steps down to a
-    smaller model (keeping the GPU), while a compute failure (NaN from a broken
-    GPU kernel, or any other error) retries the *same* model on CPU before
-    stepping down — so a too-new GPU degrades to CPU without needless downloads.
+    Auto picks from the VRAM free right now, on every load. Failure handling
+    differs by cause, and lasts for this load only; nothing is remembered:
 
-    Returns ``(session, rung, mode)`` where mode is auto|manual|fallback.
+    - out of memory: step down to a smaller model, keeping the GPU.
+    - a compute failure (NaN from a broken GPU kernel, or any other error):
+      retry the *same* model on CPU before stepping down, so a too-new GPU
+      degrades to CPU without needless downloads.
+    - a failed download, or a model file that arrived damaged: raise a
+      SegAcquireError. It says nothing about the model, so a smaller one that
+      happens to be cached must not stand in.
+
+    Returns a SamPick.
     """
     cpu_only = ["CPUExecutionProvider"]
     have_gpu = gpu and any(_provider_name(p) != "CPUExecutionProvider"
                            for p in providers)
 
-    cfg = load_config()
     if want == "auto":
         vram = probe_vram()
-        derived = rung_for_vram(vram["free"] if vram else 0, have_gpu and bool(vram))
-        # Only honour a *saved* rung when it is cheaper than what VRAM suggests
-        # — i.e. a remembered step-down from a prior failure — so we don't
-        # re-attempt a known-too-big model every launch. Never let it cap us
-        # below the VRAM pick (a manual choice is not persisted, see below).
-        saved = cfg.get("rung")
-        if saved in LADDER and LADDER.index(saved) > LADDER.index(derived):
-            start = saved
-        else:
-            start = derived
-        base_mode, persist = "auto", True
+        vram_free = vram["free"] if vram else None
+        start = rung_for_vram(vram_free or 0, have_gpu and bool(vram))
+        base_mode = "auto"
+        if any(k in load_config() for k in _STALE_KEYS):
+            save_config(**{k: None for k in _STALE_KEYS})
     else:
         start = want if want in LADDER else "base_plus"
-        base_mode, persist = "manual", False
+        base_mode = "manual"
+        vram_free = None               # nothing was probed for a model the user chose
+
+    def load(name, prov):
+        try:
+            sess = SamSession.load(name, prov, progress=on_progress)
+        except SegAcquireError:
+            raise
+        except Exception as e:
+            if _is_download_error(e):
+                raise SegDownloadError(name) from e
+            raise
+        if probe_image is not None:
+            sess.encode(probe_image)
+        return sess
 
     for name in LADDER[LADDER.index(start):]:
         attempts = ([providers, cpu_only] if have_gpu else [cpu_only])
         for prov in attempts:
             try:
-                sess = SamSession.load(name, prov, progress=on_progress)
-                if probe_image is not None:
-                    sess.encode(probe_image)
-                if persist:
-                    save_config(rung=name)
-                first = (name == start and prov is attempts[0])
-                return sess, name, (base_mode if first else "fallback")
+                sess = load(name, prov)
+                first = name == start and prov is attempts[0]
+                return SamPick(sess, name, base_mode if first else "fallback", vram_free)
+            except SegAcquireError:
+                raise
             except Exception as e:  # noqa: BLE001
                 if type(e).__name__ == "_Canceled":
                     raise      # a cancel isn't a load failure — don't step down
@@ -548,12 +646,7 @@ def auto_select_session(providers, gpu, want="auto", probe_image=None,
                 continue
 
     # Ultimate fallback: MobileSAM forced onto CPU.
-    sess = SamSession.load("mobile", cpu_only, progress=on_progress)
-    if probe_image is not None:
-        sess.encode(probe_image)
-    if persist:
-        save_config(rung="mobile")
-    return sess, "mobile", "fallback"
+    return SamPick(load("mobile", cpu_only), "mobile", "fallback", vram_free)
 
 
 # ---------------------------------------------------------------------------

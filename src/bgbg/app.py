@@ -664,6 +664,7 @@ class Window(Adw.ApplicationWindow):
         self._seg_models = []          # [{"rung","label"}] from the worker
         self.seg_loaded_for = None     # (source path, model asked for) the worker holds
         self.seg_pending = None        # callback to run once seg_ready arrives
+        self._seg_active_model = None  # label of the SAM model last loaded
         self.seg_busy = False
         self.seg_objects = []
         self.seg_points = []           # accumulated [x, y, label] in point mode
@@ -911,8 +912,10 @@ class Window(Adw.ApplicationWindow):
     def _footer_context(self):
         page = self.stack.get_visible_child_name()
         if page == "segment":
+            # The model actually loaded, once there is one: Auto, or a step-down
+            # after a failure, may differ from the row's choice.
             it = self.seg_model_row.get_selected_item()
-            model = it.get_string() if it is not None else ""
+            model = self._seg_active_model or (it.get_string() if it is not None else "")
             mode = "Click" if self._seg_mode() == "point" else "Everything"
             return "Segment · %s · %s" % (mode, model) if model else "Segment · %s" % mode
         if page == "batch":
@@ -1566,6 +1569,7 @@ class Window(Adw.ApplicationWindow):
         if getattr(self, "_syncing_seg", False):
             return
         self.seg_loaded_for = None  # force re-encode with the new model
+        self._seg_active_model = None
         self.seg_adv.set_subtitle("Reloads on next segment")
         self._update_footer()
 
@@ -2288,6 +2292,9 @@ class Window(Adw.ApplicationWindow):
             note = {"auto": " · auto", "fallback": " · fallback"}.get(
                 msg.get("mode"), "")
             self.seg_model_row.set_subtitle(msg["model"] + note)
+            self._seg_active_model = msg["model"] + (
+                " (fallback)" if msg.get("mode") == "fallback" else "")
+            self._update_footer()
             # When on "Auto", tell the user which model that resolved to.
             if self.seg_model_row.get_selected() <= 0:
                 self.seg_model_row.set_tooltip_text(
