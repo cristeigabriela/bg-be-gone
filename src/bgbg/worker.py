@@ -100,7 +100,7 @@ import traceback  # noqa: E402
 import warnings  # noqa: E402
 import urllib.error  # noqa: E402
 
-from PIL import Image, UnidentifiedImageError  # noqa: E402
+from PIL import Image, ImageOps, UnidentifiedImageError  # noqa: E402
 # Imports onnxruntime, then rembg when it is installed.
 from engines import ort as ort_engine  # noqa: E402
 from engines import selection  # noqa: E402
@@ -553,7 +553,9 @@ def process_one(model, req_id, src, dst, alpha, bg, blur=background.STRENGTH_DEF
     `keep_dir`, when given, keeps the picture and its cut-out there, so
     recomposite can put the result onto another background without the model.
     """
-    img = _plain(open_image(src))
+    # Upright first: rembg would turn its mask by the EXIF orientation, and
+    # the cut-out, kept picture and composite must all match that mask.
+    img = _plain(ImageOps.exif_transpose(open_image(src)))
     res = _straight_cutout(img, _remove_resilient(model, req_id, img, alpha), alpha)
     if keep_dir:
         os.makedirs(keep_dir, exist_ok=True)
@@ -858,7 +860,7 @@ def _render_animation(req, cut_of, done_type, scope):
                 out({"type": "canceled", "scope": scope, "id": rid})
                 return
             im.seek(i)
-            frame = _apply_transform(im.convert("RGBA"), rot, fh, fv)
+            frame = _apply_transform(ImageOps.exif_transpose(im.convert("RGBA")), rot, fh, fv)
             # After decoding: a WebP frame's duration is set only once it loads.
             durations.append(im.info.get("duration", 100))
             cut = cut_of(i, frame)

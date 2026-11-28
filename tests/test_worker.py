@@ -12,7 +12,7 @@ import sys
 
 import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageOps
 
 import modelinfo
 from workerpipe import BACKGROUND_PIXEL, REPLY_TIMEOUT_S, SUBJECT_PIXEL, TESTDATA, WORKER
@@ -333,3 +333,24 @@ def test_a_soft_edge_keeps_the_pictures_own_colours(worker, tmp_path):
     for xy in soft:
         assert cut.getpixel(xy)[:3] == picture.getpixel(xy), \
             f"the edge pixel at {xy} has the picture's colour, not one darkened by its alpha"
+
+
+@pytest.mark.parametrize("orientation", range(1, 9), ids=lambda o: f"orientation {o}")
+def test_a_photo_with_an_exif_orientation_is_cut_out_upright(worker, tmp_path, orientation):
+    """oriented-N.jpg: one upright picture stored as a camera would for EXIF
+    orientation N (make_orientation_fixtures.py). Turned ones (5-8) have their
+    sides swapped on disk."""
+    source = TESTDATA / f"oriented-{orientation}.jpg"
+    out = tmp_path / "cutout.png"
+    reply, _ = worker.ask(
+        {"op": "single", "model": "u2netp", "id": 1, "input": str(source), "output": str(out)},
+        until={"done_single", "error"})
+    assert reply["type"] == "done_single", reply.get("message")
+    cut = Image.open(out).convert("RGBA")
+    upright = ImageOps.exif_transpose(Image.open(source)).convert("RGB")
+    assert cut.size == upright.size, "the result is the upright picture's size"
+    shown = [(x, y) for x in range(cut.width) for y in range(cut.height)
+             if cut.getpixel((x, y))[3] > 16]
+    assert shown, "something is cut out"
+    assert all(cut.getpixel(xy)[:3] == upright.getpixel(xy) for xy in shown), \
+        "the cut-out's colours are the upright picture's, pixel for pixel"
