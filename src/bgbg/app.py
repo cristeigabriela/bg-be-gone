@@ -1085,6 +1085,10 @@ class Window(Adw.ApplicationWindow):
         # libadwaita's sidebar surface sets it off from the pages, with no line.
         sidebar = self._build_sidebar()
         sidebar.add_css_class("sidebar-pane")
+        # As wide as its rows want, and no wider: otherwise it takes a share of
+        # any spare width (659 px of a maximized window), which a page needs.
+        sidebar.set_propagate_natural_width(True)
+        sidebar.set_hexpand(False)
         body.append(sidebar)
         self.stack.set_hexpand(True)
         body.append(self.stack)
