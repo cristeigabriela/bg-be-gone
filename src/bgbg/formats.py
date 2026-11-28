@@ -85,6 +85,34 @@ def save_formats(alpha):
 BATCH_OUTPUTS = {"png": PNG, "webp": WEBP, "jpeg": JPEG}
 
 
+def batch_output_key(fmt):
+    """The key BATCH_OUTPUTS names `fmt` by."""
+    return next(key for key, value in BATCH_OUTPUTS.items() if value is fmt)
+
+
+# libwebp's ANIMATION_FLAG, in the flags byte of an extended (VP8X) header.
+_WEBP_ANIMATION_FLAG = 0x02
+
+
+def webp_animation(path):
+    """Whether a WebP file says it animates, from its first 21 bytes.
+
+    Only an extended (VP8X) WebP can animate, and its header says so, so a
+    folder can be sorted without decoding it. A file that can't be read, or
+    isn't a WebP, counts as a still: a batch then reports it like any other
+    image it can't read.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(21)
+    except OSError:
+        return Animation.STILL
+    if len(head) < 21 or head[0:4] != b"RIFF" or head[8:12] != b"WEBP" \
+            or head[12:16] != b"VP8X":
+        return Animation.STILL
+    return Animation.ANIMATED if head[20] & _WEBP_ANIMATION_FLAG else Animation.STILL
+
+
 def default_save_format(source_path, choices):
     """The source's own format when it is one of `choices`, else the first."""
     source = format_of(source_path or "")

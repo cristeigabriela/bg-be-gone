@@ -146,6 +146,17 @@ def publish(part, outdir, stem, suffix, taken):
         return path
 
 
+def first_free(outdir, stem, suffix, taken):
+    """The name publish() would give a result if it ran now; it claims nothing.
+
+    For showing a run's names ahead of it: a file that appears before the
+    result is written still moves it to the next number.
+    """
+    for path in _candidates(outdir, stem, suffix):
+        if _path_key(path) not in taken and not os.path.lexists(path):
+            return path
+
+
 def _move_no_replace(src, dst):
     """Move `src` to `dst`, raising FileExistsError instead of replacing a file.
 

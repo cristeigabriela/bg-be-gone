@@ -38,6 +38,27 @@ def test_publishing_never_replaces_a_file_that_took_the_name(tmp_path, disk):
         "the unfinished part file is gone"
 
 
+@pytest.mark.parametrize("existing, sources", [
+    # An empty folder: the plain name.
+    ([], []),
+    # A file has the name: the next number.
+    (["cat_nobg.webp"], []),
+    # A source of the batch has it (input folder = output folder): skipped too.
+    ([], ["cat_nobg.webp"]),
+    # Two numbers gone: the third.
+    (["cat_nobg.webp", "cat_nobg (2).webp"], []),
+], ids=["free", "file-there", "a-source", "two-taken"])
+def test_the_name_shown_before_a_run_is_the_one_the_result_gets(tmp_path, existing, sources):
+    """The Batch page shows `cat.jpg -> cat_nobg (2).webp` ahead of a run."""
+    for name in existing:
+        (tmp_path / name).write_bytes(b"")
+    taken = batchnames.taken_by([str(tmp_path / s) for s in sources])
+    shown = batchnames.first_free(str(tmp_path), "cat_nobg", ".webp", set(taken))
+    part = batchnames.new_part(str(tmp_path), "cat_nobg", ".webp")
+    assert batchnames.publish(part, str(tmp_path), "cat_nobg", ".webp", taken) == shown, \
+        "the example and the run follow the same rule"
+
+
 @pytest.mark.parametrize("pattern", [
     # "{n:c}" expands item 47 to "/", which os.path.join takes as the root.
     "{n:c}outside",
