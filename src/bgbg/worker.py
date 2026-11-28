@@ -11,11 +11,12 @@ Background removal needs ``rembg`` (imported lazily); segmentation needs only
 can be absent — a segmentation-only install ships without rembg.
 
 Requests (one JSON object per line on stdin):
-  {"op":"single","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":S,"id":N}
+  {"op":"single","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":S,
+   "keep_dir":D?,"id":N}                     # keep_dir: keep what recomposite needs
   {"op":"batch","input_dir":D,"output_dir":D,"model":M,"alpha":bool,"bg":BG,
    "pattern":"{name}_nobg","id":N}
   {"op":"gif","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":S,
-   "rot":0..3,"fh":bool,"fv":bool,"id":N}   # per-frame background removal;
+   "rot":0..3,"fh":bool,"fv":bool,"keep_dir":D?,"id":N}   # per-frame removal;
                                              # GIF or WebP (animated) by output
   {"op":"convert","input":P,"output":P,"id":N}   # re-encode as output's format
   {"op":"frames","input":P,"id":N}           # count an image's frames
@@ -33,6 +34,12 @@ Requests (one JSON object per line on stdin):
 
 BG is "transparent", "blur" or "#rrggbb" to flatten onto. S is the blur
 strength, 1-100, relative to the picture's size (background.py).
+
+Re-compositing a kept result onto another background, with no model, from
+the keep_dir its "single" or "gif" wrote:
+  {"op":"recomposite","keep_dir":D,"output":P,"bg":BG,"blur":S,"id":N}   # a still
+  {"op":"recomposite","keep_dir":D,"input":P,"output":P,"bg":BG,"blur":S,
+   "rot":0..3,"fh":bool,"fv":bool,"id":N}   # an animation: its source, as for "gif"
 
 Responses (one JSON object per line on stdout):
   {"type":"ready","models":[...],"providers":[...],"seg":bool,"bgremove":bool,
@@ -540,19 +547,32 @@ def handle_frames(req):
 
 
 def process_one(model, req_id, src, dst, alpha, bg, blur=background.STRENGTH_DEFAULT,
-                want_preview=False):
+                want_preview=False, keep_dir=None):
+    """Cut `src` out with `model` and write it onto background `bg` at `dst`.
+
+    `keep_dir`, when given, keeps the picture and its cut-out there, so
+    recomposite can put the result onto another background without the model.
+    """
     img = _plain(open_image(src))
     res = _straight_cutout(img, _remove_resilient(model, req_id, img, alpha), alpha)
+    if keep_dir:
+        os.makedirs(keep_dir, exist_ok=True)
+        img.save(os.path.join(keep_dir, _KEPT_PICTURE))
+        res.save(os.path.join(keep_dir, _KEPT_CUTOUT))
     return _write_result(img, res, dst, bg, blur, want_preview)
+
+
+# A still's kept files, in its keep_dir; an animation keeps one cut-out per frame.
+_KEPT_PICTURE = "picture.png"
+_KEPT_CUTOUT = "cutout.png"
 
 
 def _write_result(img, res, dst, bg, blur, want_preview):
     """Write cut-out `res` of picture `img` onto background `bg` at `dst`.
 
-    Stills and animation frames compose through _compose_frame, so a blur
-    strength means the same everywhere. Returns the preview's path (a
-    checkered copy of a transparent result), `dst` itself, or None without a
-    preview.
+    Generate and a re-composite both write through here, so the same cut-out
+    and settings give the same file. Returns the preview's path (a checkered
+    copy of a transparent result), `dst` itself, or None without a preview.
     """
     if bg != "transparent":
         _compose_frame(img, res, bg, blur).convert("RGB").save(dst)
@@ -573,7 +593,8 @@ def handle_single(req):
     t = time.time()
     preview = process_one(req["model"], rid, req["input"], req["output"],
                           req.get("alpha", False), req.get("bg", "transparent"),
-                          req.get("blur", background.STRENGTH_DEFAULT), want_preview=True)
+                          req.get("blur", background.STRENGTH_DEFAULT), want_preview=True,
+                          keep_dir=req.get("keep_dir"))
     if _cancel.is_set():                    # a single inference can't be stopped
         out({"type": "canceled", "scope": "single", "id": rid})   # mid-run; drop it
         return
@@ -767,10 +788,57 @@ def handle_gif(req):
     model is loaded once and reused for every frame. Each finished frame is
     written to disk (not held in RAM) so a long animation stays memory-bounded
     during the slow per-frame inference. Progress is per frame; cancellable
-    between frames."""
+    between frames.
+
+    With "keep_dir", each frame's cut-out is kept there too, for recomposite
+    to put onto another background later.
+    """
     rid = req.get("id")
-    src, dst, model = req["input"], req["output"], req["model"]
-    alpha = req.get("alpha", False)
+    model, alpha = req["model"], req.get("alpha", False)
+    kept = req.get("keep_dir")
+    loaded = []
+
+    def cut_of(i, frame):
+        if not loaded:
+            get_session(model, rid)        # once; reused for every frame
+            loaded.append(True)
+        cut = _straight_cutout(frame, _remove_resilient(model, rid, frame, alpha), alpha)
+        if kept:
+            cut.save(_kept_frame(kept, i))
+        return cut
+
+    if kept:
+        os.makedirs(kept, exist_ok=True)
+        with open(os.path.join(kept, _KEPT_SOURCE), "w", encoding="utf-8") as f:
+            json.dump(_file_stamp(req["input"]), f)
+    _render_animation(req, cut_of, "gif_done", "gif")
+
+
+# An animation's keep_dir notes its source file as it was, since recomposite
+# reads that file again.
+_KEPT_SOURCE = "source.json"
+
+
+def _file_stamp(path):
+    """What tells a file changed: its size and modification time."""
+    st = os.stat(path)
+    return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+def _kept_frame(folder, i):
+    """Where frame `i`'s cut-out is kept for re-compositing."""
+    return os.path.join(folder, "f%05d.png" % i)
+
+
+def _render_animation(req, cut_of, done_type, scope):
+    """Cut out (via `cut_of(i, frame)`) and compose every frame of the
+    request's animation, then reassemble it at its output path.
+
+    Reports "gif_progress" per frame and `done_type` at the end; a cancel
+    between frames reports "canceled" with `scope`.
+    """
+    rid = req.get("id")
+    src, dst = req["input"], req["output"]
     bg = req.get("bg", "transparent")
     blur = req.get("blur", background.STRENGTH_DEFAULT)
     rot = int(req.get("rot", 0))
@@ -781,26 +849,25 @@ def handle_gif(req):
     # Report 0/N up front so the progress bar appears immediately — the model
     # load + first-frame warmup (slow on BiRefNet) happen before frame 1 lands.
     out({"type": "gif_progress", "done": 0, "total": n, "id": rid})
-    get_session(model, rid)                # load once; reused for every frame
     framedir = tempfile.mkdtemp(prefix="gifframes-", dir=os.path.dirname(dst) or None)
     paths, durations = [], []
     t = time.time()
     try:
         for i in range(n):
             if _cancel.is_set():
-                out({"type": "canceled", "scope": "gif", "id": rid})
+                out({"type": "canceled", "scope": scope, "id": rid})
                 return
             im.seek(i)
             frame = _apply_transform(im.convert("RGBA"), rot, fh, fv)
             # After decoding: a WebP frame's duration is set only once it loads.
             durations.append(im.info.get("duration", 100))
-            cut = _straight_cutout(frame, _remove_resilient(model, rid, frame, alpha), alpha)
+            cut = cut_of(i, frame)
             fp = os.path.join(framedir, "f%05d.png" % i)
             _compose_frame(frame, cut, bg, blur).save(fp)
             paths.append(fp)
             out({"type": "gif_progress", "done": i + 1, "total": n, "id": rid})
         if _cancel.is_set():
-            out({"type": "canceled", "scope": "gif", "id": rid})
+            out({"type": "canceled", "scope": scope, "id": rid})
             return
         if formats.format_of(dst) is formats.WEBP:
             _frames_to_webp(paths, dst, durations, loop)
@@ -809,10 +876,43 @@ def handle_gif(req):
         # For a frontend whose GdkPixbuf has no loader for the animation.
         preview = dst + ".preview.png"
         shutil.copyfile(paths[0], preview)
-        out({"type": "gif_done", "output": dst, "preview": preview, "frames": n,
+        out({"type": done_type, "output": dst, "preview": preview, "frames": n,
              "device": _last_device, "seconds": round(time.time() - t, 2), "id": rid})
     finally:
         shutil.rmtree(framedir, ignore_errors=True)
+
+
+# What recomposite says when an animation's source changed since its Generate.
+SOURCE_CHANGED = "The original file changed; press Generate again."
+
+
+def handle_recomposite(req):
+    """Put a kept cut-out onto another background, without the model.
+
+    The cut-out is the one "single" or "gif" kept for this input, so the
+    result is the file Generate would write with these settings. A still is
+    one compose; an animation recomposes every frame, with progress, and a
+    cancel stops it between frames.
+    """
+    rid = req.get("id")
+    folder = req["keep_dir"]
+    if "input" in req:                     # an animation, re-read from its source
+        with open(os.path.join(folder, _KEPT_SOURCE), encoding="utf-8") as f:
+            kept_stamp = json.load(f)
+        if _file_stamp(req["input"]) != kept_stamp:
+            # Its frames would no longer match the kept cut-outs.
+            out({"type": "error", "message": SOURCE_CHANGED, "id": rid})
+            return
+        _render_animation(
+            req, lambda i, _frame: Image.open(_kept_frame(folder, i)).convert("RGBA"),
+            "recomposited", "recomposite")
+        return
+    img = Image.open(os.path.join(folder, _KEPT_PICTURE))
+    res = Image.open(os.path.join(folder, _KEPT_CUTOUT)).convert("RGBA")
+    preview = _write_result(img, res, req["output"], req.get("bg", "transparent"),
+                            req.get("blur", background.STRENGTH_DEFAULT), want_preview=True)
+    out({"type": "recomposited", "output": req["output"], "preview": preview,
+         "frames": 1, "id": rid})
 
 
 # ---------------------------------------------------------------------------
@@ -1062,6 +1162,7 @@ _HANDLERS = {
     "single": handle_single,
     "batch": handle_batch,
     "gif": handle_gif,
+    "recomposite": handle_recomposite,
     "convert": handle_convert,
     "frames": handle_frames,
     "seg_load": handle_seg_load,
