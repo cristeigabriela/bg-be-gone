@@ -390,6 +390,8 @@ class BatchPage:
         self.output: Optional[str] = None
         self._images = []                  # the scanned folder: [(path, Animation)]
         self._scanned = None               # the folder the gallery shows, once read
+        self._chosen = DEFAULT_OUTPUT.chosen   # the format last picked; see _read_output
+        self._format_handler = 0
         self._scan_token = None
         self._run = Run.IDLE
         self._runs = 0                     # runs so far, to name each one's thumbnail folder
@@ -603,7 +605,8 @@ class BatchPage:
                 self._set_folder(key, folder.get_path())
         self._show_output(_restored_output(self._host.setting))
         self.bg_toggle.connect("notify::active-name", lambda *_: self._on_output_changed())
-        self.format_toggle.connect("notify::active-name", lambda *_: self._on_output_changed())
+        self._format_handler = self.format_toggle.connect(
+            "notify::active-name", lambda *_: self._on_format_picked())
         self.blur_row.connect("notify::value", lambda *_: self._on_output_changed())
         self.colour_btn.connect("notify::rgba", lambda *_: self._on_output_changed())
         self.matting_row.connect("notify::active", lambda *_: self._on_output_changed())
@@ -619,19 +622,25 @@ class BatchPage:
         self.colour_btn.set_rgba(rgba)
         self.format_toggle.set_active_name(formats.batch_output_key(out.chosen))
         self.matting_row.set_active(out.matting is Matting.ON)
+        self._chosen = out.chosen
         self._out = out
 
+    def _on_format_picked(self):
+        """The person picked a format: the one kept, whatever the background."""
+        self._chosen = formats.BATCH_OUTPUTS.get(self.format_toggle.get_active_name(),
+                                                 formats.PNG)
+        self._on_output_changed()
+
     def _read_output(self):
-        """The Output card's choices, as its widgets show them."""
+        """The Output card's choices: its widgets, and the format last picked.
+
+        The format toggle shows what a run writes, which follows the
+        background; the format picked is kept apart, so JPEG comes back
+        with a flat background after a turn through Remove.
+        """
         behind = Background(self.bg_toggle.get_active_name() or Background.REMOVE.value)
-        chosen = formats.BATCH_OUTPUTS.get(self.format_toggle.get_active_name(), formats.PNG)
-        # A disabled JPEG toggle can still be the active one: keep the person's
-        # choice, which `format` sets aside while the background is transparent.
-        if (chosen is formats.PNG and self._out.chosen is formats.JPEG
-                and behind is Background.REMOVE):
-            chosen = formats.JPEG
         return Output(behind, _hex(self.colour_btn.get_rgba()),
-                      int(self.blur_row.get_value()), chosen,
+                      int(self.blur_row.get_value()), self._chosen,
                       Matting.ON if self.matting_row.get_active() else Matting.OFF)
 
     def _on_output_changed(self):
@@ -644,11 +653,20 @@ class BatchPage:
         for colour, mark in self._swatches:
             mark.set_visible(colour == out.colour)
         # JPEG can't hold the transparency: offered only on a flat background.
+        # Enabled before it's shown, and disabled only once it isn't: the group
+        # won't show a disabled toggle, and picks another itself if the shown
+        # one is disabled.
         jpeg = self.format_toggle.get_toggle_by_name(formats.batch_output_key(formats.JPEG))
-        jpeg.set_enabled(out.alpha is formats.Alpha.FLATTENED)
+        flat = out.alpha is formats.Alpha.FLATTENED
+        if flat:
+            jpeg.set_enabled(True)
         shown = formats.batch_output_key(out.format)
         if self.format_toggle.get_active_name() != shown:
-            self.format_toggle.set_active_name(shown)
+            # Showing what a run writes isn't the person picking a format.
+            with self.format_toggle.handler_block(self._format_handler):
+                self.format_toggle.set_active_name(shown)
+        if not flat:
+            jpeg.set_enabled(False)
         if out.format is not out.chosen:
             self.format_hint.set_text("JPEG can't keep a transparent background, so this "
                                       "writes PNG. Pick Blur or Colour to write JPEG.")
