@@ -3,6 +3,7 @@
 Uses rembg's smallest model (u2netp, ~5 MB), downloaded on first use into
 U2NET_HOME; CI caches it.
 """
+import importlib.metadata
 import json
 import os
 import shutil
@@ -13,6 +14,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+import modelinfo
 from workerpipe import BACKGROUND_PIXEL, REPLY_TIMEOUT_S, SUBJECT_PIXEL, TESTDATA, WORKER
 
 
@@ -48,12 +50,34 @@ def test_a_single_cutout_succeeds(worker, tmp_path):
 
 def test_the_ready_message_carries_every_field_the_frontend_reads(worker):
     assert set(worker.ready) == {"type", "models", "providers", "bgremove", "seg",
-                                 "seg_models", "engines", "settings"}, \
+                                 "seg_models", "engines", "engine", "settings"}, \
         "the frontend reads each of these on start-up"
     assert worker.ready["engines"][0] == "ort", "ONNX Runtime is always on offer"
     assert worker.ready["providers"][-1] == "CPUExecutionProvider", \
         "the CPU is always the last provider, so the status bar always has one to show"
     assert "u2netp" in worker.ready["models"], "rembg's models are listed"
+
+
+def test_every_model_the_worker_lists_is_described_or_left_out_on_purpose(worker):
+    unaccounted = (set(worker.ready["models"]) - set(modelinfo.BG_MODELS)
+                   - set(modelinfo.NOT_OFFERED))
+    # The worker runs on this interpreter, so this is the rembg it lists.
+    rembg = importlib.metadata.version("rembg")
+    assert not unaccounted, \
+        "rembg %s lists models with no modelinfo entry or NOT_OFFERED reason: %s" % (
+            rembg, sorted(unaccounted))
+
+
+def test_every_model_the_picker_offers_is_one_the_worker_runs(worker):
+    unknown = set(modelinfo.BG_MODELS) - set(worker.ready["models"])
+    assert not unknown, "a picker entry the worker can't load: %s" % sorted(unknown)
+
+
+def test_every_segment_model_the_worker_lists_is_described(worker):
+    rungs = {m["rung"] for m in worker.ready["seg_models"]}
+    assert rungs, "the CPU worker has segmentation"
+    assert rungs == set(modelinfo.SEG_MODELS), \
+        "Segment's picker and the worker must offer the same models"
 
 
 def test_with_no_engine_set_start_up_says_nothing_but_ready(start_worker, engine_env):

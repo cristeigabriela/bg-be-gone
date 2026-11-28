@@ -29,6 +29,8 @@ import numpy as np
 from PIL import Image, ImageFilter
 import onnxruntime as ort
 
+import modelinfo
+from engines.selection import Engine
 from plat import config_dir, models_dir, probe_vram
 
 # ---------------------------------------------------------------------------
@@ -47,17 +49,20 @@ _STD = np.array([0.229, 0.224, 0.225], np.float32)
 # ---------------------------------------------------------------------------
 # Model registry / ladder
 # ---------------------------------------------------------------------------
-# Peak dedicated VRAM (MiB) each SAM 2.1 model used to segment everything on a
-# 1600x1598 photo, measured on DirectML on 2026-11-27.
-_MEASURED_PEAK_MIB = {"large": 3041, "base_plus": 2591, "small": 2392, "tiny": 2347}
-# Headroom over the measured peak: a bigger photo, another provider, the driver.
+# Headroom over a model's measured peak VRAM: a bigger photo, another provider,
+# the driver.
 _GATE_FACTOR = 1.25
 _GATE_SLACK_MIB = 512
 
 
 def _gate(rung):
-    """The free VRAM (MiB) Auto wants before it picks `rung`."""
-    return round(_MEASURED_PEAK_MIB[rung] * _GATE_FACTOR) + _GATE_SLACK_MIB
+    """The free VRAM (MiB) Auto wants before it picks `rung`.
+
+    The peak is modelinfo's: what the SAM 2.1 model used to segment everything
+    on a 1600x1598 photo, measured on DirectML. The pickers show the same number.
+    """
+    peak = modelinfo.SEG_MODELS[rung].vram_mib(Engine.ORT)
+    return round(peak * _GATE_FACTOR) + _GATE_SLACK_MIB
 
 
 # ``vram_gate`` is the minimum *free* VRAM (MiB) for auto-selection to pick this

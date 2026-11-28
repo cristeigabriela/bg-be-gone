@@ -83,6 +83,24 @@ def test_pytorch_is_on_offer_when_installed(start_worker, torch_env):
     assert w.ready["engines"] == ["ort", "torch"], "the frontend shows the Engine setting"
 
 
+@pytest.mark.parametrize(
+    "asked, expected",
+    [
+        # Nothing asks for PyTorch: ONNX Runtime, as every install starts.
+        ({}, "ort"),
+        # Asked for and installed: PyTorch, before its start-up has even run.
+        ({"BGBG_ENGINE": "torch"}, "torch"),
+        # Asked for but switched off: ONNX Runtime, the engine that will run.
+        ({"BGBG_ENGINE": "torch", "BGBG_NO_TORCH": "1"}, "ort"),
+    ],
+    ids=["nothing asked", "pytorch asked", "pytorch switched off"],
+)
+def test_ready_names_the_engine_that_runs_birefnet(start_worker, torch_env, asked, expected):
+    w = start_worker(dict(torch_env, **asked))
+    assert w.ready["engine"] == expected, \
+        "the frontend shows this engine's VRAM from the start"
+
+
 @pytest.mark.parametrize("switch", ["BGBG_NO_TORCH", "BGBG_NO_ROCM"])
 def test_a_kill_switch_takes_pytorch_off_the_table(start_worker, torch_env, switch):
     env = dict(torch_env, BGBG_ENGINE="torch", **{switch: "1"})
@@ -120,6 +138,25 @@ def test_a_birefnet_job_without_a_gpu_runs_on_onnx_runtime_and_says_why(
     notices = [r["message"] for r in seen if r.get("type") == "notice"]
     assert any("sees no ROCm or CUDA GPU" in m and "ONNX Runtime" in m for m in notices), \
         "the user hears why PyTorch wasn't used"
+
+
+def test_a_session_that_falls_back_says_which_engine_really_runs_it(
+        start_worker, torch_env, tmp_path):
+    """ready names PyTorch, the start-up choice; this model then fell back.
+
+    The device reply names the model and its engine, so the pickers show the
+    cost of what runs (u2netp stands in for BiRefNet, as above).
+    """
+    command = [sys.executable, str(TESTDATA / "torch_fallback_worker.py"), str(WORKER.parent)]
+    w = start_worker(dict(torch_env, BGBG_ENGINE="torch"), command=command)
+    assert w.ready["engine"] == "torch", "PyTorch is the start-up choice"
+    _, seen = w.ask(
+        {"op": "single", "model": "u2netp", "id": 3,
+         "input": str(TESTDATA / "subject.png"), "output": str(tmp_path / "cutout.png")},
+        until={"done_single", "error"})
+    devices = [(r.get("model"), r.get("engine")) for r in seen if r.get("type") == "device"]
+    assert devices == [("u2netp", "ort")], \
+        "the session that was made runs on ONNX Runtime, and the reply says so"
 
 
 def test_a_loader_thread_that_cannot_start_leaves_onnx_runtime_in_charge(monkeypatch):

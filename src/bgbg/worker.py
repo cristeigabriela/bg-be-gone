@@ -36,12 +36,14 @@ BG is "transparent", "blur" or "#rrggbb" to flatten onto.
 Responses (one JSON object per line on stdout):
   {"type":"ready","models":[...],"providers":[...],"seg":bool,"bgremove":bool,
    "seg_models":[{"rung":R,"label":L}],"engines":["ort"]|["ort","torch"],
+   "engine":"ort"|"torch",                   # what runs BiRefNet
    "settings":P}                             # the settings.json this worker reads
   {"type":"engine_status","engine":"ort"|"torch","state":"ready"|"failed"|...,
    "reason":str|null,"device":str|null,"id":N}
   {"type":"loading","model":M,"id":N}
   {"type":"download","model":M,"done":bytes,"total":bytes,"id":N}   # first use
-  {"type":"device","provider":P,"label":L,"gpu":bool,"id":N}
+  {"type":"device","provider":P,"label":L,"gpu":bool,"model":M,"engine":"ort"|"torch",
+   "id":N}                                  # a session made: what runs it, for that model
   {"type":"progress","done":i,"total":n,"name":str,"id":N}
   {"type":"done_single","output":P,"preview":P,"seconds":f,"device":D,"id":N}
       # D: {"provider","label","gpu"} it last ran on; done_batch and gif_done
@@ -118,7 +120,7 @@ _cpu_sessions = {}          # model -> CPU-only fallback session (low-VRAM path)
 _fallback_notified = set()  # models we've already warned about this session
 _torch_models = set()       # models whose session in _sessions is PyTorch's
 
-# The engine BiRefNet runs on, from engines/selection.py; see _apply_engine_choice.
+# The engine BiRefNet runs on, from engines/selection.py; see _settle_engine.
 _engine = selection.Engine.ORT
 _torch = torch_birefnet.TorchEngine()
 _torch_notified = False     # the user heard why PyTorch isn't used, this choice
@@ -155,7 +157,7 @@ def _torch_session(model, req_id):
             reason = f"{model} didn't load ({type(err).__name__}: {err})"
         else:
             out({"type": "device", "provider": "PyTorch", "label": _torch.device,
-                 "gpu": True, "id": req_id})
+                 "gpu": True, "model": model, "engine": "torch", "id": req_id})
             return session
     else:
         reason = _torch.reason
@@ -243,7 +245,8 @@ def get_session(model, req_id):
         with _rembg_download_progress(_download_reporter(model, req_id)):
             sess = ort_engine.new_session(model, ort_engine.preferred_providers())
         _sessions[model] = sess
-        out({"type": "device", **_device(model, sess), "id": req_id})
+        out({"type": "device", **_device(model, sess), "model": model, "engine": "ort",
+             "id": req_id})
     return _sessions[model]
 
 
@@ -274,7 +277,7 @@ def get_cpu_session(model, req_id):
     # correct-but-slow one look identical from the outside.
     out({"type": "device", "provider": "CPUExecutionProvider",
          "label": ort_engine.PROVIDER_LABELS["CPUExecutionProvider"],
-         "gpu": False, "id": req_id})
+         "gpu": False, "model": model, "engine": "ort", "id": req_id})
     return _cpu_sessions[model]
 
 
@@ -984,29 +987,40 @@ def handle_unload(req):
     out({"type": "unloaded", "scope": freed, "id": rid})
 
 
-def _apply_engine_choice():
+def _settle_engine():
     """Settle which engine runs BiRefNet, from the engine settings, once at
     start-up: a change of the setting starts a new worker.
 
-    Skipped layers go to the worker log. A request for PyTorch that can't be
-    met (switched off, or not installed) reaches the user; otherwise PyTorch
-    starts loading on its own thread, and BiRefNet jobs wait for it.
+    Settled before "ready", which names it, so the frontend shows that
+    engine's VRAM. Skipped layers go to the worker log.
+
+    Returns:
+        Why PyTorch was asked for but can't run (switched off, or not
+        installed), for _apply_engine_choice to tell the user; else None.
     """
     global _engine
     choice = selection.resolve()
     for problem in choice.problems:
         sys.stderr.write(f"engine setting ignored: {problem}\n")
-    wanted = choice.engine
-    if wanted is selection.Engine.TORCH:
+    _engine = choice.engine
+    if _engine is selection.Engine.TORCH:
         off = torch_birefnet.switched_off()
         if off or not torch_birefnet.installed():
+            _engine = selection.Engine.ORT
             why = f"{off} is set" if off else "this install doesn't have PyTorch"
-            _notice(f"The PyTorch engine was asked for by {choice.source.value}, but {why}. "
+            return (f"The PyTorch engine was asked for by {choice.source.value}, but {why}. "
                     "Using ONNX Runtime.")
-            wanted = selection.Engine.ORT
-        else:
-            _torch.start()
-    _engine = wanted
+    return None
+
+
+def _apply_engine_choice(refusal):
+    """Act on _settle_engine's choice, after "ready": tell the user why
+    PyTorch can't run, or start loading it on its own thread, which BiRefNet
+    jobs wait for."""
+    if refusal:
+        _notice(refusal)
+    elif _engine is selection.Engine.TORCH:
+        _torch.start()
 
 
 def handle_engine_status(req):
@@ -1060,6 +1074,7 @@ def _engines_on_offer():
 def _ready():
     out({"type": "ready",
          "engines": _engines_on_offer(),
+         "engine": _engine.value,          # what runs BiRefNet, settled at start-up
          # Resolved here, after plat.prepare_process() may have moved it, so the
          # frontend's Engine row reads and writes the file this worker reads.
          "settings": selection.default_settings_path(),
@@ -1188,8 +1203,9 @@ def _worker_loop(q):
 
 
 def main():
+    refusal = _settle_engine()
     _ready()
-    _apply_engine_choice()
+    _apply_engine_choice(refusal)
     q = queue.Queue()
     threading.Thread(target=_worker_loop, args=(q,), daemon=True).start()
     for line in sys.stdin:
