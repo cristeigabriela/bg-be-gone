@@ -71,11 +71,10 @@ param(
     [switch]$SkipModelDownload
 )
 
-# 'Continue' (not 'Stop'): pacman/uv write progress to stderr, which
-# PowerShell 5.1 turns into a terminating error under 'Stop' when output is
-# captured - even on success. Native exit codes are checked explicitly below;
-# must-succeed cmdlets carry an explicit -ErrorAction Stop.
-$ErrorActionPreference = 'Continue'
+# Any failure stops the install before it says "Installed". The programs it
+# runs (pacman, uv, pip) go through Invoke-NativeShown, with their exit codes
+# checked; the few steps allowed to fail say so where they are.
+$ErrorActionPreference = 'Stop'
 if ($SegmentOnly) { $Variant = 'seg' }
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -226,11 +225,14 @@ if ($Variant -eq 'rocm') {
 # --- 3. Icon and shortcut -------------------------------------------------------
 # The app icon goes in a hicolor theme dir, as install.sh does on Linux; the
 # launcher hands it to GTK, which shows it on the window and taskbar.
+# Recorded before they are written, so a run that fails from here on leaves
+# nothing uninstall.ps1 can't remove, and nothing that blocks a re-run.
+Add-Owned $IconRel, 'bg-be-gone.ico'
+Save-Manifest $gtk
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent (Join-Path $Prefix $IconRel)) -ErrorAction Stop | Out-Null
 Copy-Item -LiteralPath (Join-Path $Root "data\$PngName") (Join-Path $Prefix $IconRel) -Force -ErrorAction Stop
 $icoPath = Join-Path $Prefix 'bg-be-gone.ico'
 New-AppIcon -Png (Join-Path $Root "data\$PngName") -Ico $icoPath
-Add-Owned $IconRel, 'bg-be-gone.ico'
 
 # bg-be-gone's own MSYS2 holds the launch module; a shared one is not ours to
 # write into, so its shortcut names the paths instead.
@@ -244,14 +246,16 @@ if ($lnkPath) {
 # The pre-manifest launcher pair, replaced by the shortcut above.
 foreach ($old in 'BgBeGone.cmd', 'BgBeGone.vbs') {
     if ($legacy -and $owned.Contains($old)) {
-        Remove-Item -LiteralPath (Join-Path $Prefix $old) -Force -ErrorAction SilentlyContinue
+        # Tolerated: the new shortcut works without this cleanup.
+        try { Remove-Item -LiteralPath (Join-Path $Prefix $old) -Force } catch { Write-Warning "Could not remove the old $($old): $_" }
         $null = $owned.Remove($old)
     }
 }
 if ($legacy) {
     $oldLnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\bg-be-gone.lnk'
     if ($shortcuts.Contains($oldLnk) -and $oldLnk -ne $lnkPath) {
-        Remove-Item -LiteralPath $oldLnk -Force -ErrorAction SilentlyContinue
+        # Tolerated, as above.
+        try { Remove-Item -LiteralPath $oldLnk -Force } catch { Write-Warning "Could not remove the old shortcut: $_" }
         $null = $shortcuts.Remove($oldLnk)
     }
 }
@@ -277,6 +281,12 @@ if ($Variant -eq 'seg') {
     } else {
         @((Join-Path $AppDir 'prefetch.py'), 'onnx', 'birefnet-general', (Join-Path $ModelData 'u2net'))
     }
-    $code = Invoke-WorkerPython -WorkerDir $WorkerDir -AppDir $AppDir -Arguments $fetch
+    # Tolerated: the install is complete, and the app downloads the model on first use.
+    try {
+        $code = Invoke-WorkerPython -WorkerDir $WorkerDir -AppDir $AppDir -Arguments $fetch
+    } catch {
+        Write-Warning "The model download couldn't start: $_"
+        $code = 1
+    }
     if ($code -ne 0) { Write-Warning "The model download failed; the app will download it on first use." }
 }

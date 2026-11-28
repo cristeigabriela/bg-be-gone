@@ -31,9 +31,9 @@ param(
     [string]$Dest
 )
 
-# 'Continue', not 'Stop': uv writes progress to stderr, which PowerShell 5.1
-# turns into a terminating error under 'Stop'. Exit codes are checked instead.
-$ErrorActionPreference = 'Continue'
+# Any failure stops the build. uv and pip run through Invoke-NativeShown,
+# with their exit codes checked.
+$ErrorActionPreference = 'Stop'
 
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $AppDir = Join-Path (Split-Path -Parent $Here) 'src\bgbg'
@@ -71,8 +71,13 @@ try {
     Write-Host "==> The new worker is ready: $($ready.providers -join ', ')"
     Complete-Worker $staged
 } catch {
-    # The staging folder is this run's own, so it goes whole.
-    if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged -Recurse -Force -ErrorAction SilentlyContinue }
+    # The staging folder is this run's own, so it goes whole. Tolerated, but
+    # said: a leftover must not hide the error that brought us here.
+    try {
+        if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged -Recurse -Force }
+    } catch {
+        Write-Warning "Could not remove $($staged): $_"
+    }
     throw
 }
 

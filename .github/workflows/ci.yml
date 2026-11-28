@@ -121,6 +121,10 @@ jobs:
       - name: Tests
         run: python -m pytest tests -q
 
+      - name: Uninstall waits for helpers and refuses while bg-be-gone runs
+        shell: pwsh
+        run: ./packaging/test-uninstall-running.ps1
+
   # The worker as releases build it: a standalone CPython from the real script,
   # probed for "ready" before it is kept.
   windows-worker:
@@ -202,6 +206,11 @@ jobs:
           $photo = Join-Path $photos 'retrato é.png'
           Copy-Item tests/testdata/subject.png $photo
           ./packaging/test-windows-launch.ps1 -Shortcut $env:BGBG_LNK -Open $photo -Expect seg
+
+      # A second install, on the MSYS2 above, whose shortcut step can't succeed.
+      - name: A failed step fails the install
+        shell: pwsh
+        run: ./packaging/test-install-failure.ps1 -Msys2Root "$env:BGBG_PREFIX\msys64" -Prefix "$env:RUNNER_TEMP\failtest\bg-be-gone"
 
       - name: Uninstall removes only what it installed
         shell: pwsh

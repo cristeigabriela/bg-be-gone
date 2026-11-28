@@ -97,6 +97,10 @@ if (Test-Path -LiteralPath $ManifestPath) {
     Write-Host "Nothing at $Prefix was installed by bg-be-gone's install.ps1; no install files removed."
 }
 
+# Nothing is removed while bg-be-gone runs or a file of it is open, so an
+# uninstall never stops halfway.
+if ($folders.Count) { Assert-InstallIdle -Roots @($folders | ForEach-Object { Join-Path $Prefix $_ }) }
+
 # A shortcut goes only when it still launches this install, so uninstalling a
 # test install under -Prefix leaves the real one's shortcut alone.
 foreach ($lnk in $shortcuts) {
