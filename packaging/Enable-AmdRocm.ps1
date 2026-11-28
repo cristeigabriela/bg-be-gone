@@ -36,7 +36,10 @@ param(
     [switch]$WaitOnExit
 )
 
-$ErrorActionPreference = 'Continue'   # pip writes progress to stderr; exit codes are checked
+# Any failure stops it, and the directml worker stays. pip runs through
+# Invoke-NativeShown and robocopy in a scope of its own, with their exit
+# codes checked.
+$ErrorActionPreference = 'Stop'
 
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Import-Module (Join-Path $Here 'BgBeGone.Windows.psm1') -Force -ErrorAction Stop
@@ -116,7 +119,7 @@ function Enable-Rocm {
     $staged = New-UniqueName $WorkerDir '.new'
     Write-Host "==> Copying the worker to $staged"
     # robocopy exit codes below 8 mean success; 8 and up mean some files failed.
-    robocopy $WorkerDir $staged /E /NFL /NDL /NJH /NJS /NP | Out-Null
+    & { $ErrorActionPreference = 'Continue'; robocopy $WorkerDir $staged /E /NFL /NDL /NJH /NJS /NP | Out-Null }
     if ($LASTEXITCODE -ge 8) { throw "Copying the worker failed (robocopy $LASTEXITCODE)" }
 
     try {
@@ -136,7 +139,8 @@ function Enable-Rocm {
         Complete-Worker $staged
     } catch {
         # The staging folder is this run's own, so it goes whole.
-        Remove-Item -LiteralPath $staged -Recurse -Force -ErrorAction SilentlyContinue
+        # Tolerated, but said: a leftover must not hide the error that brought us here.
+        try { Remove-Item -LiteralPath $staged -Recurse -Force } catch { Write-Warning "Could not remove $($staged): $_" }
         throw
     }
 
