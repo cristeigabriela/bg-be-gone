@@ -23,7 +23,9 @@ Requests (one JSON object per line on stdin):
   {"op":"gif","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":S,
    "rot":0..3,"fh":bool,"fv":bool,"keep_dir":D?,"id":N}   # per-frame removal;
                                              # GIF or WebP (animated) by output
-  {"op":"convert","input":P,"output":P,"id":N}   # re-encode as output's format
+  {"op":"convert","input":P,"output":P,"max_size":int,"id":N}
+      # re-encode as output's format; max_size (optional) shrinks it to fit a
+      # square that size, upright, for a thumbnail
   {"op":"frames","input":P,"id":N}           # count an image's frames
   {"op":"cancel","id":N}     # stop request N: running, or skipped once it's due
   {"op":"models"}
@@ -556,11 +558,19 @@ def handle_convert(req):
     The frontend uses it to preview a source GdkPixbuf can't decode (no loader
     for HEIC or AVIF, say) and to save a result as WebP or JPEG. Only the first
     frame is written; "frames" tells the frontend whether the source animates.
+
+    With "max_size", the Batch page's gallery gets a thumbnail: shrunk to fit,
+    and turned upright as GdkPixbuf turns the thumbnails it decodes itself.
     """
     im = open_image(req["input"])
+    frames = getattr(im, "n_frames", 1)
+    if req.get("max_size"):
+        side = int(req["max_size"])
+        im = ImageOps.exif_transpose(_plain(im))
+        im.thumbnail((side, side))
     save_image(im, req["output"])
-    out({"type": "converted", "output": req["output"],
-         "frames": getattr(im, "n_frames", 1), "id": req.get("id")})
+    out({"type": "converted", "output": req["output"], "frames": frames,
+         "id": req.get("id")})
 
 
 def handle_frames(req):
