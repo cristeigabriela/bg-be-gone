@@ -1680,16 +1680,18 @@ class Window(Adw.ApplicationWindow):
                 pick, modelinfo.SEG_MODELS.get(loaded["rung"]), selection.Engine.ORT,
                 why=_seg_reason(loaded), name=loaded.get("model"),
                 device=Device.GPU if loaded.get("gpu") else Device.CPU)
-            adv = "Model: %s" % self._seg_model_name()
-            if pick is Pick.AUTO:
-                adv += " (Auto)"
+            label = self._seg_model_name() + (" (Auto)" if pick is Pick.AUTO else "")
+            adv = "Model: " + modelinfo.model_summary(
+                label, modelinfo.SEG_MODELS.get(loaded["rung"]), selection.Engine.ORT,
+                device=Device.GPU if loaded.get("gpu") else Device.CPU)
         elif choice == SEG_AUTO:
             text = "Auto · picks by free VRAM when you segment"
             adv = "Model: Auto"
         else:
             text = modelinfo.row_subtitle(Pick.MANUAL, modelinfo.SEG_MODELS.get(choice),
                                           selection.Engine.ORT)
-            adv = "Model: %s" % self._seg_model_name()
+            adv = "Model: " + modelinfo.model_summary(
+                self._seg_model_name(), modelinfo.SEG_MODELS.get(choice), selection.Engine.ORT)
         self.seg_model_row.set_subtitle(text)
         self.seg_adv.set_subtitle(adv)
 
