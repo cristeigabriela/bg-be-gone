@@ -1158,6 +1158,8 @@ class Window(Adw.ApplicationWindow):
             return
         if self._job_in_flight():
             return
+        if self._worker_state is WorkerState.DOWN:
+            return          # Restart starts the new worker, and that applies the change
         label, self._engine_switch = self._engine_switch, None
         old = self.worker
         self.seg_loaded_for = None     # the new worker holds no encoded image
@@ -2584,6 +2586,8 @@ class Window(Adw.ApplicationWindow):
                                    % _exit_code_text(msg["code"]))
         elif t == "ready":
             self.worker.started()
+            if self._worker_state is WorkerState.DOWN:
+                self._show_worker_up()      # whatever started it, a worker is up
             self._offer_engines(msg.get("engines") or ["ort"], msg.get("settings"))
             provs = msg.get("providers") or []
             if provs:
@@ -2928,11 +2932,18 @@ class Window(Adw.ApplicationWindow):
         self.worker.shutdown()
         # Before the new worker exists, so none of the old requests waits on it.
         self._end_requests_in_flight()
+        # The new worker reads the saved Engine setting at start-up: a change
+        # still waiting for a worker is applied by this start.
+        self._engine_switch = None
         self._start_worker(first_id=self.worker.next_id)
         if not self.worker.ok:
             self._show_worker_down("Could not start the background process (%s)."
                                    % self.worker.error)
             return
+        self._show_worker_up()
+
+    def _show_worker_up(self):
+        """A worker is back: take the banner down and offer the actions again."""
         self._worker_state = WorkerState.UP
         self.worker_banner.set_revealed(False)
         self.device_lbl.set_text("Detecting device…")
