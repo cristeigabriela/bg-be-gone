@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+import modelinfo
 from workerpipe import BACKGROUND_PIXEL, REPLY_TIMEOUT_S, SUBJECT_PIXEL, TESTDATA, WORKER
 
 
@@ -54,6 +55,25 @@ def test_the_ready_message_carries_every_field_the_frontend_reads(worker):
     assert worker.ready["providers"][-1] == "CPUExecutionProvider", \
         "the CPU is always the last provider, so the status bar always has one to show"
     assert "u2netp" in worker.ready["models"], "rembg's models are listed"
+
+
+def test_every_model_the_worker_lists_is_described_or_left_out_on_purpose(worker):
+    unaccounted = (set(worker.ready["models"]) - set(modelinfo.BG_MODELS)
+                   - set(modelinfo.NOT_OFFERED))
+    assert not unaccounted, \
+        "each model needs a modelinfo entry or a NOT_OFFERED reason: %s" % sorted(unaccounted)
+
+
+def test_every_model_the_picker_offers_is_one_the_worker_runs(worker):
+    unknown = set(modelinfo.BG_MODELS) - set(worker.ready["models"])
+    assert not unknown, "a picker entry the worker can't load: %s" % sorted(unknown)
+
+
+def test_every_segment_model_the_worker_lists_is_described(worker):
+    rungs = {m["rung"] for m in worker.ready["seg_models"]}
+    assert rungs, "the CPU worker has segmentation"
+    assert rungs == set(modelinfo.SEG_MODELS), \
+        "Segment's picker and the worker must offer the same models"
 
 
 def test_with_no_engine_set_start_up_says_nothing_but_ready(start_worker, engine_env):
