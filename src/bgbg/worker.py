@@ -55,7 +55,7 @@ Responses (one JSON object per line on stdout):
   {"type":"seg_ready","rung":R,"model":L,"provider":P,"label":L,"gpu":bool,
    "mode":auto|manual|fallback,"family":str,"vram_free":MiB|null,"id":N}
       # vram_free: what Auto's pick was based on; null when nothing was probed
-  {"type":"seg_progress","done":i,"total":n,"id":N}
+  {"type":"seg_progress","phase":"points|layers","done":i,"total":n,"id":N}
   {"type":"seg_objects","label_map":P,"count":n,"objects":[...],"id":N}
   {"type":"seg_mask","mask":P,"score":f,"bbox":[x,y,w,h],"id":N}
   {"type":"seg_extracted","output":P,"seconds":f,"id":N}
@@ -698,6 +698,8 @@ def handle_gif(req):
 # Segmentation
 # ---------------------------------------------------------------------------
 _cancel = threading.Event()
+# How often Segment everything's progress goes out, at most.
+_SEG_REPORT_S = 0.1
 # {session, image, input, rung, size, maskdir, objects, prev_low}; an unload
 # sets only session (and prev_low) to None.
 _seg = None
@@ -771,16 +773,35 @@ def handle_seg_everything(req):
     gpu = session.provider() in ort_engine.GPU_PROVIDERS
     pps = int(req.get("points_per_side") or (32 if gpu else 16))
 
-    def progress(done, total):
-        out({"type": "seg_progress", "done": done, "total": total, "id": rid})
+    def reporter(phase):
+        """progress(done, total) for `phase`, sent at most every _SEG_REPORT_S and
+        always at the end, so a 1,936-point grid doesn't flood the window."""
+        last = [0.0]
+
+        def progress(done, total):
+            now = time.monotonic()
+            if done < total and now - last[0] < _SEG_REPORT_S:
+                return
+            last[0] = now
+            out({"type": "seg_progress", "phase": phase, "done": done,
+                 "total": total, "id": rid})
+        return progress
 
     t = time.time()
     masks = session.everything(points_per_side=pps, cancel=_cancel,
-                               progress=progress)
+                               progress=reporter("points"))
     if _cancel.is_set():
         out({"type": "seg_canceled", "id": rid})
         return
-    maps, objs = seg.save_objects(masks, _seg["size"], _seg["maskdir"], f"e{rid}")
+    try:
+        maps, objs = seg.save_objects(masks, _seg["size"], _seg["maskdir"], f"e{rid}",
+                                      cancel=_cancel, progress=reporter("layers"))
+    except seg.SegCanceled:
+        out({"type": "seg_canceled", "id": rid})
+        return
+    if _cancel.is_set():         # a cancel at the last moment still keeps the old objects
+        out({"type": "seg_canceled", "id": rid})
+        return
     _seg["objects"] = objs
     out({"type": "seg_objects", "label_map": maps["label"],
          "general_map": maps["general"], "depth_map": maps["depth"],

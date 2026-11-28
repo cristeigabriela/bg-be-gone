@@ -2393,7 +2393,10 @@ class Window(Adw.ApplicationWindow):
         elif t == "seg_progress":
             # The scan shimmer conveys activity; keep a calm static label, but
             # also drive the shared footer progress bar.
-            self.seg_status.set_text("Finding objects…")
+            if msg.get("phase") == "layers":
+                self.seg_status.set_text("Building layers…")
+            else:
+                self.seg_status.set_text("Finding objects…")
             self._footer_progress(msg["done"], msg["total"])
         elif t == "seg_objects":
             self.seg_objects = msg["objects"]

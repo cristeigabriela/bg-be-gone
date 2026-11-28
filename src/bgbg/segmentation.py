@@ -99,6 +99,14 @@ class ComputeError(SegError):
     Retry the same model on CPU rather than dropping to a smaller one."""
 
 
+class SegCanceled(SegError):
+    """The caller's cancel event was set while the work was running."""
+
+    def __init__(self, stage):
+        super().__init__(f"canceled while {stage}")
+        self.stage = stage
+
+
 class SegAcquireError(SegError):
     """Getting a model's files failed, as opposed to loading or running them.
 
@@ -296,12 +304,16 @@ def _bbox_overlap(a, b):
     return not (ax + aw <= bx or bx + bw <= ax or ay + ah <= by or by + bh <= ay)
 
 
-def _nms(records, iou_thresh=0.7, max_objects=256):
-    """Greedy IoU-NMS. ``records`` = list of ``(score, mask_bool)``. Bbox
-    pre-filter then mask IoU; returns survivors sorted by score desc."""
+def _nms(records, iou_thresh=0.7, max_objects=256, cancel=None):
+    """Greedy IoU-NMS. ``records`` = list of ``(score, mask_bool, ...)``; any
+    further items ride along. Bbox pre-filter then mask IoU; returns the
+    surviving records sorted by score desc, or nothing once ``cancel`` is set."""
     records = sorted(records, key=lambda r: r[0], reverse=True)
     kept, kept_bb = [], []
-    for score, mask in records:
+    for rec in records:
+        if cancel is not None and cancel.is_set():
+            return []
+        mask = rec[1]
         bb = _bbox(mask)
         if bb[2] == 0:
             continue
@@ -311,7 +323,7 @@ def _nms(records, iou_thresh=0.7, max_objects=256):
                 drop = True
                 break
         if not drop:
-            kept.append((score, mask))
+            kept.append(rec)
             kept_bb.append(bb)
             if len(kept) >= max_objects:
                 break
@@ -458,13 +470,20 @@ class SamSession:
             **prompts})
         return out[0], out[1]
 
-    def _crop_upscale(self, low):
-        """256x256 logits over the padded 1024 input -> original-size bool mask."""
+    def _crop(self, low):
+        """The part of 256x256 logits over the padded 1024 input that covers the image."""
         vh = max(1, round(self._nh / 4.0))
         vw = max(1, round(self._nw / 4.0))
-        crop = np.ascontiguousarray(low[:vh, :vw])
+        return np.ascontiguousarray(low[:vh, :vw])
+
+    def _upscale(self, crop):
+        """Cropped low-res logits (see _crop) -> original-size bool mask."""
         im = Image.fromarray(crop, mode="F").resize(self._size, Image.BILINEAR)
         return np.asarray(im) > 0.0
+
+    def _crop_upscale(self, low):
+        """256x256 logits over the padded 1024 input -> original-size bool mask."""
+        return self._upscale(self._crop(low))
 
     # ---- interactive point prompt ----
     def decode_points(self, points, labels, prev_low=None):
@@ -519,32 +538,46 @@ class SamSession:
                    cancel=None, progress=None):
         """Grid-sampled automatic mask generation. Returns a list of bool masks
         (HxW) sorted largest-first. Cooperative-cancellable via ``cancel`` (a
-        threading.Event); ``progress(done, total)`` is called periodically."""
+        threading.Event); ``progress(done, total)`` is called after every grid
+        point, whether or not it found an object.
+
+        Candidates are filtered and de-duplicated on their low-resolution masks
+        (at most 256x256), and only the survivors are scaled to full size: at
+        4K a full-size candidate took 8.3 MB and one overlap test 11 ms.
+        """
         W, H = self._size
         xs = np.linspace(0, self._nw, points_per_side + 2)[1:-1]
         ys = np.linspace(0, self._nh, points_per_side + 2)[1:-1]
         grid = [(float(x), float(y)) for y in ys for x in xs]
         total = len(grid)
         min_area = max(64, int(min_area_frac * W * H))
-        records = []
+        records = []          # (score, low-res bool mask, low-res logits)
         for i, (x, y) in enumerate(grid):
             if cancel is not None and cancel.is_set():
                 break
             lg, score = self._grid_decode(x, y)
-            if score < pred_iou_thresh:
-                continue
-            if _stability(lg) < stability_thresh:
-                continue
-            mask = self._crop_upscale(lg)
-            if np.count_nonzero(mask) < min_area:
-                continue
-            records.append((score, mask))
-            if progress and (i % 8 == 0 or i == total - 1):
+            if score >= pred_iou_thresh and _stability(lg) >= stability_thresh:
+                crop = self._crop(lg)
+                low = crop > 0.0
+                # The low-res area, in full-size pixels.
+                if np.count_nonzero(low) * (W * H) / low.size >= min_area:
+                    records.append((score, low, crop))
+            if progress:
                 progress(i + 1, total)
 
-        kept = _nms(records, iou_thresh=0.7)
-        kept.sort(key=lambda r: np.count_nonzero(r[1]), reverse=True)
-        return [m for _, m in kept]
+        def canceled():
+            return cancel is not None and cancel.is_set()
+
+        # A cancel after the grid still stops here: de-duplicating and scaling
+        # up hundreds of candidates takes seconds of its own.
+        kept = [] if canceled() else _nms(records, iou_thresh=0.7, cancel=cancel)
+        masks = []
+        for _, _, crop in kept:
+            if canceled():
+                return []
+            masks.append(self._upscale(crop))
+        masks.sort(key=np.count_nonzero, reverse=True)
+        return masks
 
 
 # ---------------------------------------------------------------------------
@@ -826,13 +859,17 @@ def _save_idmap(arr, path):
     return path
 
 
-def save_objects(masks, size, out_dir, prefix, feather=0.8):
+def save_objects(masks, size, out_dir, prefix, feather=0.8, cancel=None, progress=None):
     """Write soft per-object mask PNGs + three lookup maps for hit-testing
     (``masks`` is largest-first). Returns ``(maps, objects)`` where maps has:
       - ``label``   : the most *specific* object per pixel (smallest on top)
       - ``general`` : the most *general* object per pixel (largest on top)
       - ``depth``   : how many objects overlap each pixel (an ``L`` PNG)
-    ids are encoded ``R + G*256`` (0 = background)."""
+    ids are encoded ``R + G*256`` (0 = background).
+
+    Each object takes ~0.4 s at 4K (its PNG and outline), so ``progress(done,
+    total)`` is called after each one and ``cancel`` (a threading.Event) is
+    checked before each; a set cancel raises SegCanceled."""
     W, H = size
     os.makedirs(out_dir, exist_ok=True)
     label = np.zeros((H, W), np.uint16)      # specific: smallest painted last
@@ -840,6 +877,10 @@ def save_objects(masks, size, out_dir, prefix, feather=0.8):
     depth = np.zeros((H, W), np.uint16)
     objs = []
     for idx, mask in enumerate(masks):
+        if cancel is not None and cancel.is_set():
+            raise SegCanceled("building layers")
+        if progress and idx:
+            progress(idx, len(masks))
         oid = idx + 1
         label[mask] = oid
         depth += mask
@@ -853,6 +894,10 @@ def save_objects(masks, size, out_dir, prefix, feather=0.8):
         objs.append({"id": oid, "color": "#%02x%02x%02x" % _obj_color(cx, cy),
                      "bbox": [x, y, w, h], "area": int(xs.size), "mask": mp,
                      "contour": contour(mask)})
+    # The lookup maps take a while too: check once more, and count the run as
+    # done only once they are written.
+    if cancel is not None and cancel.is_set():
+        raise SegCanceled("building layers")
     for idx in range(len(masks) - 1, -1, -1):   # largest painted last -> on top
         general[masks[idx]] = idx + 1
     maps = {
@@ -861,6 +906,8 @@ def save_objects(masks, size, out_dir, prefix, feather=0.8):
         "depth": os.path.join(out_dir, f"{prefix}_depth.png"),
     }
     Image.fromarray(np.minimum(depth, 255).astype(np.uint8), "L").save(maps["depth"])
+    if progress and masks:
+        progress(len(masks), len(masks))
     return maps, objs
 
 
