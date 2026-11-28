@@ -715,13 +715,20 @@ function Test-Worker {
       Start worker.py on a worker's interpreter and return its "ready" message.
 
     .DESCRIPTION
-      Runs with the frontend's environment for the worker, and with
-      BGBG_NO_TORCH, so the probe never initialises a GPU. Throws when the
-      worker exits or stays silent instead of answering.
+      Runs with the frontend's environment for the worker. By default with
+      BGBG_NO_TORCH too, so the probe never initialises a GPU.
+
+      -Engine Torch instead runs the worker's real PyTorch start-up (the GPU
+      runtime, torchvision's compiled ops, BiRefNet's code) and asks for its
+      engine_status. It returns @{ Ready; EngineStatus }, and the caller
+      keeps a worker only when EngineStatus.state is "ready".
+
+      Throws when the worker exits or stays silent instead of answering.
     #>
     param(
         [Parameter(Mandatory)][string]$WorkerDir,
         [Parameter(Mandatory)][string]$AppDir,
+        [ValidateSet('None', 'Torch')][string]$Engine = 'None',
         [int]$TimeoutSeconds = 300
     )
     $psi = New-WorkerStartInfo -WorkerDir $WorkerDir -AppDir $AppDir -Arguments @((Join-Path $AppDir 'worker.py'))
@@ -729,26 +736,52 @@ function Test-Worker {
     $psi.RedirectStandardOutput = $true
     $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
     $psi.CreateNoWindow = $true
-    $psi.EnvironmentVariables['BGBG_NO_TORCH'] = '1'
+    if ($Engine -eq 'Torch') {
+        $psi.EnvironmentVariables['BGBG_ENGINE'] = 'torch'
+        foreach ($switch in 'BGBG_NO_TORCH', 'BGBG_NO_ROCM') { $psi.EnvironmentVariables.Remove($switch) }
+    } else {
+        $psi.EnvironmentVariables['BGBG_NO_TORCH'] = '1'
+    }
 
-    $proc = [Diagnostics.Process]::Start($psi)
+    # Windows PowerShell's .NET encodes a child's stdin with the console's
+    # input encoding, and its UTF-8 writes a byte order mark into the pipe at
+    # start-up. The worker can't parse a first request behind it.
+    $consoleEncoding = [Console]::InputEncoding
+    [Console]::InputEncoding = New-Object Text.UTF8Encoding $false
     try {
+        $proc = [Diagnostics.Process]::Start($psi)
+    } finally {
+        [Console]::InputEncoding = $consoleEncoding
+    }
+    try {
+        $stdin = $proc.StandardInput
         $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-        while ($true) {
-            $left = [int]($deadline - (Get-Date)).TotalMilliseconds
-            $read = $proc.StandardOutput.ReadLineAsync()
-            if ($left -le 0 -or -not $read.Wait($left)) {
-                throw "The worker in $WorkerDir sent no ready within $TimeoutSeconds s"
+        function Wait-Reply {
+            param([string]$Type)
+            while ($true) {
+                $left = [int]($deadline - (Get-Date)).TotalMilliseconds
+                $read = $proc.StandardOutput.ReadLineAsync()
+                if ($left -le 0 -or -not $read.Wait($left)) {
+                    throw "The worker in $WorkerDir sent no $Type within $TimeoutSeconds s"
+                }
+                $line = $read.Result
+                if ($null -eq $line) { throw "The worker in $WorkerDir exited before it sent $Type" }
+                try { $msg = $line | ConvertFrom-Json } catch { continue }
+                if ($msg.type -eq $Type) { return $msg }
             }
-            $line = $read.Result
-            if ($null -eq $line) { throw "The worker in $WorkerDir exited before it was ready" }
-            try { $msg = $line | ConvertFrom-Json } catch { continue }
-            if ($msg.type -eq 'ready') { break }
         }
-        $proc.StandardInput.WriteLine('{"op":"shutdown"}')
-        $proc.StandardInput.Close()
+        $ready = Wait-Reply 'ready'
+        $status = $null
+        if ($Engine -eq 'Torch') {
+            $stdin.WriteLine('{"op":"engine_status","id":1}')
+            $stdin.Flush()
+            $status = Wait-Reply 'engine_status'
+        }
+        $stdin.WriteLine('{"op":"shutdown"}')
+        $stdin.Close()
         if (-not $proc.WaitForExit(15000)) { Stop-ProcessTree $proc }
-        return $msg
+        if ($Engine -eq 'Torch') { return @{ Ready = $ready; EngineStatus = $status } }
+        return $ready
     } finally {
         Stop-ProcessTree $proc
         $proc.Dispose()

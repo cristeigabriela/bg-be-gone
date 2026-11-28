@@ -1,4 +1,6 @@
 """Which engine the settings pick: the app setting, BGBG_ENGINE, then the profile."""
+import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -8,7 +10,9 @@ from engines.selection import (
     Source,
     UnknownEngineError,
     UnreadableSettingError,
+    read_setting,
     resolve,
+    save_setting,
 )
 
 ENGINE_DATA = Path(__file__).parent / "testdata" / "engine"
@@ -132,3 +136,18 @@ def test_a_broken_layer_hands_the_choice_to_the_next_one(layers):
     assert (choice.engine, choice.source) == (Engine.TORCH, Source.PROFILE), \
         "an unusable BGBG_ENGINE has no opinion, so the profile still decides"
     assert [p.source for p in choice.problems] == [Source.ENV], "and the bad value is reported"
+
+
+def test_the_engine_setting_is_saved_without_losing_other_settings(tmp_path):
+    """The Engine row writes settings.json; resolve() must read it back as
+    the first layer, and whatever else the file holds stays."""
+    path = tmp_path / "config" / "settings.json"
+    path.parent.mkdir()
+    shutil.copy(ENGINE_DATA / "settings-other-keys.json", path)
+    save_setting(Engine.TORCH, str(path))
+    assert read_setting(str(path)) is Engine.TORCH, "the row shows what it saved"
+    choice = resolve(settings_path=str(path), environ={}, profile_path=str(tmp_path / "none.json"))
+    assert (choice.engine, choice.source) == (Engine.TORCH, Source.SETTING), \
+        "the saved setting is the first layer resolve() reads"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["theme"] == "dark", "other keys are kept"

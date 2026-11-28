@@ -10,6 +10,7 @@ never checks ``os.name`` itself. Each platform module provides, for the worker:
 - ``probe_vram()``: total and free VRAM of the GPU, or None.
 - ``models_dir()`` and ``config_dir()``: where downloaded models and settings
   live. Read them after ``prepare_process()``, which can change them.
+- ``kernel_cache_dir()``: where the PyTorch engine's GPU kernels are cached.
 
 and for the frontend:
 
@@ -26,6 +27,7 @@ if os.name == "nt":
         config_dir,
         default_worker_python,
         frontend_started,
+        kernel_cache_dir,
         models_dir,
         prepare_process,
         probe_vram,
@@ -40,6 +42,7 @@ else:
         config_dir,
         default_worker_python,
         frontend_started,
+        kernel_cache_dir,
         models_dir,
         prepare_process,
         probe_vram,
@@ -50,7 +53,6 @@ else:
         worker_log_path,
     )
 
-__all__ = ["config_dir", "default_worker_python", "frontend_started", "models_dir",
-           "prepare_process", "probe_vram", "provider_options", "subprocess_flags",
-           "unusable_providers",
-           "worker_env", "worker_log_path"]
+__all__ = ["config_dir", "default_worker_python", "frontend_started", "kernel_cache_dir",
+           "models_dir", "prepare_process", "probe_vram", "provider_options", "subprocess_flags",
+           "unusable_providers", "worker_env", "worker_log_path"]

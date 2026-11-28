@@ -26,13 +26,17 @@ Requests (one JSON object per line on stdin):
   {"op":"seg_point","points":[[x,y,label],...],"use_prev":bool,"id":N}
   {"op":"seg_extract","ids":[...]|"mask":P,"bg":BG,"blur":int,"output":P,"id":N}
   {"op":"seg_cancel"}
+  {"op":"engine_status","id":N}              # waits for PyTorch's start-up, if any
   {"op":"shutdown"}
 
 BG is "transparent", "blur" or "#rrggbb" to flatten onto.
 
 Responses (one JSON object per line on stdout):
   {"type":"ready","models":[...],"providers":[...],"seg":bool,"bgremove":bool,
-   "seg_models":[{"rung":R,"label":L}]}
+   "seg_models":[{"rung":R,"label":L}],"engines":["ort"]|["ort","torch"],
+   "settings":P}                             # the settings.json this worker reads
+  {"type":"engine_status","engine":"ort"|"torch","state":"ready"|"failed"|...,
+   "reason":str|null,"device":str|null,"id":N}
   {"type":"loading","model":M,"id":N}
   {"type":"device","provider":P,"label":L,"gpu":bool,"id":N}
   {"type":"progress","done":i,"total":n,"name":str,"id":N}
@@ -79,6 +83,7 @@ from PIL import Image, ImageFilter, UnidentifiedImageError  # noqa: E402
 # Imports onnxruntime, then rembg when it is installed.
 from engines import ort as ort_engine  # noqa: E402
 from engines import selection  # noqa: E402
+from engines import torch_birefnet  # noqa: E402  (imports no torch itself)
 import formats  # noqa: E402
 
 # HEIC/HEIF (phone photos) needs libheif; pi-heif is its decode-only build.
@@ -99,6 +104,12 @@ except Exception:  # noqa: BLE001
 _sessions = {}
 _cpu_sessions = {}          # model -> CPU-only fallback session (low-VRAM path)
 _fallback_notified = set()  # models we've already warned about this session
+_torch_models = set()       # models whose session in _sessions is PyTorch's
+
+# The engine BiRefNet runs on, from engines/selection.py; see _apply_engine_choice.
+_engine = selection.Engine.ORT
+_torch = torch_birefnet.TorchEngine()
+_torch_notified = False     # the user heard why PyTorch isn't used, this choice
 
 
 def out(obj):
@@ -106,8 +117,47 @@ def out(obj):
     sys.stdout.flush()
 
 
+def _notice(message, req_id=None):
+    sys.stderr.write(message + "\n")
+    out({"type": "notice", "message": message, "id": req_id})
+
+
+def _torch_session(model, req_id):
+    """A PyTorch session for `model`, or None to run it on ONNX Runtime.
+
+    None when the engine isn't asked for or the model isn't BiRefNet, and
+    when PyTorch failed to start or this model failed to load: the user
+    hears why once, and the job carries on on ONNX Runtime.
+    """
+    global _torch_notified
+    if _engine is not selection.Engine.TORCH or model not in torch_birefnet.MODELS:
+        return None
+    if _torch.wait() is torch_birefnet.EngineState.READY:
+        try:
+            out({"type": "loading", "model": model, "id": req_id})
+            session = _torch.new_session(model)
+        except Exception as err:  # noqa: BLE001  (out of VRAM, a bad download, ...)
+            _torch.release_memory()
+            reason = f"{model} didn't load ({type(err).__name__}: {err})"
+        else:
+            out({"type": "device", "provider": "PyTorch", "label": _torch.device,
+                 "gpu": True, "id": req_id})
+            return session
+    else:
+        reason = _torch.reason
+    if not _torch_notified:
+        _torch_notified = True
+        _notice(f"The PyTorch engine can't run this: {reason}. Using ONNX Runtime.", req_id)
+    return None
+
+
 def get_session(model, req_id):
     if model not in _sessions:
+        session = _torch_session(model, req_id)
+        if session is not None:
+            _sessions[model] = session
+            _torch_models.add(model)
+            return session
         out({"type": "loading", "model": model, "id": req_id})
         sess = ort_engine.new_session(model, ort_engine.preferred_providers())
         active = sess.inner_session.get_providers()
@@ -151,8 +201,13 @@ def _remove_resilient(model, req_id, img, alpha):
         _fallback_notified.discard(model)      # GPU healthy again
         return res
     except Exception as e:
-        if not ort_engine.is_runtime_error(e):
+        # On PyTorch any RuntimeError is a run failure: out of VRAM, a HIP/CUDA
+        # error, or the non-finite mask TorchSession refuses to return.
+        on_torch = model in _torch_models
+        if not (ort_engine.is_runtime_error(e) or (on_torch and isinstance(e, RuntimeError))):
             raise
+        if on_torch:
+            _torch.release_memory()
         if model not in _fallback_notified:
             _fallback_notified.add(model)
             out({"type": "notice",
@@ -639,9 +694,7 @@ def handle_unload(req):
     scope = req.get("scope", "all")
     freed = []
     if scope in ("bg", "all") and (_sessions or _cpu_sessions):
-        _sessions.clear()
-        _cpu_sessions.clear()
-        _fallback_notified.clear()
+        _drop_bg_sessions()
         freed.append("bg")
     if scope in ("seg", "all") and _seg is not None:
         _seg = None
@@ -649,6 +702,43 @@ def handle_unload(req):
     if freed:
         gc.collect()
     out({"type": "unloaded", "scope": freed, "id": rid})
+
+
+def _apply_engine_choice():
+    """Settle which engine runs BiRefNet, from the engine settings, once at
+    start-up: a change of the setting starts a new worker.
+
+    Skipped layers go to the worker log. A request for PyTorch that can't be
+    met (switched off, or not installed) reaches the user; otherwise PyTorch
+    starts loading on its own thread, and BiRefNet jobs wait for it.
+    """
+    global _engine
+    choice = selection.resolve()
+    for problem in choice.problems:
+        sys.stderr.write(f"engine setting ignored: {problem}\n")
+    wanted = choice.engine
+    if wanted is selection.Engine.TORCH:
+        off = torch_birefnet.switched_off()
+        if off or not torch_birefnet.installed():
+            why = f"{off} is set" if off else "this install doesn't have PyTorch"
+            _notice(f"The PyTorch engine was asked for by {choice.source.value}, but {why}. "
+                    "Using ONNX Runtime.")
+            wanted = selection.Engine.ORT
+        else:
+            _torch.start()
+    _engine = wanted
+
+
+def handle_engine_status(req):
+    """Which engine BiRefNet runs on, once PyTorch's start-up (if any) is over.
+
+    The install scripts ask this before they keep a ROCm worker.
+    """
+    status = {"state": "ready", "reason": None, "device": None}
+    if _engine is selection.Engine.TORCH:
+        _torch.wait()
+        status = _torch.status()
+    out({"type": "engine_status", "engine": _engine.value, **status, "id": req.get("id")})
 
 
 # ---------------------------------------------------------------------------
@@ -665,13 +755,34 @@ _HANDLERS = {
     "seg_point": handle_seg_point,
     "seg_extract": handle_seg_extract,
     "unload": handle_unload,
+    "engine_status": handle_engine_status,
 }
 _SEG_OPS = {"seg_load", "seg_everything", "seg_point", "seg_extract"}
 _BG_OPS = {"single", "batch", "gif"}
 
 
+def _drop_bg_sessions():
+    _sessions.clear()
+    _cpu_sessions.clear()
+    _fallback_notified.clear()
+    _torch_models.clear()
+    _torch.release_memory()
+
+
+def _engines_on_offer():
+    """The engines this worker can run, for the frontend's Engine setting."""
+    on_offer = ["ort"]
+    if torch_birefnet.installed() and not torch_birefnet.switched_off():
+        on_offer.append("torch")
+    return on_offer
+
+
 def _ready():
     out({"type": "ready",
+         "engines": _engines_on_offer(),
+         # Resolved here, after plat.prepare_process() may have moved it, so the
+         # frontend's Engine row reads and writes the file this worker reads.
+         "settings": selection.default_settings_path(),
          "models": list(ort_engine.sessions_names) if ort_engine.HAVE_REMBG else [],
          "providers": ort_engine.provider_names(),
          "bgremove": ort_engine.HAVE_REMBG,
@@ -713,25 +824,9 @@ def _worker_loop(q):
         _dispatch(req)
 
 
-def _report_engine_choice():
-    """Say what the engine settings asked for. Only ONNX Runtime exists so far.
-
-    Runs once per start: skipped layers go to the worker log, and a request
-    for PyTorch also reaches the user, since it can't be honoured.
-    """
-    choice = selection.resolve()
-    for problem in choice.problems:
-        sys.stderr.write(f"engine setting ignored: {problem}\n")
-    if choice.engine is selection.Engine.TORCH:
-        message = (f"The PyTorch engine was asked for by {choice.source.value}, but "
-                   "this build doesn't have it yet. Using ONNX Runtime.")
-        sys.stderr.write(message + "\n")
-        out({"type": "notice", "message": message, "id": None})
-
-
 def main():
     _ready()
-    _report_engine_choice()
+    _apply_engine_choice()
     q = queue.Queue()
     threading.Thread(target=_worker_loop, args=(q,), daemon=True).start()
     for line in sys.stdin:

@@ -131,7 +131,9 @@ def test_a_single_cutout_succeeds(worker, tmp_path):
 
 def test_the_ready_message_carries_every_field_the_frontend_reads(worker):
     assert set(worker.ready) == {"type", "models", "providers", "bgremove", "seg",
-                                 "seg_models"}, "the frontend reads each of these on start-up"
+                                 "seg_models", "engines", "settings"}, \
+        "the frontend reads each of these on start-up"
+    assert worker.ready["engines"][0] == "ort", "ONNX Runtime is always on offer"
     assert worker.ready["providers"][-1] == "CPUExecutionProvider", \
         "the CPU is always the last provider, so the status bar always has one to show"
     assert "u2netp" in worker.ready["models"], "rembg's models are listed"
@@ -146,7 +148,7 @@ def test_with_no_engine_set_start_up_says_nothing_but_ready(start_worker, engine
 
 
 def test_asking_for_pytorch_keeps_onnx_runtime_and_says_so(start_worker, engine_env, tmp_path):
-    """Only ONNX Runtime exists so far: a torch request must not break removal.
+    """Without PyTorch installed, a torch request must not break removal.
 
     The worker sees only the CPU, so the provider that runs is known.
     """

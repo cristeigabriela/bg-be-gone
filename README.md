@@ -121,9 +121,12 @@ a failed worker build keeps the previous one. It never overwrites a file it
 didn't create: if one is in the way, it stops before changing anything.
 Options:
 
-- `-Variant directml|cpu|cuda|seg`: `directml` is the default; `cuda` is for
-  NVIDIA cards before the RTX 50 series (on RTX 50, use `directml`); `seg` is
-  the lean, segmentation-only build.
+- `-Variant directml|rocm|cpu|cuda|seg`: `directml` is the default; `rocm`
+  adds AMD's PyTorch build (about 4 GB) so BiRefNet runs natively on an RX
+  6700/6750 XT, where DirectML can't fit it in 12 GB; `cuda` is for NVIDIA
+  cards before the RTX 50 series (on RTX 50, use `directml`); `seg` is the
+  lean, segmentation-only build. With PyTorch installed, Model > Advanced >
+  Engine switches between it and ONNX Runtime.
 - `-Msys2Root C:\msys64`: use an MSYS2 you already have. bg-be-gone never
   changes it; the install checks it has the GTK packages and version needed,
   and prints the `pacman` command to run if not.

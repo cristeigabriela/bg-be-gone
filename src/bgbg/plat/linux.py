@@ -195,6 +195,12 @@ def config_dir():
     return os.path.join(config_home, "bg-be-gone")
 
 
+def kernel_cache_dir():
+    """Where the PyTorch engine's GPU stack keeps compiled kernels (MIOpen's)."""
+    cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(cache_home, "bg-be-gone", "miopen")
+
+
 # ---------------------------------------------------------------------------
 # VRAM probing
 # ---------------------------------------------------------------------------

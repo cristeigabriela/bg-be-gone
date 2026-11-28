@@ -118,6 +118,35 @@ def default_profile_path(environ=os.environ) -> str:
     return environ.get(PROFILE_ENV_VAR) or os.path.join(sys.prefix, "profile.json")
 
 
+def read_setting(settings_path: str | None = None) -> Engine:
+    """The in-app setting alone: what the Engine row shows. AUTO when unset or unreadable."""
+    try:
+        return _from_file(Source.SETTING, settings_path or default_settings_path())
+    except EngineSettingError:
+        return Engine.AUTO
+
+
+def save_setting(engine: Engine, settings_path: str | None = None) -> None:
+    """Write the in-app setting, keeping any other keys the file holds.
+
+    Written beside the file and renamed over it, so the worker never reads
+    half of one.
+    """
+    path = settings_path or default_settings_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError, RecursionError):
+        data = {}
+    data[_ENGINE_KEY] = engine.value
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".part", "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(path + ".part", path)
+
+
 def resolve(settings_path: str | None = None, environ=os.environ,
             profile_path: str | None = None) -> Choice:
     """The engine the settings ask for, and which layer asked.
