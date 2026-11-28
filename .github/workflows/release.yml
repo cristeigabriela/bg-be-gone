@@ -6,12 +6,13 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: "Publish a GitHub release (otherwise build artifacts only)"
+        description: "Publish a GitHub release (otherwise a dry run: build, test and list the assets)"
         type: boolean
         default: false
 
+# Read-only by default; only the publish job may write the release.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   version:
@@ -68,7 +69,7 @@ jobs:
             desktop-file-utils python uv git wget gcc pkgconf meson ninja \
             libxcrypt libxcrypt-compat openssl libffi bzip2 xz zlib sqlite
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       - name: Build AppImage (${{ matrix.variant }})
         env:
@@ -79,25 +80,236 @@ jobs:
           ./packaging/build-appimage.sh
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: bg-be-gone-${{ matrix.variant }}
+          name: linux-${{ matrix.variant }}
           path: dist/*.AppImage
 
-  release:
-    needs: [version, appimage]
-    if: needs.version.outputs.publish == 'true'
-    runs-on: ubuntu-latest
+  windows:
+    needs: version
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # directml replaces the Linux rocm variant (any DirectX 12 GPU). ROCm is
+        # not an asset: the directml build carries tools\Enable-AmdRocm.ps1,
+        # which downloads TheRock's pinned wheels on the user's PC.
+        variant: [cpu, directml, cuda, seg]
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      VARIANT: ${{ matrix.variant }}
+      # Inno Setup 6.7.4, checked against this digest before it runs.
+      INNO_URL: https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe
+      INNO_SHA256: a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
         with:
-          path: dist
+          version: "0.12.7"
+          enable-cache: true
+          cache-dependency-glob: packaging/locks/*.txt
+
+      # Outside the MSYS2 root: install-windows-gtk.ps1 unpacks a new root and
+      # copies the cached package files into it.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ runner.temp }}\pacman-pkg
+          key: msys2-${{ hashFiles('packaging/locks/msys2-*.txt') }}
+
+      # The exact package files in packaging/locks/msys2-ucrt64.txt, never a
+      # rolling update: GTK's rendering differs between releases.
+      - name: Pinned GTK runtime
+        shell: pwsh
+        run: >-
+          ./packaging/install-windows-gtk.ps1 -Msys2Root "$env:RUNNER_TEMP\msys64" -Mode Owned
+          -BuildTools -PackageCache "$env:RUNNER_TEMP\pacman-pkg"
+
+      - name: Collect GTK bundle + app
+        shell: pwsh
+        env:
+          MSYSTEM: UCRT64
+          CHERE_INVOKING: "1"
+        run: |
+          & "$env:RUNNER_TEMP\msys64\usr\bin\bash.exe" -lc "./packaging/build-windows-gtk.sh"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build the ${{ matrix.variant }} worker
+        shell: pwsh
+        run: ./packaging/build-windows-worker.ps1 -Variant $env:VARIANT -Dest dist/BgBeGone/worker
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP 'innosetup.exe'
+          Invoke-WebRequest -Uri $env:INNO_URL -OutFile $setup
+          $actual = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash
+          if ($actual -ne $env:INNO_SHA256) { throw "Inno Setup's SHA-256 is $actual, expected $env:INNO_SHA256" }
+          $dir = Join-Path $env:RUNNER_TEMP 'inno'
+          Start-Process -FilePath $setup -Wait -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /DIR=`"$dir`""
+          "ISCC=$(Join-Path $dir 'ISCC.exe')" >> $env:GITHUB_ENV
+
+      # Fails unless both the zip and the installer exist, aren't empty and are
+      # under 2 GiB.
+      - name: Package zip + installer
+        shell: pwsh
+        run: ./packaging/package-windows.ps1 -Version $env:VERSION -Variant $env:VARIANT -Msys2Root "$env:RUNNER_TEMP\msys64" -Iscc $env:ISCC
+
+      - name: Start the bundle
+        shell: pwsh
+        run: |
+          $expect = if ($env:VARIANT -eq 'seg') { 'seg' } else { 'bgremove' }
+          ./packaging/test-windows-launch.ps1 -Bundle dist/BgBeGone -Expect $expect
+
+      # Install, start from the Start Menu and through Open with, upgrade in
+      # place, then uninstall: only what Setup wrote may go.
+      - name: Install, upgrade and uninstall with Setup
+        shell: pwsh
+        run: |
+          $expect = if ($env:VARIANT -eq 'seg') { 'seg' } else { 'bgremove' }
+          $setup = "dist-out/bg-be-gone-$env:VERSION-$env:VARIANT-win64-setup.exe"
+          $app = Join-Path $env:RUNNER_TEMP 'Programas de José\bg-be-gone'
+          function Invoke-Setup([string]$exe, [string]$extra) {
+            $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /LOG=`"$env:RUNNER_TEMP\setup.log`" $extra"
+            if ($p.ExitCode -ne 0) { Get-Content "$env:RUNNER_TEMP\setup.log" -Tail 60; throw "$exe exited $($p.ExitCode)" }
+          }
+
+          # No tasks: no model download, no desktop icon.
+          Invoke-Setup $setup "/DIR=`"$app`" /TASKS=`"`""
+          $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\bg-be-gone\bg-be-gone.lnk'
+          ./packaging/test-windows-launch.ps1 -Shortcut $lnk -Expect $expect
+          $photo = Join-Path $env:RUNNER_TEMP 'Fotos de José\retrato é.png'
+          New-Item -ItemType Directory -Force (Split-Path $photo) | Out-Null
+          Copy-Item tests/testdata/subject.png $photo
+          ./packaging/test-windows-launch.ps1 -OpenWith bg-be-gone.Image -Open $photo -Expect $expect
+
+          # A file of the user's beside the runtime, and one added inside it.
+          $mine = Join-Path $app 'notes.txt'
+          $inWorker = Join-Path $app 'runtime\worker\added-later.txt'
+          'mine' | Set-Content $mine; 'mine' | Set-Content $inWorker
+
+          Invoke-Setup $setup "/DIR=`"$app`" /TASKS=`"`""
+          ./packaging/test-windows-launch.ps1 -Shortcut $lnk -Expect $expect
+
+          Invoke-Setup (Join-Path $app 'unins000.exe') ''
+          if (-not (Test-Path -LiteralPath $mine)) { throw "uninstall deleted $mine" }
+          if (-not (Get-ChildItem -LiteralPath $app -Recurse -Filter 'added-later.txt')) { throw 'uninstall deleted added-later.txt' }
+          if (Test-Path -LiteralPath (Join-Path $app 'runtime\bin')) { throw 'uninstall left the runtime' }
+          if (Test-Path -LiteralPath $lnk) { throw 'uninstall left the Start Menu entry' }
+          if (Test-Path -LiteralPath 'HKCU:\Software\Classes\bg-be-gone.Image') { throw 'uninstall left the Open with entry' }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          # windows-* apart from linux-*: the assets job downloads each set on its own.
+          name: windows-${{ matrix.variant }}
+          path: |
+            dist-out/*.zip
+            dist-out/*.exe
+
+  # Settles what a release publishes, on dry runs too, so their summary shows
+  # every asset and its size.
+  assets:
+    needs: [version, appimage, windows]
+    # NOTE: a failed Windows build does not hold back the Linux release until
+    # Windows is declared supported; then add needs.windows.result here.
+    if: always() && needs.appimage.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: linux-*
+          path: linux
           merge-multiple: true
 
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
+      # Optional: whatever goes wrong here, the Linux release still ships.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        continue-on-error: true
         with:
-          tag_name: ${{ needs.version.outputs.tag }}
-          name: bg-be-gone ${{ needs.version.outputs.version }}
-          files: dist/*.AppImage
-          generate_release_notes: true
+          pattern: windows-*
+          path: windows
+          merge-multiple: true
+
+      - name: Choose the assets and write SHA256SUMS
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir release
+          mv linux/*.AppImage release/
+          # Windows ships only as a full set: every variant's zip and installer.
+          missing=()
+          for v in cpu directml cuda seg; do
+            for f in "bg-be-gone-$VERSION-$v-win64.zip" "bg-be-gone-$VERSION-$v-win64-setup.exe"; do
+              [ -s "windows/$f" ] || missing+=("$f")
+            done
+          done
+          if [ "${#missing[@]}" -eq 0 ]; then
+            for v in cpu directml cuda seg; do
+              mv "windows/bg-be-gone-$VERSION-$v-win64.zip" "windows/bg-be-gone-$VERSION-$v-win64-setup.exe" release/
+            done
+          else
+            echo "::warning::No Windows assets this release; missing or empty: ${missing[*]}"
+          fi
+
+          cd release
+          files=(*)
+          limit=$((2 * 1024 * 1024 * 1024))   # GitHub rejects release assets of 2 GiB and up
+          echo "| Asset | MiB |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | ---: |" >> "$GITHUB_STEP_SUMMARY"
+          bad=0
+          for f in "${files[@]}"; do
+            size=$(stat -c %s "$f")
+            echo "| $f | $((size / 1024 / 1024)) |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$size" -eq 0 ] || [ "$size" -ge "$limit" ]; then echo "::error::$f is $size bytes"; bad=1; fi
+          done
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
+          exit "$bad"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: release
+          path: release/*
+
+  release:
+    needs: [version, assets]
+    if: always() && needs.version.outputs.publish == 'true' && needs.assets.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Only the assets job's choice: what SHA256SUMS lists, and SHA256SUMS.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: release
+          path: release
+
+      # Into a fresh draft first, so no one sees a half-uploaded release, and
+      # never over one already published: its assets stay as they were.
+      - name: Publish through a checked draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if draft="$(gh release view "$TAG" -R "$REPO" --json isDraft -q .isDraft 2>/dev/null)"; then
+            if [ "$draft" != "true" ]; then
+              echo "::error::$TAG is already published; not replacing it"; exit 1
+            fi
+            gh release delete "$TAG" -R "$REPO" --yes   # a draft an earlier run left
+          fi
+          gh release create "$TAG" -R "$REPO" --draft --target "$GITHUB_SHA" \
+            --title "bg-be-gone $VERSION" --generate-notes release/*
+          # The draft must hold exactly the chosen files, each at its size.
+          expected="$(cd release && for f in *; do echo "$f $(stat -c %s "$f")"; done | sort)"
+          actual="$(gh release view "$TAG" -R "$REPO" --json assets -q '.assets[] | "\(.name) \(.size)"' | sort)"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::the draft's assets differ from the ones chosen"
+            diff <(echo "$expected") <(echo "$actual") || true
+            exit 1
+          fi
+          gh release edit "$TAG" -R "$REPO" --draft=false
