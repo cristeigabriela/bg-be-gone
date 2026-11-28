@@ -64,3 +64,5 @@ if ($left.Count) { throw "uninstall.ps1 left $($left.Count) item(s) of the faile
 if ($installed.Count) { throw "install.ps1 said '$($installed[0])' after a failed step" }
 if (-not $named.Count) { throw 'install.ps1 failed without naming the shortcut step' }
 Write-Host 'A failed step fails the install.'
+# install.ps1 exits 1 on purpose above; don't let a native exit code decide this script's result.
+exit 0

@@ -97,3 +97,5 @@ try {
 }
 if ($failures.Count) { throw "$($failures.Count) check(s) failed: $($failures -join '; ')" }
 Write-Host 'Uninstall waits for helpers and refuses while bg-be-gone runs.'
+# The last case's uninstall exits 1 on purpose; without this, pwsh hands that to CI.
+exit 0
