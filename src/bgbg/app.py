@@ -1342,7 +1342,12 @@ class Window(Adw.ApplicationWindow):
             self._footer_progress(msg["done"] // mb, msg["total"] // mb)
             self.footer_progress.set_text("%d / %d MB" % (msg["done"] // mb, msg["total"] // mb))
         if msg.get("total") and msg["done"] >= msg["total"]:
-            self._hide_footer_progress()       # loading the model comes next
+            self._footer_loading()             # loading the model comes next
+
+    def _footer_loading(self):
+        """Pulse the footer bar while a model loads: there's no fraction to show."""
+        self.footer_progress.set_text("")
+        self._footer_motion.unknown()
 
     def _hide_footer_progress(self):
         if getattr(self, "footer_progress", None) is not None:
@@ -1968,6 +1973,7 @@ class Window(Adw.ApplicationWindow):
             if self._seg_input != inp:
                 self._remove_temp_input(self._seg_input)
             self._seg_input = inp
+            self._footer_loading()
             # Tracked as a job, so a reply that lands after we've left or
             # unloaded is dropped instead of re-marking the model as resident.
             # The masks go in our temp folder: the input can be the user's photo.
@@ -3067,8 +3073,7 @@ class Window(Adw.ApplicationWindow):
             if SELFTEST:
                 _finish_selftest(self, {"ok": True, "ready": msg})
         elif t == "loading":
-            self.footer_progress.set_text("")
-            self._footer_motion.unknown()      # a load has no fraction to show
+            self._footer_loading()
             if job is Job.BATCH:
                 self.batch_status.set_text("Loading model %s…" % msg["model"])
             else:
