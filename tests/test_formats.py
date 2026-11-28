@@ -84,3 +84,24 @@ def test_a_save_the_dialog_covered_needs_no_asking(tmp_path, typed, existing):
 ], ids=["webp", "jpeg-transparent", "jpeg-flattened", "heic", "no-source"])
 def test_the_default_save_format_follows_the_source_when_it_can(source, choices, want):
     assert formats.default_save_format(source, choices) is want
+
+
+TESTDATA = Path(__file__).parent / "testdata"
+
+
+@pytest.mark.parametrize("fixture, want", [
+    # An animated WebP: its extended header sets the animation flag.
+    ("animated.webp", formats.Animation.ANIMATED),
+    # A still WebP runs in a batch.
+    ("subject.webp", formats.Animation.STILL),
+    # Named .webp but not one: a still, which the batch then reports it can't read.
+    ("not_an_image.webp", formats.Animation.STILL),
+    # An animated PNG: an acTL chunk before its image data (make_apng_fixture.py).
+    ("animated.png", formats.Animation.ANIMATED),
+    # A plain PNG has none.
+    ("subject.png", formats.Animation.STILL),
+    # A JPEG never animates.
+    ("subject.jpg", formats.Animation.STILL),
+], ids=["webp-animated", "webp-still", "not-a-webp", "apng", "png-still", "jpeg"])
+def test_the_gallery_tells_an_animation_from_its_header(fixture, want):
+    assert formats.animation_in(str(TESTDATA / fixture)) is want

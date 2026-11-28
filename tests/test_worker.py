@@ -195,6 +195,25 @@ def test_convert_decodes_every_readable_format_into_a_png_to_preview(
     assert grey.getpixel(BACKGROUND_PIXEL) < 250, "the light grey background isn't clipped to white"
 
 
+@pytest.mark.parametrize("fixture", [
+    # Phone photos: GdkPixbuf has no HEIC loader on Windows or most Linux installs.
+    "subject.heic",
+    # The same for AVIF.
+    "subject.avif",
+    # Windows' GdkPixbuf has no WebP loader either.
+    "subject.webp",
+], ids=["heic", "avif", "webp"])
+def test_a_thumbnail_conversion_fits_the_size_asked_for(worker, tmp_path, fixture):
+    """The Batch gallery asks the worker for thumbnails of what GdkPixbuf can't read."""
+    out = tmp_path / "thumb.png"
+    reply, _ = worker.ask(
+        {"op": "convert", "id": 1, "input": str(TESTDATA / fixture), "output": str(out),
+         "max_size": 64},
+        until={"converted", "error"})
+    assert reply["type"] == "converted", "the worker reads it: %s" % reply.get("message")
+    assert Image.open(out).size == (64, 64), "the 256 px square shrinks to the size asked for"
+
+
 def test_batch_cuts_out_every_still_format_and_skips_gifs_and_other_files(worker, tmp_path):
     """A GIF in batch would lose all but its first frame, so batch leaves it out."""
     inp, outdir = tmp_path / "in", tmp_path / "out"

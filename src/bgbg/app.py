@@ -36,7 +36,6 @@ from viewer import (  # noqa: E402
     transform_pixbuf,
 )
 import background  # noqa: E402
-import batchnames  # noqa: E402
 import formats  # noqa: E402
 from gi.repository import GObject, Graphene, Gsk, Pango  # noqa: E402
 import modelinfo  # noqa: E402
@@ -44,6 +43,8 @@ from modelinfo import Device, Pick  # noqa: E402
 from engines import selection  # noqa: E402  (standard library only)
 import offmain  # noqa: E402
 import settings  # noqa: E402
+from batchpage import BatchPage, Cancel  # noqa: E402
+from widgets import action_bar, pill_button, primary_button, save_button  # noqa: E402
 
 APP_ID = "io.github.cristeigabriela.BgBeGone"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -73,6 +74,8 @@ class Job(enum.Enum):
     OPEN = "open"                # decode a new source, or count its frames
     SINGLE = "single"            # Generate, on a still or an animation
     BATCH = "batch"
+    THUMB = "thumb"              # a Batch gallery thumbnail GdkPixbuf can't decode
+    BATCH_PREVIEW = "batch_preview"  # the Batch page's Output preview
     SAVE = "save"                # re-encode a result as WebP or JPEG for Save
     SEG_LOAD = "seg_load"        # load SAM and encode the image
     SEG_RUN = "seg_run"          # Segment everything, or a click in point mode
@@ -86,7 +89,7 @@ _JOB_REPLIES = {
     "loading", "done_single", "gif_progress", "gif_done", "canceled", "progress",
     "done_batch", "converted", "frames", "seg_ready", "seg_download", "seg_step",
     "seg_progress", "seg_objects", "seg_mask", "seg_extracted", "seg_canceled", "error",
-    "download", "recomposited",
+    "download", "recomposited", "batch_file",
 }
 # Reply types that end their request.
 _JOB_ENDS = {
@@ -113,13 +116,6 @@ class Prep(enum.Enum):
 
     SINGLE = "single"            # Generate's input
     SEGMENT = "segment"          # Segment's model load
-
-
-_PATTERN_HINT = ("<small>Tokens: <tt>{name}</tt> original filename, "
-                 "<tt>{n}</tt> index. Output is PNG in the output folder; a name "
-                 "that's taken gets a number.</small>")
-# Failed or skipped files a batch summary lists by name, so the dialog fits on screen.
-_MAX_LISTED = 15
 
 
 class Quit(enum.Enum):
@@ -730,62 +726,6 @@ def _descendants(widget):
         child = child.get_next_sibling()
 
 
-def primary_button(label, icon=None):
-    """The one bold, rounded call-to-action button (Generate / Segment / Run)."""
-    b = Gtk.Button()
-    if icon:
-        b.set_child(Adw.ButtonContent(icon_name=icon, label=label))
-    else:
-        b.set_label(label)
-    b.add_css_class("suggested-action")
-    b.add_css_class("pill")
-    return b
-
-
-def pill_button(label):
-    b = Gtk.Button(label=label)
-    b.add_css_class("pill")
-    return b
-
-
-def save_button(label="Save…"):
-    """Consistent Save button (icon + label), disabled until there's something."""
-    b = Gtk.Button()
-    b.set_child(Adw.ButtonContent(icon_name="document-save-symbolic", label=label))
-    b.add_css_class("pill")
-    b.set_sensitive(False)
-    return b
-
-
-def action_bar(primary=None, secondary=(), cancel=None, save=None, status_text=""):
-    """Standard action row with fixed slots so Save is always far-right and the
-    layout is identical on every page. Returns (bar, status_label, spinner).
-
-    The status label is intentionally NOT shown here — status text lives only in
-    the window footer (statusbar) to avoid showing the same message twice. The
-    label object is still returned so callers `set_text` on it and the footer
-    mirror picks it up."""
-    bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-    bar.add_css_class("action-bar")
-    if primary is not None:
-        bar.append(primary)
-    for b in secondary:
-        bar.append(b)
-    spinner = Gtk.Spinner()
-    spinner.set_size_request(18, 18)   # reserve space so start/stop never reflows
-    spinner.set_valign(Gtk.Align.CENTER)
-    bar.append(spinner)
-    status = Gtk.Label(xalign=0, label=status_text)   # detached: footer shows it
-    spacer = Gtk.Box()
-    spacer.set_hexpand(True)           # keep Save pinned far-right
-    bar.append(spacer)
-    if cancel is not None:
-        bar.append(cancel)
-    if save is not None:
-        bar.append(save)
-    return bar, status, spinner
-
-
 def _exit_code_text(code):
     """An exit code as people look it up: a negative one names the signal,
     and a Windows crash code (above 255) reads in hex."""
@@ -794,6 +734,11 @@ def _exit_code_text(code):
     if code > 255:
         return "0x%08X" % code
     return str(code)
+
+
+# How long shutting the worker down waits for its "exiting" reply: past its
+# own wait for a batch result being written (5 s), with room to say so.
+_WORKER_EXIT_WAIT_S = 8
 
 
 class Worker:
@@ -810,6 +755,8 @@ class Worker:
         # a request still tracked from before can never match a new request.
         self._next_id = first_id
         self._closing = False
+        self._exiting = threading.Event()   # set by the worker's "exiting" reply
+        self._exit_reply = None
         self.ok = False
         self.error = None
         # Requests sent before the worker's "ready", in order; None once it came.
@@ -835,6 +782,11 @@ class Worker:
                 msg = json.loads(line)
             except ValueError:
                 continue             # a stray print from a library, not a reply
+            if msg.get("type") == "exiting":
+                # Its last reply, which shutdown() waits for, off the main loop.
+                self._exit_reply = msg
+                self._exiting.set()
+                continue
             # Above redraw priority: at the default idle priority, a reply could
             # wait for as long as the Segment outlines kept animating, which on
             # Windows starved it until the next input event.
@@ -894,18 +846,24 @@ class Worker:
             self._write(req)
 
     def shutdown(self):
+        """Ask the worker to exit, and wait for its "exiting": a batch result
+        being written gets its name first, or its part file is deleted."""
         if not self.ok:
             return
         self._closing = True
         try:
             self.proc.stdin.write('{"op":"shutdown"}\n')
             self.proc.stdin.flush()
+        except (OSError, ValueError):   # ValueError: the pipe is already closed
+            pass
+        if not self._exiting.wait(_WORKER_EXIT_WAIT_S):
+            _log.warning("the worker didn't say it was exiting in %d s", _WORKER_EXIT_WAIT_S)
+        elif self._exit_reply.get("part_left"):
+            _log.warning("the worker exited mid-write; its log names the part file left")
+        try:
             self.proc.wait(timeout=2)
-        except Exception:
-            try:
-                self.proc.terminate()
-            except Exception:
-                pass
+        except subprocess.TimeoutExpired:
+            self.proc.terminate()
 
 
 class Panel:
@@ -1071,8 +1029,6 @@ class Window(Adw.ApplicationWindow):
         self._quit = Quit.NOT_ASKED
         self._quit_timer = 0           # the wait for a stopping batch, while one runs
         self.busy = False
-        self.batch_input = None
-        self.batch_output = None
         self._gpu_notified = False
         # segmentation state
         self._seg_available = False
@@ -1140,6 +1096,10 @@ class Window(Adw.ApplicationWindow):
         # libadwaita's sidebar surface sets it off from the pages, with no line.
         sidebar = self._build_sidebar()
         sidebar.add_css_class("sidebar-pane")
+        # As wide as its rows want, and no wider: otherwise it takes a share of
+        # any spare width (659 px of a maximized window), which a page needs.
+        sidebar.set_propagate_natural_width(True)
+        sidebar.set_hexpand(False)
         body.append(sidebar)
         self.stack.set_hexpand(True)
         body.append(self.stack)
@@ -1149,8 +1109,10 @@ class Window(Adw.ApplicationWindow):
 
         self.single_page = self.stack.add_titled_with_icon(
             self._build_single(), "single", "Single", "image-x-generic-symbolic")
+        self.batch = BatchPage(self)
+        self.batch_status = self.batch.status
         self.batch_page = self.stack.add_titled_with_icon(
-            self._build_batch(), "batch", "Batch", "view-grid-symbolic")
+            self.batch.widget, "batch", "Batch", "view-grid-symbolic")
         self.seg_page = self.stack.add_titled_with_icon(
             self._build_segment(), "segment", "Segment", "edit-select-all-symbolic")
         self.stack.connect("notify::visible-child-name", self._on_page_changed)
@@ -1234,12 +1196,7 @@ class Window(Adw.ApplicationWindow):
         blur = s.get("blur_strength")
         if isinstance(blur, (int, float)) and not isinstance(blur, bool) and math.isfinite(blur):
             self.blur_row.set_value(blur)          # the row clamps it to its range
-        for key, row in (("batch_input", self.in_row), ("batch_output", self.out_row)):
-            folder = _existing_folder(s.get(key))
-            if folder:
-                setattr(self, key, folder)
-                row.set_subtitle(folder)
-        self._sync_batch()
+        self.batch.restore()
 
         self.subject_row.connect("notify::selected", lambda *_: self._remember(
             subject=("custom" if self.subject_row.get_selected() >= len(SUBJECTS)
@@ -2026,6 +1983,8 @@ class Window(Adw.ApplicationWindow):
         seg = self.stack.get_visible_child_name() == "segment"
         self.model_grp.set_visible(not seg)
         self.seg_grp.set_visible(seg and self._seg_available)
+        # Batch's Output card has its own alpha matting: Single's doesn't apply.
+        self.alpha_row.set_visible(self.stack.get_visible_child_name() != "batch")
 
     def _accel_save(self):
         p = self.stack.get_visible_child_name()
@@ -2045,7 +2004,7 @@ class Window(Adw.ApplicationWindow):
             if self._seg_mode() == "everything":
                 self._on_seg_everything()
         elif p == "batch":
-            self._on_run_batch()
+            self.batch.run()
         return True
 
     def _accel_cancel(self):
@@ -2634,62 +2593,46 @@ class Window(Adw.ApplicationWindow):
                 paned.set_position(mx // 2)
                 self._paned_centered = True
 
-    # ---------- batch page ----------
-    def _build_batch(self):
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        clamp = Adw.Clamp(maximum_size=640)
-        clamp.set_margin_top(24)
-        clamp.set_margin_bottom(24)
-        clamp.set_margin_start(12)
-        clamp.set_margin_end(12)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
-        clamp.set_child(box)
-        outer.append(clamp)
+    # ---------- the Batch page's link to the window (batchpage.BatchHost) ----------
+    def run_batch(self, req):
+        self._set_busy(True, spin=False, cancel=True)
+        rid = self._send_job(Job.BATCH, req)
+        if rid < 0:
+            self._set_busy(False, spin=False)
+        return rid
 
-        grp = Adw.PreferencesGroup(
-            title="Batch", description="Process every image in a folder.")
-        self.in_row = Adw.ActionRow(title="Input folder", subtitle="Not set")
-        in_btn = Gtk.Button(label="Choose…", valign=Gtk.Align.CENTER)
-        in_btn.connect("clicked", self._on_pick_input)
-        self.in_row.add_suffix(in_btn)
-        grp.add(self.in_row)
+    def cancel_batch(self):
+        self._on_bg_cancel()
 
-        self.out_row = Adw.ActionRow(title="Output folder", subtitle="Not set")
-        out_btn = Gtk.Button(label="Choose…", valign=Gtk.Align.CENTER)
-        out_btn.connect("clicked", self._on_pick_output)
-        self.out_row.add_suffix(out_btn)
-        grp.add(self.out_row)
+    def send_batch_thumb(self, req):
+        return self._send_job(Job.THUMB, req)
 
-        self.pattern_row = Adw.EntryRow(title="Rename pattern")
-        self.pattern_row.set_text("{name}_nobg")
-        self.pattern_row.connect("changed", lambda *_: self._check_pattern())
-        grp.add(self.pattern_row)
-        box.append(grp)
+    def send_batch_preview(self, req):
+        return self._send_job(Job.BATCH_PREVIEW, req)
 
-        hint = Gtk.Label(xalign=0, wrap=True)
-        hint.add_css_class("dim-label")
-        hint.set_markup(_PATTERN_HINT)
-        self.pattern_hint = hint
-        box.append(hint)
+    def batch_model(self):
+        return self._bg_model_key()
 
-        run_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        run_row.set_halign(Gtk.Align.START)
-        self.run_btn = primary_button("Run batch", icon="view-grid-symbolic")
-        self.run_btn.set_sensitive(False)
-        self.run_btn.connect("clicked", lambda *_: self._on_run_batch())
-        run_row.append(self.run_btn)
-        self.batch_cancel_btn = pill_button("Cancel")
-        self.batch_cancel_btn.set_sensitive(False)
-        self.batch_cancel_btn.connect("clicked", lambda *_: self._on_bg_cancel())
-        run_row.append(self.batch_cancel_btn)
-        box.append(run_row)
+    def worker_is_up(self):
+        return self._worker_state is WorkerState.UP
 
-        # Progress + status are shown in the window footer (statusbar), not on the
-        # page — kept as detached objects so existing set_fraction/set_text calls
-        # (and the footer mirror) keep working.
-        self.progress = Gtk.ProgressBar(show_text=True)
-        self.batch_status = Gtk.Label(xalign=0, label="")
-        return outer
+    def is_busy(self):
+        return self.busy
+
+    def setting(self, key):
+        return self._settings.get(key)
+
+    def remembered_folder(self, key):
+        return self._remembered_folder(key)
+
+    def remember(self, **values):
+        self._remember(**values)
+
+    def open_folder(self, path):
+        self._open_folder(path)
+
+    def toast(self, text):
+        self._toast(text)
 
     # ---------- file dialogs ----------
     def _image_filters(self):
@@ -2729,11 +2672,7 @@ class Window(Adw.ApplicationWindow):
         first = paths[0]
         if os.path.isdir(first):
             if page == "batch":
-                self.batch_input = first
-                self.in_row.set_subtitle(first)
-                self._remember(batch_input=first)
-                self._sync_batch()
-                self.batch_status.set_text("Input folder: " + first)
+                self.batch.set_input(first)
             else:
                 self._toast("That's a folder. Drop it on the Batch page to process "
                             "every image in it.")
@@ -3128,74 +3067,13 @@ class Window(Adw.ApplicationWindow):
             return
         self._report_saved(pending.target, pending.choices)
 
-    def _on_pick_input(self, *_):
-        dlg = Gtk.FileDialog(title="Input folder")
-        start = self._remembered_folder("batch_input")
-        if start is not None:
-            dlg.set_initial_folder(start)
-
-        def done(d, res):
-            try:
-                f = d.select_folder_finish(res)
-            except GLib.Error:
-                return
-            self.batch_input = f.get_path()
-            self.in_row.set_subtitle(self.batch_input)
-            self._remember(batch_input=self.batch_input)
-            self._sync_batch()
-        dlg.select_folder(self, None, done)
-
-    def _on_pick_output(self, *_):
-        dlg = Gtk.FileDialog(title="Output folder")
-        start = (self._remembered_folder("batch_output")
-                 or self._remembered_folder("batch_input"))
-        if start is not None:
-            dlg.set_initial_folder(start)
-
-        def done(d, res):
-            try:
-                f = d.select_folder_finish(res)
-            except GLib.Error:
-                return
-            self.batch_output = f.get_path()
-            self.out_row.set_subtitle(self.batch_output)
-            self._remember(batch_output=self.batch_output)
-            self._sync_batch()
-        dlg.select_folder(self, None, done)
-
-    def _pattern_problem(self):
-        """Why the rename pattern can't name files, or None."""
-        try:
-            batchnames.check_pattern(self.pattern_row.get_text().strip() or "{name}_nobg")
-        except batchnames.BatchPatternError as e:
-            return e.user_message
-        return None
-
-    def _check_pattern(self):
-        problem = self._pattern_problem()
-        if problem:
-            self.pattern_row.add_css_class("error")
-            self.pattern_hint.set_text(problem)
-        else:
-            self.pattern_row.remove_css_class("error")
-            self.pattern_hint.set_markup(_PATTERN_HINT)
-        self._sync_batch()
-
-    def _sync_batch(self):
-        self.run_btn.set_sensitive(
-            bool(self.batch_input and self.batch_output) and not self.busy
-            and self._worker_state is WorkerState.UP)
-        if self._pattern_problem() is not None:
-            self.run_btn.set_sensitive(False)   # Run waits for a pattern that works
-
     # ---------- actions ----------
     def _set_busy(self, busy, spin=True, cancel=False):
         self.busy = busy
         self.gen_btn.set_sensitive(not busy and self.src_panel.view.has_image()
                                    and self._worker_state is WorkerState.UP)
         self.gen_cancel_btn.set_sensitive(busy and cancel)
-        self.batch_cancel_btn.set_sensitive(busy and cancel)
-        self._sync_batch()
+        self.batch.offer_cancel(Cancel.OFFERED if busy and cancel else Cancel.NOT_OFFERED)
         if spin:
             (self.spinner.start if busy else self.spinner.stop)()
         if not busy:
@@ -3282,25 +3160,10 @@ class Window(Adw.ApplicationWindow):
         # Its reply (stopped, or skipped if still queued) ends the busy state.
         self._cancel_jobs(Job.SINGLE, Job.BATCH)
         self.gen_cancel_btn.set_sensitive(False)
-        self.batch_cancel_btn.set_sensitive(False)
+        self.batch.offer_cancel(Cancel.NOT_OFFERED)
         self.status.set_text("Cancelling…")
         if self.stack.get_visible_child_name() == "batch":
             self.batch_status.set_text("Cancelling…")
-
-    def _on_run_batch(self):
-        if (self.busy or not (self.batch_input and self.batch_output)
-                or self._worker_state is WorkerState.DOWN):
-            return
-        model, bg, alpha, blur = self.get_settings()
-        pattern = self.pattern_row.get_text().strip() or "{name}_nobg"
-        self._set_busy(True, spin=False, cancel=True)
-        self.progress.set_fraction(0)
-        self.progress.set_text("starting…")
-        self.batch_status.set_text("Preparing…")
-        self._send_job(Job.BATCH, {
-            "op": "batch", "input_dir": self.batch_input,
-            "output_dir": self.batch_output, "model": model,
-            "alpha": alpha, "bg": bg, "blur": blur, "pattern": pattern})
 
     # ---------- worker replies ----------
     def _on_worker_message(self, msg):
@@ -3339,6 +3202,12 @@ class Window(Adw.ApplicationWindow):
         if job is Job.SAVE:
             self._on_save_reply(req.save, msg)
             return False
+        if job is Job.THUMB:
+            self.batch.on_thumb_reply(rid, msg)
+            return False
+        if job is Job.BATCH_PREVIEW:
+            self.batch.preview.on_reply(rid, msg)
+            return False
         if t == "worker_exited":
             self._show_worker_down("The background process stopped (exit code %s)."
                                    % _exit_code_text(msg["code"]))
@@ -3364,6 +3233,7 @@ class Window(Adw.ApplicationWindow):
                 if self._seg_available:
                     self.stack.set_visible_child_name("segment")
             self._sync_sidebar_page()
+            self.batch.worker_ready()
             if SELFTEST:
                 _finish_selftest(self, {"ok": True, "ready": msg})
         elif t == "loading":
@@ -3436,7 +3306,7 @@ class Window(Adw.ApplicationWindow):
         elif t == "canceled":
             self._set_busy(False, spin=(msg.get("scope") != "batch"))
             if msg.get("scope") == "batch":
-                self.progress.set_text("cancelled")
+                self.batch.on_canceled(msg)
                 self.batch_status.set_text(
                     # No count when it stopped before the first file, say in a download.
                     "Cancelled after %d / %d." % (msg["done"], msg["total"])
@@ -3445,16 +3315,14 @@ class Window(Adw.ApplicationWindow):
                 self.status.set_text("Cancelled.")
         elif t == "progress":
             total = max(msg["total"], 1)
-            self.progress.set_fraction(msg["done"] / total)
-            self.progress.set_text("%d / %d" % (msg["done"], total))
             self._footer_progress(msg["done"], total)
             if msg.get("name"):
                 self.batch_status.set_text("Processing " + msg["name"])
+        elif t == "batch_file":
+            self.batch.on_file(msg)
         elif t == "done_batch":
-            self.progress.set_fraction(1.0)
-            self.progress.set_text("done")
             self._set_busy(False, spin=False)
-            self._on_batch_done(msg)
+            self.batch.on_done(msg)
         elif t == "seg_ready":
             self._seg_set_busy(False)
             self.seg_loaded_for = req.loads
@@ -3545,42 +3413,6 @@ class Window(Adw.ApplicationWindow):
             self._on_job_error(job, msg["message"])
         return False
 
-    def _on_batch_done(self, msg):
-        """Summarise a finished batch; list what failed or was skipped."""
-        failed, skipped = msg["failed"], msg["skipped"]
-        parts = ["%d done" % msg["count"]]
-        if failed:
-            parts.append("%d failed" % len(failed))
-        if skipped:
-            parts.append("%d skipped" % len(skipped))
-        summary = ", ".join(parts)
-        renamed = msg["renamed"]
-        if renamed:
-            summary += " (%d numbered, so nothing was overwritten)" % renamed
-        self.batch_status.set_text("%s in %.1fs → %s" % (summary, msg["seconds"], msg["outdir"]))
-        if not (failed or skipped):
-            toast = Adw.Toast(title="Batch finished: " + summary, timeout=5)
-            toast.set_button_label("Open folder")
-            toast.connect("button-clicked", lambda *_: self._open_folder(msg["outdir"]))
-            self.toasts.add_toast(toast)
-            return
-        lines = []
-        for title, entries in (("Failed", failed), ("Skipped", skipped)):
-            if not entries:
-                continue
-            lines.append(title + ":")
-            lines += ["%s: %s" % (e["name"], e["message"]) for e in entries[:_MAX_LISTED]]
-            if len(entries) > _MAX_LISTED:
-                lines.append("…and %d more; the log has them all."
-                             % (len(entries) - _MAX_LISTED))
-        dlg = Adw.AlertDialog(heading="Batch finished: " + summary, body="\n".join(lines))
-        dlg.add_response("close", "Close")
-        dlg.add_response("open", "Open folder")
-        dlg.set_default_response("close")
-        dlg.connect("response", lambda d, r: self._open_folder(msg["outdir"])
-                    if r == "open" else None)
-        dlg.present(self)
-
     def _open_folder(self, path):
         launcher = Gtk.FileLauncher.new(Gio.File.new_for_path(path))
 
@@ -3604,6 +3436,7 @@ class Window(Adw.ApplicationWindow):
         elif job is Job.BATCH:
             self.batch_status.set_text(text)
             self._set_busy(False, spin=False)
+            self.batch.on_failed()
         elif job is Job.SINGLE:
             self.status.set_text(text)
             self._set_busy(False)
@@ -3642,7 +3475,7 @@ class Window(Adw.ApplicationWindow):
             ("image-x-generic-symbolic", "Generate, then Save",
              "Output transparent, blurred, or a solid colour."),
             ("view-grid-symbolic", "Batch a whole folder",
-             "Choose input/output folders and Run batch."),
+             "Choose the folders, untick the images to leave out, and Run batch."),
         ])
         group("Segment objects", "The Segment tab", [
             ("edit-select-all-symbolic", "Everything → pick layers",
@@ -3703,6 +3536,7 @@ class Window(Adw.ApplicationWindow):
             if req.job is Job.SAVE:
                 self._on_save_reply(req.save, {
                     "type": "error", "message": "the background process stopped."})
+        self.batch.requests_lost()
 
     def _restart_worker(self):
         self.worker.shutdown()
@@ -3809,6 +3643,7 @@ class Window(Adw.ApplicationWindow):
         else:
             self._remember(window_maximized=False, window_width=self.get_width(),
                            window_height=self.get_height())
+        self.batch.shutdown()
         self.worker.shutdown()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 

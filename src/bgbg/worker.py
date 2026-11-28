@@ -15,10 +15,17 @@ Requests (one JSON object per line on stdin):
    "keep_dir":D?,"id":N}                     # keep_dir: keep what recomposite needs
   {"op":"batch","input_dir":D,"output_dir":D,"model":M,"alpha":bool,"bg":BG,
    "pattern":"{name}_nobg","id":N}
+      # optional "format":"png|webp|jpeg": what each result is written as,
+      #   png by default; jpeg only with a background to flatten onto
+      # optional "files":[P,...]: exactly these, in order, not input_dir's images
+      # optional "thumbs":D: a folder for each result's small preview, named
+      #   in its batch_file reply
   {"op":"gif","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":S,
    "rot":0..3,"fh":bool,"fv":bool,"keep_dir":D?,"id":N}   # per-frame removal;
                                              # GIF or WebP (animated) by output
-  {"op":"convert","input":P,"output":P,"id":N}   # re-encode as output's format
+  {"op":"convert","input":P,"output":P,"max_size":int,"id":N}
+      # re-encode as output's format; max_size (optional) shrinks it to fit a
+      # square that size, upright, for a thumbnail
   {"op":"frames","input":P,"id":N}           # count an image's frames
   {"op":"cancel","id":N}     # stop request N: running, or skipped once it's due
   {"op":"models"}
@@ -30,7 +37,8 @@ Requests (one JSON object per line on stdin):
    "blur":int,"output":P,"id":N}             # needs no model loaded
   {"op":"seg_cancel","id":N}                 # the same as cancel
   {"op":"engine_status","id":N}              # waits for PyTorch's start-up, if any
-  {"op":"shutdown"}
+  {"op":"shutdown"}       # stops what runs; a batch result being written gets its
+                          # name first (up to 5 s), then "exiting" goes out
 
 BG is "transparent", "blur" or "#rrggbb" to flatten onto. S is the blur
 strength, 1-100, relative to the picture's size (background.py).
@@ -56,6 +64,10 @@ Responses (one JSON object per line on stdout):
   {"type":"done_single","output":P,"preview":P,"seconds":f,"device":D,"id":N}
       # D: {"provider","label","gpu"} it last ran on; done_batch and gif_done
       # carry it too, so every finished job says where it ran
+  {"type":"batch_file","input":P,"name":str,"state":S,"output":P,"thumb":P,
+   "message":str,"id":N}
+      # one image of a batch: S is "working", "done" (with output, and thumb
+      # when asked for), "failed" or "skipped" (both with message)
   {"type":"done_batch","count":n,"total":n,"failed":[{"name","message"}],
    "skipped":[{"name","message"}],"renamed":n,"seconds":f,"outdir":P,"id":N}
   {"type":"gif_progress","done":i,"total":n,"id":N}
@@ -75,6 +87,8 @@ Responses (one JSON object per line on stdout):
   {"type":"seg_canceled","id":N}
   {"type":"notice","message":str,"id":N|null}   # shown to the user; null at start-up
   {"type":"error","message":str,"id":N}
+  {"type":"exiting","part_left":bool}   # the last reply; part_left: a batch's
+                                        # part file couldn't be deleted
 """
 import os
 import sys
@@ -90,6 +104,7 @@ import gc  # noqa: E402
 import json  # noqa: E402
 import contextlib  # noqa: E402
 import enum  # noqa: E402
+import functools  # noqa: E402
 import errno  # noqa: E402
 import time  # noqa: E402
 import queue  # noqa: E402
@@ -397,6 +412,21 @@ class NoImagesError(WorkerError):
         self.user_message = user_message
 
 
+class UnknownBatchFormatError(WorkerError, ValueError):
+    def __init__(self, key):
+        super().__init__(f"unknown batch output format {key!r}")
+        self.key = key
+        self.user_message = ("bg-be-gone can't write a batch as %r: it writes PNG, WebP or JPEG."
+                             % key)
+
+
+class TransparentJpegError(WorkerError, ValueError):
+    def __init__(self):
+        super().__init__("a transparent batch can't be written as JPEG")
+        self.user_message = ("JPEG can't keep a transparent background. Choose PNG or WebP, "
+                             "or a background to flatten onto.")
+
+
 def _causes(exc):
     """`exc` and every exception it was raised from, outermost first."""
     seen = []
@@ -531,11 +561,19 @@ def handle_convert(req):
     The frontend uses it to preview a source GdkPixbuf can't decode (no loader
     for HEIC or AVIF, say) and to save a result as WebP or JPEG. Only the first
     frame is written; "frames" tells the frontend whether the source animates.
+
+    With "max_size", the Batch page's gallery gets a thumbnail: shrunk to fit,
+    and turned upright as GdkPixbuf turns the thumbnails it decodes itself.
     """
     im = open_image(req["input"])
+    frames = getattr(im, "n_frames", 1)
+    if req.get("max_size"):
+        side = int(req["max_size"])
+        im = ImageOps.exif_transpose(_plain(im))
+        im.thumbnail((side, side))
     save_image(im, req["output"])
-    out({"type": "converted", "output": req["output"],
-         "frames": getattr(im, "n_frames", 1), "id": req.get("id")})
+    out({"type": "converted", "output": req["output"], "frames": frames,
+         "id": req.get("id")})
 
 
 def handle_frames(req):
@@ -553,15 +591,21 @@ def process_one(model, req_id, src, dst, alpha, bg, blur=background.STRENGTH_DEF
     `keep_dir`, when given, keeps the picture and its cut-out there, so
     recomposite can put the result onto another background without the model.
     """
-    # Upright first: rembg would turn its mask by the EXIF orientation, and
-    # the cut-out, kept picture and composite must all match that mask.
-    img = _plain(ImageOps.exif_transpose(open_image(src)))
-    res = _straight_cutout(img, _remove_resilient(model, req_id, img, alpha), alpha)
+    img, res = _cut_out(model, req_id, src, alpha)
     if keep_dir:
         os.makedirs(keep_dir, exist_ok=True)
         img.save(os.path.join(keep_dir, _KEPT_PICTURE))
         res.save(os.path.join(keep_dir, _KEPT_CUTOUT))
     return _write_result(img, res, dst, bg, blur, want_preview)
+
+
+def _cut_out(model, req_id, src, alpha):
+    """The upright picture at `src`, and its cut-out with the picture's own
+    colours: what Generate and a batch both composite."""
+    # Upright first: rembg would turn its mask by the EXIF orientation, and
+    # the cut-out, kept picture and composite must all match that mask.
+    img = _plain(ImageOps.exif_transpose(open_image(src)))
+    return img, _straight_cutout(img, _remove_resilient(model, req_id, img, alpha), alpha)
 
 
 # A still's kept files, in its keep_dir; an animation keeps one cut-out per frame.
@@ -576,10 +620,9 @@ def _write_result(img, res, dst, bg, blur, want_preview):
     and settings give the same file. Returns the preview's path (a checkered
     copy of a transparent result), `dst` itself, or None without a preview.
     """
+    _composite(img, res, bg, blur).save(dst)
     if bg != "transparent":
-        _compose_frame(img, res, bg, blur).convert("RGB").save(dst)
         return dst if want_preview else None
-    res.save(dst)
     if not want_preview:
         return None
     board = _checkerboard(res.size).convert("RGBA")
@@ -587,6 +630,15 @@ def _write_result(img, res, dst, bg, blur, want_preview):
     preview_path = dst + ".preview.png"
     board.convert("RGB").save(preview_path)
     return preview_path
+
+
+def _composite(img, res, bg, blur):
+    """Cut-out `res` of picture `img` on background `bg`: the cut-out itself
+    when transparent, else the flattened RGB picture. Generate, a batch and
+    a re-composite all write this."""
+    if bg == "transparent":
+        return res
+    return _compose_frame(img, res, bg, blur).convert("RGB")
 
 
 def handle_single(req):
@@ -605,64 +657,199 @@ def handle_single(req):
          "seconds": round(time.time() - t, 2), "id": rid})
 
 
-def _webp_frames(path):
-    """How many frames a WebP holds, from its header; 1 for any other format.
+# Containers whose extra frames are an animation, by Pillow's format name. A
+# multi-page TIFF or multi-image HEIC is a set of stills: a batch keeps the first.
+_ANIMATED_CONTAINERS = {"GIF": "GIF", "PNG": "PNG", "WEBP": "WebP"}
 
-    A file that won't open counts as one frame, so process_one reports it with
-    its name like any other unreadable image.
+
+def _animated_container(path):
+    """The container's name when the file animates, whatever its name says; else None.
+
+    A file that won't open counts as a still, so the batch reports it with its
+    name like any other unreadable image.
     """
-    if formats.format_of(path) is not formats.WEBP:
-        return 1
     try:
         with Image.open(path) as im:
-            return getattr(im, "n_frames", 1)
+            if getattr(im, "is_animated", False):
+                return _ANIMATED_CONTAINERS.get(im.format)
     except (UnidentifiedImageError, OSError):
-        return 1
+        pass
+    return None
 
 
 def _batch_skip_reason(path):
     """Why a batch leaves out an image it can read, or None to process it.
 
     Batch keeps one frame per file, so animations go through the Single page,
-    which keeps them all. A GIF is left out even as a still, as before.
+    which keeps them all; a GIF is left out even as a still. Single animates
+    by the file's name, so a .png that animates isn't sent there.
     """
     if not path.lower().endswith(formats.BATCH_SUFFIXES):
         return "it's a GIF; open it on the Single page, which keeps every frame."
-    if _webp_frames(path) > 1:
-        return "it's an animated WebP; open it on the Single page, which keeps every frame."
-    return None
+    container = _animated_container(path)
+    if container is None:
+        return None
+    if formats.can_animate(path):
+        return ("it's an animated %s; open it on the Single page, which keeps every frame."
+                % container)
+    return "it's an animated %s; a batch would keep only its first frame." % container
+
+
+def _batch_sources(req):
+    """The images a batch runs on, in order: the request's own list of files,
+    or every image in its input folder."""
+    if req.get("files") is not None:
+        return list(req["files"])
+    indir = req["input_dir"]
+    return sorted(f for f in glob.glob(os.path.join(indir, "*"))
+                  if f.lower().endswith(formats.READ_SUFFIXES) and os.path.isfile(f))
+
+
+def _batch_format(req, bg):
+    """The format a batch writes, checked against its background before any work.
+
+    Raises:
+        UnknownBatchFormatError: the request names no format a batch writes.
+        TransparentJpegError: JPEG was asked for with a transparent background.
+    """
+    key = req.get("format") or "png"
+    fmt = formats.BATCH_OUTPUTS.get(key)
+    if fmt is None:
+        raise UnknownBatchFormatError(key)
+    alpha = formats.Alpha.TRANSPARENT if bg == "transparent" else formats.Alpha.FLATTENED
+    if fmt not in formats.save_formats(alpha):
+        raise TransparentJpegError()
+    return fmt
+
+
+def _batch_render(model, req_id, src, alpha, bg, blur):
+    """One batch result, in memory, made as Generate makes it. Nothing is on
+    disk yet, so a quit or a crash during the slow part, the model, leaves no
+    file behind."""
+    img, res = _cut_out(model, req_id, src, alpha)
+    return _composite(img, res, bg, blur)
+
+
+# Held from a result's part file being made until the part has its real name
+# or is deleted. At exit _exit_cleanly takes it, so an exit doesn't cut a
+# write short, and no new one starts.
+_writing = threading.Lock()
+# How long an exit waits for a write in progress; the frontend waits longer.
+_EXIT_WRITE_WAIT_S = 5.0
+# The part file being written, while one is: an exit past the wait deletes it.
+_part_in_progress = None
+
+
+class Part(enum.Enum):
+    """Whether a part file of the batch's own is still on disk."""
+
+    GONE = "gone"
+    LEFT = "left"
+
+
+def _remove_part(part):
+    """Delete one of the batch's own part files; one already gone is fine."""
+    try:
+        os.remove(part)
+    except FileNotFoundError:
+        pass                    # Pillow deletes a file whose save failed itself
+    except OSError as err:
+        print(f"batch: could not remove {part}: {err}", file=sys.stderr, flush=True)
+        return Part.LEFT
+    return Part.GONE
+
+
+def _publish_result(image, outdir, stem, fmt, taken):
+    """Write a finished result into a part file of the batch's own, then give
+    it its name; returns the published path.
+
+    It gets its name from a call that never replaces a file, so one that
+    appears under that name meanwhile is kept. On any failure, the part goes.
+    """
+    global _part_in_progress
+    with _writing:
+        part = _part_in_progress = batchnames.new_part(outdir, stem, fmt.suffix)
+        published = None
+        try:
+            save_image(image, part)
+            published = batchnames.publish(part, outdir, stem, fmt.suffix, taken)
+        finally:
+            if published is None:
+                _remove_part(part)
+            _part_in_progress = None
+        return published
+
+
+# The longest side of a result's thumbnail: a gallery tile, at 2x scale.
+_BATCH_THUMB_SIDE = 320
+# The checkerboard's squares behind a transparent thumbnail, in pixels:
+# about the size of Single's on screen, once the tile scales it down.
+_THUMB_CHECKER = 10
+
+
+def _write_batch_thumb(image, folder, n, bg):
+    """A small PNG of result `n` for the gallery, over a checkerboard when
+    transparent, like Single's preview; its path, or None if it couldn't be
+    written (the result itself is fine)."""
+    small = image.copy()
+    small.thumbnail((_BATCH_THUMB_SIDE, _BATCH_THUMB_SIDE))
+    if bg == "transparent":
+        board = _board(small.size, _THUMB_CHECKER)
+        board.alpha_composite(small)
+        small = board
+    path = os.path.join(folder, "result-%d.png" % n)
+    try:
+        small.convert("RGB").save(path)
+    except OSError as err:
+        print(f"batch: could not write the thumbnail {path}: {err}", file=sys.stderr, flush=True)
+        return None
+    return path
+
+
+@functools.lru_cache(maxsize=8)
+def _cached_board(size, cell):
+    return _checkerboard(size, cell).convert("RGBA")
+
+
+def _board(size, cell):
+    """A checkerboard to composite onto: _checkerboard, drawn once per size."""
+    return _cached_board(size, cell).copy()
 
 
 def handle_batch(req):
     rid = req.get("id")
-    indir = req["input_dir"]
     outdir = req["output_dir"]
     pattern = req.get("pattern") or "{name}_nobg"
     batchnames.check_pattern(pattern)      # before any work, so nothing half-runs
-    images = sorted(f for f in glob.glob(os.path.join(indir, "*"))
-                    if f.lower().endswith(formats.READ_SUFFIXES) and os.path.isfile(f))
+    bg = req.get("bg", "transparent")
+    fmt = _batch_format(req, bg)
     files, skipped = [], []                # skipped: [{"name", "message"}], in order
-    for f in images:
+    for f in _batch_sources(req):
         reason = _batch_skip_reason(f)
         if reason is None:
             files.append(f)
         else:
             skipped.append({"name": os.path.basename(f), "message": reason})
+            out({"type": "batch_file", "input": f, "name": os.path.basename(f),
+                 "state": "skipped", "message": reason, "id": rid})
     if skipped:
         out({"type": "notice", "id": rid, "message":
              "Skipped %d GIF or animated WebP (%s): open them on the Single page."
              % (len(skipped), ", ".join(s["name"] for s in skipped))})
     total = len(files)
     if total == 0:
-        found = "No images found in the input folder."
+        listed = req.get("files") is not None
+        found = "No images are selected." if listed else "No images found in the input folder."
         if skipped:
             found += " Skipped %d GIF or animated WebP: open them on the Single page." \
                 % len(skipped)
-        raise NoImagesError(indir, found)
+        raise NoImagesError(req.get("input_dir") or outdir, found)
     os.makedirs(outdir, exist_ok=True)
+    thumbs = req.get("thumbs")
+    if thumbs:
+        os.makedirs(thumbs, exist_ok=True)
     get_session(req["model"], rid)         # load + emit the device message
     alpha = req.get("alpha", False)
-    bg = req.get("bg", "transparent")
     blur = req.get("blur", background.STRENGTH_DEFAULT)
     taken = batchnames.taken_by(files)     # a source is never an output
     renamed = 0                            # results written under a numbered name
@@ -673,40 +860,32 @@ def handle_batch(req):
             out({"type": "canceled", "scope": "batch", "done": i - 1,
                  "total": total, "id": rid})
             return
-        out({"type": "progress", "done": i - 1, "total": total,
-             "name": os.path.basename(f), "id": rid})
+        name = os.path.basename(f)
+        out({"type": "progress", "done": i - 1, "total": total, "name": name, "id": rid})
+        out({"type": "batch_file", "input": f, "name": name, "state": "working", "id": rid})
         # One file that can't be read must not cost the rest of the run.
-        part = None
         try:
             stem = batchnames.stem_for(pattern, f, i)
-            # The result is written into a file of the batch's own, and gets
-            # its name only once complete, from a call that never replaces a
-            # file: one that appears under that name meanwhile is kept.
-            part = batchnames.new_part(outdir, stem)
-            process_one(req["model"], rid, f, part, alpha, bg, blur,
-                        want_preview=False)
-            dst = batchnames.publish(part, outdir, stem, taken)
-            part = None
+            result = _batch_render(req["model"], rid, f, alpha, bg, blur)
+            dst = _publish_result(result, outdir, stem, fmt, taken)
         except _Canceled:
-            # A cancel that stopped a model download ends the run; its
-            # unfinished file must not stay behind.
-            if part is not None:
-                os.remove(part)
-            raise
+            raise                          # a cancel that stopped a model download
         except Exception as e:  # noqa: BLE001 - reported per file, run goes on
             print(f"batch: {f} failed:", file=sys.stderr)
             traceback.print_exc()
             sys.stderr.flush()
-            if part is not None:           # only ever the batch's own file
-                try:
-                    os.remove(part)
-                except OSError as rm_err:
-                    print(f"batch: could not remove {part}: {rm_err}", file=sys.stderr)
-            failed.append({"name": os.path.basename(f),
-                           "message": describe_error(e, {"input": f})})
+            message = describe_error(e, {"input": f})
+            failed.append({"name": name, "message": message})
+            out({"type": "batch_file", "input": f, "name": name, "state": "failed",
+                 "message": message, "id": rid})
             continue
-        if os.path.basename(dst) != stem + ".png":
+        if os.path.basename(dst) != stem + fmt.suffix:
             renamed += 1
+        done = {"type": "batch_file", "input": f, "name": name, "state": "done",
+                "output": dst, "id": rid}
+        if thumbs:
+            done["thumb"] = _write_batch_thumb(result, thumbs, i, bg)
+        out(done)
     out({"type": "progress", "done": total, "total": total, "name": "",
          "id": rid})
     out({"type": "done_batch", "count": total - len(failed), "total": total,
@@ -1298,6 +1477,13 @@ class _Cancels:
                 return CancelOutcome.SKIPPED
             return CancelOutcome.DROPPED
 
+    def cancel_all(self):
+        """The worker is exiting: stop the running request, skip the queued ones."""
+        with self._lock:
+            if self._running is not None:
+                self._running[1].set()
+            self._skipped |= self._waiting
+
 
 _cancels = _Cancels()
 
@@ -1330,7 +1516,8 @@ def main():
     _ready()
     _apply_engine_choice(refusal)
     q = queue.Queue()
-    threading.Thread(target=_worker_loop, args=(q,), daemon=True).start()
+    worker_thread = threading.Thread(target=_worker_loop, args=(q,), daemon=True)
+    worker_thread.start()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -1355,6 +1542,50 @@ def main():
             continue
         _cancels.queue(req.get("id"))
         q.put(req)
+    _exit_cleanly(q, worker_thread)
+
+
+# How long an exit gives the worker thread to end its request once no write is
+# in progress: enough to send its last replies, not to finish a model's image.
+_EXIT_JOIN_S = 1.0
+
+
+def _exit_cleanly(q, worker_thread):
+    """Stop the worker thread, let a result being written get its name, say
+    so in an "exiting" reply, and end the process.
+
+    The frontend waits for that reply before it stops waiting for the exit.
+    """
+    _cancels.cancel_all()
+    q.put(None)                            # the thread's loop ends after its request
+    part = _wait_for_write()
+    worker_thread.join(_EXIT_JOIN_S)
+    out({"type": "exiting", "part_left": part is Part.LEFT})
+    if not worker_thread.is_alive():
+        return
+    # TRICK: os._exit skips the interpreter's finalization. That flushes stdout,
+    # which the still-running worker thread (a model can't be stopped midway)
+    # may hold the lock of; it then aborts: "could not acquire lock for
+    # <stdout> at interpreter shutdown, possibly due to daemon threads". No
+    # write is left to finish: _writing is held, or its part was deleted.
+    sys.stderr.flush()
+    os._exit(0)
+
+
+def _wait_for_write():
+    """Wait for a batch result being written to get its name, and keep the
+    worker thread from starting another. Past _EXIT_WRITE_WAIT_S, delete its
+    part file instead, where the system allows it."""
+    if _writing.acquire(timeout=_EXIT_WRITE_WAIT_S):
+        return Part.GONE
+    part = _part_in_progress
+    if part is None:
+        return Part.GONE
+    left = _remove_part(part)
+    if left is Part.LEFT:
+        sys.stderr.write("exit: a batch result was still being written after %.1f s, "
+                         "and its part file %s stays\n" % (_EXIT_WRITE_WAIT_S, part))
+    return left
 
 
 if __name__ == "__main__":
