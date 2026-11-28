@@ -101,6 +101,11 @@ class Prep(enum.Enum):
     SEGMENT = "segment"          # Segment's model load
 
 
+class WorkerState(enum.Enum):
+    UP = "up"          # started; requests go through
+    DOWN = "down"      # failed to start or exited: nothing would answer
+
+
 @dataclass
 class _PendingOpen:
     """A source the worker is decoding or probing before the app adopts it."""
@@ -376,12 +381,30 @@ def action_bar(primary=None, secondary=(), cancel=None, save=None, status_text="
     return bar, status, spinner
 
 
-class Worker:
-    """Owns the venv subprocess and dispatches replies to the main loop."""
+def _exit_code_text(code):
+    """An exit code as people look it up: a negative one names the signal,
+    and a Windows crash code (above 255) reads in hex."""
+    if code < 0:
+        return "%d (killed by signal %d)" % (code, -code)
+    if code > 255:
+        return "0x%08X" % code
+    return str(code)
 
-    def __init__(self, on_message):
+
+class Worker:
+    """Owns the venv subprocess and dispatches replies to the main loop.
+
+    When the process ends on its own (a crash, a failed start), the window
+    gets a ``{"type": "worker_exited", "code": N}`` message, as if the worker
+    had sent it.
+    """
+
+    def __init__(self, on_message, first_id=1):
         self._on_message = on_message
-        self._next_id = 1
+        # A restarted worker continues the old one's ids, so a late reply or
+        # a request still tracked from before can never match a new request.
+        self._next_id = first_id
+        self._closing = False
         self.ok = False
         self.error = None
         # Requests sent before the worker's "ready", in order; None once it came.
@@ -394,8 +417,9 @@ class Worker:
                 creationflags=plat.subprocess_flags(), env=plat.worker_env())
             threading.Thread(target=self._reader, daemon=True).start()
             self.ok = True
-        except Exception as e:
-            self.error = str(e)
+        except OSError as e:
+            self.error = plain_reason(e)
+            _log.error("starting the worker %s %s failed", VENV_PY, WORKER, exc_info=e)
 
     def _reader(self):
         for line in self.proc.stdout:
@@ -404,20 +428,35 @@ class Worker:
                 continue
             try:
                 msg = json.loads(line)
-            except Exception:
-                continue
+            except ValueError:
+                continue             # a stray print from a library, not a reply
             # Above redraw priority: at the default idle priority, a reply could
             # wait for as long as the Segment outlines kept animating, which on
             # Windows starved it until the next input event.
             GLib.idle_add(self._on_message, msg, priority=GLib.PRIORITY_DEFAULT)
+        # stdout closes when the process ends: say so, unless we asked it to.
+        # From here on nothing is sent: no reply would ever come.
+        code = self.proc.wait()
+        self.ok = False
+        if not self._closing:
+            GLib.idle_add(self._on_message, {"type": "worker_exited", "code": code},
+                          priority=GLib.PRIORITY_DEFAULT)
+
+    @property
+    def next_id(self):
+        return self._next_id
 
     def send(self, req):
+        """Send `req` with an id of its own; return the id, or -1 when the
+        worker isn't there to answer (never started, exited, or its pipe broke)."""
         if not self.ok:
             return -1
         rid = self._next_id
         self._next_id += 1
         req["id"] = rid
         self._post(req)
+        if not self.ok:
+            return -1                   # writing it found the pipe broken
         return rid
 
     def cancel(self, rid):
@@ -440,8 +479,8 @@ class Worker:
         try:
             self.proc.stdin.write(json.dumps(req) + "\n")
             self.proc.stdin.flush()
-        except Exception:
-            pass
+        except (OSError, ValueError):   # ValueError: the pipe is already closed
+            self.ok = False             # the reader reports the exit itself
 
     def started(self):
         """The worker sent "ready": send what waited for it."""
@@ -452,6 +491,7 @@ class Worker:
     def shutdown(self):
         if not self.ok:
             return
+        self._closing = True
         try:
             self.proc.stdin.write('{"op":"shutdown"}\n')
             self.proc.stdin.flush()
@@ -625,6 +665,7 @@ class Window(Adw.ApplicationWindow):
         self._settings_path = None     # the worker's settings.json, from its "ready"
         self._engine_switch = None     # an Engine label waiting for a new worker, or None
         self._start_worker()
+        self._worker_state = WorkerState.UP if self.worker.ok else WorkerState.DOWN
 
         self.toasts = Adw.ToastOverlay()
         self.set_content(self.toasts)
@@ -655,6 +696,11 @@ class Window(Adw.ApplicationWindow):
                                   menu_model=menu)
         header.pack_end(menu_btn)
         tv.add_top_bar(header)
+        # Stays up while there is no worker, since nothing would answer a request.
+        self.worker_banner = Adw.Banner()
+        self.worker_banner.set_button_label("Restart")
+        self.worker_banner.connect("button-clicked", lambda *_: self._restart_worker())
+        tv.add_top_bar(self.worker_banner)
 
         body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         body.append(self._build_sidebar())
@@ -700,7 +746,8 @@ class Window(Adw.ApplicationWindow):
 
         self.connect("close-request", self._on_close)
         if not self.worker.ok:
-            self._toast("Could not start the worker. Is it installed?")
+            self._show_worker_down("Could not start the background process (%s)."
+                                   % self.worker.error)
 
     # ---------- sidebar ----------
     def _build_sidebar(self):
@@ -878,13 +925,17 @@ class Window(Adw.ApplicationWindow):
         self.device_dot.add_css_class(cls)
         self.device_dot.set_tooltip_text(label)
 
-    def _start_worker(self):
-        """Start this window's worker; replies from one it replaced are dropped."""
+    def _start_worker(self, first_id=1):
+        """Start this window's worker; replies from one it replaced are dropped.
+
+        A replacement starts its ids at `first_id`, the old worker's next one,
+        so no request id is ever used twice.
+        """
         def deliver(msg):
             if self.worker is worker:
                 self._on_worker_message(msg)
 
-        worker = Worker(deliver)
+        worker = Worker(deliver, first_id=first_id)
         self.worker = worker
 
     def _offer_engines(self, on_offer, settings_path):
@@ -934,7 +985,7 @@ class Window(Adw.ApplicationWindow):
         for req in self._abandoned.values():
             self._remove_temp_input(req.input)
         self._abandoned.clear()
-        self._start_worker()
+        self._start_worker(first_id=old.next_id)
         threading.Thread(target=old.shutdown, daemon=True).start()
         self._toast("Engine: %s." % label)
 
@@ -1206,7 +1257,8 @@ class Window(Adw.ApplicationWindow):
     # ---------- segmentation actions ----------
     def _seg_set_busy(self, busy, cancel=False):
         self.seg_busy = busy
-        self.seg_everything_btn.set_sensitive(not busy)
+        self.seg_everything_btn.set_sensitive(
+            not busy and self._worker_state is WorkerState.UP)
         self.seg_selall_btn.set_sensitive(not busy)
         self.seg_cancel_btn.set_sensitive(busy and cancel)
         (self.seg_spinner.start if busy else self.seg_spinner.stop)()
@@ -1227,6 +1279,8 @@ class Window(Adw.ApplicationWindow):
     def _ensure_seg_loaded(self, cb):
         if not self.source_path:
             self._toast("Open an image first.")
+            return
+        if self._worker_state is WorkerState.DOWN:
             return
         # The model loaded for this image, and the model asked for: a load
         # still running for another model doesn't count when it lands.
@@ -1710,9 +1764,10 @@ class Window(Adw.ApplicationWindow):
             button.set_sensitive(False)
 
     def _release_source_actions(self):
-        self.gen_btn.set_sensitive(not self.busy and self.src_panel.view.has_image())
+        up = self._worker_state is WorkerState.UP
+        self.gen_btn.set_sensitive(not self.busy and self.src_panel.view.has_image() and up)
         self.save_btn.set_sensitive(self.result_output is not None)
-        self.seg_everything_btn.set_sensitive(not self.seg_busy)
+        self.seg_everything_btn.set_sensitive(not self.seg_busy and up)
         self.seg_save_btn.set_sensitive(self.seg_result_output is not None)
 
     def _drop_old_source_jobs(self):
@@ -1766,6 +1821,8 @@ class Window(Adw.ApplicationWindow):
         self.result_output = None
         self.save_btn.set_sensitive(False)
         self.gen_btn.set_sensitive(not self.busy)   # a batch may still be running
+        if self._worker_state is not WorkerState.UP:
+            self.gen_btn.set_sensitive(False)       # no worker to run it
         if animation is formats.Animation.ANIMATED:
             tail = " — animated %s, press Generate." % formats.format_of(path).name
         else:
@@ -1975,12 +2032,14 @@ class Window(Adw.ApplicationWindow):
 
     def _sync_batch(self):
         self.run_btn.set_sensitive(
-            bool(self.batch_input and self.batch_output) and not self.busy)
+            bool(self.batch_input and self.batch_output) and not self.busy
+            and self._worker_state is WorkerState.UP)
 
     # ---------- actions ----------
     def _set_busy(self, busy, spin=True, cancel=False):
         self.busy = busy
-        self.gen_btn.set_sensitive(not busy and self.src_panel.view.has_image())
+        self.gen_btn.set_sensitive(not busy and self.src_panel.view.has_image()
+                                   and self._worker_state is WorkerState.UP)
         self.gen_cancel_btn.set_sensitive(busy and cancel)
         self.batch_cancel_btn.set_sensitive(busy and cancel)
         self._sync_batch()
@@ -2001,6 +2060,8 @@ class Window(Adw.ApplicationWindow):
 
     def _on_generate(self):
         if self.busy or self._has_job(Job.OPEN) or not self.src_panel.view.has_image():
+            return
+        if self._worker_state is WorkerState.DOWN:
             return
         model, bg, alpha, blur = self.get_settings()
         if self._source_animation is formats.Animation.ANIMATED:
@@ -2059,7 +2120,8 @@ class Window(Adw.ApplicationWindow):
             self.batch_status.set_text("Cancelling…")
 
     def _on_run_batch(self):
-        if self.busy or not (self.batch_input and self.batch_output):
+        if (self.busy or not (self.batch_input and self.batch_output)
+                or self._worker_state is WorkerState.DOWN):
             return
         model, bg, alpha, blur = self.get_settings()
         pattern = self.pattern_row.get_text().strip() or "{name}_nobg"
@@ -2097,7 +2159,10 @@ class Window(Adw.ApplicationWindow):
         if job is Job.SAVE:
             self._on_save_reply(req.save, msg)
             return False
-        if t == "ready":
+        if t == "worker_exited":
+            self._show_worker_down("The background process stopped (exit code %s)."
+                                   % _exit_code_text(msg["code"]))
+        elif t == "ready":
             self.worker.started()
             self._offer_engines(msg.get("engines") or ["ort"], msg.get("settings"))
             provs = msg.get("providers") or []
@@ -2335,6 +2400,51 @@ class Window(Adw.ApplicationWindow):
 
     def _toast(self, text):
         self.toasts.add_toast(Adw.Toast(title=text, timeout=3))
+
+    def _show_worker_down(self, what):
+        """No worker: say so until it's restarted, and stop offering actions."""
+        self._worker_state = WorkerState.DOWN
+        self._end_requests_in_flight()
+        self.seg_pending = None
+        self.seg_loaded_for = None
+        self._set_busy(False)
+        self._seg_set_busy(False)
+        self._release_source_actions()
+        self.worker_banner.set_title("%s Its log: %s" % (what, LOG))
+        self.worker_banner.set_revealed(True)
+        self.device_lbl.set_text("No background process")
+        for label in (self.status, self.batch_status, self.seg_status):
+            label.set_text("The background process isn't running. Press Restart.")
+
+    def _end_requests_in_flight(self):
+        """Nothing will answer the requests in flight: end each one here."""
+        lost = list(self._jobs.values()) + list(self._abandoned.values())
+        self._jobs.clear()
+        self._abandoned.clear()
+        self._preparing.clear()
+        for req in lost:
+            self._remove_temp_input(req.input)
+            if req.job is Job.SAVE:
+                self._on_save_reply(req.save, {
+                    "type": "error", "message": "the background process stopped."})
+
+    def _restart_worker(self):
+        self.worker.shutdown()
+        # Before the new worker exists, so none of the old requests waits on it.
+        self._end_requests_in_flight()
+        self._start_worker(first_id=self.worker.next_id)
+        if not self.worker.ok:
+            self._show_worker_down("Could not start the background process (%s)."
+                                   % self.worker.error)
+            return
+        self._worker_state = WorkerState.UP
+        self.worker_banner.set_revealed(False)
+        self.device_lbl.set_text("Detecting device…")
+        for label in (self.status, self.batch_status, self.seg_status):
+            label.set_text("Restarted.")
+        self._set_busy(False)
+        self._seg_set_busy(False)
+        self._release_source_actions()
 
     def _report_failure(self, what, exc, text):
         """A frontend failure: traceback to the log, `text` on screen."""
