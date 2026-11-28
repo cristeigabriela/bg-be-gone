@@ -18,7 +18,11 @@ and for the frontend:
 - ``worker_log_path()``: the file the worker's stderr goes to.
 - ``subprocess_flags()`` and ``worker_env()``: Popen's ``creationflags`` and
   ``env`` for the worker (an ``env`` of None means inherit).
+- ``frontend_starting()``: set-up that must happen before GTK initialises.
 - ``frontend_started(app_id)``: platform set-up once GTK is up.
+- ``frontend_window(window)``: called with the main window once presented.
+- ``frontend_handed_off()``: this start passed its files to a bg-be-gone
+  already running, and ends without a window.
 """
 import os
 
@@ -26,7 +30,10 @@ if os.name == "nt":
     from .windows import (
         config_dir,
         default_worker_python,
+        frontend_handed_off,
         frontend_started,
+        frontend_starting,
+        frontend_window,
         kernel_cache_dir,
         models_dir,
         prepare_process,
@@ -41,7 +48,10 @@ else:
     from .linux import (
         config_dir,
         default_worker_python,
+        frontend_handed_off,
         frontend_started,
+        frontend_starting,
+        frontend_window,
         kernel_cache_dir,
         models_dir,
         prepare_process,
@@ -53,6 +63,7 @@ else:
         worker_log_path,
     )
 
-__all__ = ["config_dir", "default_worker_python", "frontend_started", "kernel_cache_dir",
-           "models_dir", "prepare_process", "probe_vram", "provider_options", "subprocess_flags",
+__all__ = ["config_dir", "default_worker_python", "frontend_handed_off", "frontend_started",
+           "frontend_starting", "frontend_window", "kernel_cache_dir", "models_dir",
+           "prepare_process", "probe_vram", "provider_options", "subprocess_flags",
            "unusable_providers", "worker_env", "worker_log_path"]

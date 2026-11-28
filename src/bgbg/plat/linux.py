@@ -280,5 +280,17 @@ def worker_env(environ=None):
     return None
 
 
+def frontend_starting():
+    """Called before GTK initialises. GTK picks its renderer itself on Linux."""
+
+
 def frontend_started(app_id):
     """Called once GTK is up. The .desktop file names the window icon on Linux."""
+
+
+def frontend_window(window):
+    """Called with the main window once presented. Nothing to do on Linux."""
+
+
+def frontend_handed_off():
+    """Called when this start passed its files to a running bg-be-gone."""

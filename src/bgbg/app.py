@@ -16,7 +16,10 @@ import subprocess
 from dataclasses import dataclass
 from typing import Optional
 
-import gi
+import plat
+plat.frontend_starting()   # before GTK initialises: it reads GDK_DEBUG then
+
+import gi  # noqa: E402
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("GdkPixbuf", "2.0")
@@ -25,7 +28,6 @@ from gi.repository import Gtk, Gdk, GdkPixbuf, Gio, GLib, Adw  # noqa: E402
 
 from viewer import ImageView  # noqa: E402
 import formats  # noqa: E402
-import plat  # noqa: E402
 from engines import selection  # noqa: E402  (standard library only)
 
 APP_ID = "io.github.cristeigabriela.BgBeGone"
@@ -2046,6 +2048,7 @@ class App(Adw.Application):
             win._load_source(self._pending_open)
             self._pending_open = None
         win.present()
+        plat.frontend_window(win)
         if SELFTEST:
             if not win.worker.ok:
                 _finish_selftest(win, {"ok": False, "error": win.worker.error})
@@ -2082,7 +2085,11 @@ def main():
     # Shares the worker's log file, so one file tells the whole story.
     logging.basicConfig(filename=LOG, level=logging.INFO,
                         format="%(asctime)s frontend %(levelname)s: %(message)s")
-    return App().run(sys.argv)
+    app = App()
+    status = app.run(sys.argv)
+    if app.get_is_remote():
+        plat.frontend_handed_off()
+    return status
 
 
 if __name__ == "__main__":
