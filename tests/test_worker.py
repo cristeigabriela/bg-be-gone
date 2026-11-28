@@ -3,6 +3,7 @@
 Uses rembg's smallest model (u2netp, ~5 MB), downloaded on first use into
 U2NET_HOME; CI caches it.
 """
+import importlib.metadata
 import json
 import os
 import shutil
@@ -60,8 +61,11 @@ def test_the_ready_message_carries_every_field_the_frontend_reads(worker):
 def test_every_model_the_worker_lists_is_described_or_left_out_on_purpose(worker):
     unaccounted = (set(worker.ready["models"]) - set(modelinfo.BG_MODELS)
                    - set(modelinfo.NOT_OFFERED))
+    # The worker runs on this interpreter, so this is the rembg it lists.
+    rembg = importlib.metadata.version("rembg")
     assert not unaccounted, \
-        "each model needs a modelinfo entry or a NOT_OFFERED reason: %s" % sorted(unaccounted)
+        "rembg %s lists models with no modelinfo entry or NOT_OFFERED reason: %s" % (
+            rembg, sorted(unaccounted))
 
 
 def test_every_model_the_picker_offers_is_one_the_worker_runs(worker):

@@ -133,6 +133,11 @@ NOT_OFFERED = {
     "u2net_custom": "needs a model file of your own",
     "dis_custom": "needs a model file of your own",
     "ben_custom": "needs a model file of your own",
+    # From rembg 2.0.88.
+    "atlascloud": "sends the photo to Atlas Cloud's API, with an API key; the app stays local",
+    "withoutbg": "sends the photo to withoutBG's API, with an API key; the app stays local",
+    "birefnet-general-fp16": "BiRefNet General converted to fp16 on first use, not measured",
+    "birefnet-dynamic": "BiRefNet for any input size, not measured",
 }
 
 # Segment's models, best first: rung -> what it is. Download is the zip
