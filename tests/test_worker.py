@@ -49,7 +49,7 @@ def test_a_single_cutout_succeeds(worker, tmp_path):
 
 def test_the_ready_message_carries_every_field_the_frontend_reads(worker):
     assert set(worker.ready) == {"type", "models", "providers", "bgremove", "seg",
-                                 "seg_models", "engines", "settings"}, \
+                                 "seg_models", "engines", "engine", "settings"}, \
         "the frontend reads each of these on start-up"
     assert worker.ready["engines"][0] == "ort", "ONNX Runtime is always on offer"
     assert worker.ready["providers"][-1] == "CPUExecutionProvider", \

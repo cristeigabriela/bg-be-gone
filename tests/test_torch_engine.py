@@ -83,6 +83,24 @@ def test_pytorch_is_on_offer_when_installed(start_worker, torch_env):
     assert w.ready["engines"] == ["ort", "torch"], "the frontend shows the Engine setting"
 
 
+@pytest.mark.parametrize(
+    "asked, expected",
+    [
+        # Nothing asks for PyTorch: ONNX Runtime, as every install starts.
+        ({}, "ort"),
+        # Asked for and installed: PyTorch, before its start-up has even run.
+        ({"BGBG_ENGINE": "torch"}, "torch"),
+        # Asked for but switched off: ONNX Runtime, the engine that will run.
+        ({"BGBG_ENGINE": "torch", "BGBG_NO_TORCH": "1"}, "ort"),
+    ],
+    ids=["nothing asked", "pytorch asked", "pytorch switched off"],
+)
+def test_ready_names_the_engine_that_runs_birefnet(start_worker, torch_env, asked, expected):
+    w = start_worker(dict(torch_env, **asked))
+    assert w.ready["engine"] == expected, \
+        "the frontend shows this engine's VRAM from the start"
+
+
 @pytest.mark.parametrize("switch", ["BGBG_NO_TORCH", "BGBG_NO_ROCM"])
 def test_a_kill_switch_takes_pytorch_off_the_table(start_worker, torch_env, switch):
     env = dict(torch_env, BGBG_ENGINE="torch", **{switch: "1"})

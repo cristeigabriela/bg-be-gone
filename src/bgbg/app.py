@@ -37,6 +37,9 @@ from viewer import (  # noqa: E402
 )
 import batchnames  # noqa: E402
 import formats  # noqa: E402
+from gi.repository import Graphene, Pango  # noqa: E402
+import modelinfo  # noqa: E402
+from modelinfo import Device, Pick  # noqa: E402
 from engines import selection  # noqa: E402  (standard library only)
 import offmain  # noqa: E402
 import settings  # noqa: E402
@@ -274,19 +277,7 @@ SUBJECTS = [
     ("Anime / illustration", "isnet-anime"),
     ("Fast (lower quality)", "u2net"),
 ]
-MODELS = [
-    ("BiRefNet — General", "birefnet-general"),
-    ("BiRefNet — General Lite", "birefnet-general-lite"),
-    ("BiRefNet — Massive", "birefnet-massive"),
-    ("BiRefNet — Portrait", "birefnet-portrait"),
-    ("BiRefNet — HRSOD", "birefnet-hrsod"),
-    ("BiRefNet — DIS", "birefnet-dis"),
-    ("ISNet — General", "isnet-general-use"),
-    ("ISNet — Anime", "isnet-anime"),
-    ("U2Net", "u2net"),
-    ("U2Net — Human Seg", "u2net_human_seg"),
-    ("Silueta", "silueta"),
-]
+CUSTOM_SUBJECT = "custom"      # the Subject entry that reveals the Model row
 # Model > Advanced > Engine: what runs BiRefNet. Automatic leaves it to the
 # install's profile, then ONNX Runtime (engines/selection.py).
 ENGINES = [
@@ -302,6 +293,23 @@ BGS = [
     ("Green screen", "#00b140"),
     ("Custom…", "custom"),
 ]
+# Segment's model row: its Automatic entry, and seg_ready's mode -> how the model was picked.
+SEG_AUTO = "auto"
+SEG_PICKS = {p.value: p for p in (Pick.AUTO, Pick.MANUAL, Pick.FALLBACK)}
+
+
+def _seg_reason(seg_ready):
+    """Why Auto's pick fits, in a few words: "11.2 GB free", or None.
+
+    ``vram_free`` (MiB) in seg_ready is the free VRAM the worker measured when
+    Auto picked; it's null when nothing was probed. It only matters on the GPU.
+    """
+    free = seg_ready.get("vram_free")
+    if not seg_ready.get("gpu") or free is None:
+        return None
+    return modelinfo.free_text(free)
+
+
 SEG_MODES = [
     ("Everything — pick layers", "everything"),
     ("Click to select", "point"),
@@ -380,6 +388,162 @@ button.suggested-action.pill { box-shadow: 0 4px 14px alpha(@accent_bg_color, 0.
 .dev-dml    { background: #0a84ff; box-shadow: 0 0 8px alpha(#0a84ff, 0.6); }
 .dev-cpu    { background: #9aa0a6; }
 """
+
+
+def model_picker(title, sections, describe):
+    """An Adw.ComboRow of models, in titled sections, two lines per model.
+
+    The row shows a model's short name. The open list shows its full name and
+    a dim line under it, and never ellipsizes, so it grows as wide as its
+    longest line instead of cutting names off.
+
+    Args:
+        title: the row's title.
+        sections: ``[(header or None, [key, ...]), ...]`` in picker order.
+        describe: ``key -> (short, name, subtitle)``, read each time a model is shown.
+
+    Returns:
+        ``(row, refresh)``: the row, whose selected item is a Gtk.StringObject
+        holding the key, and a function that redraws every entry, for when
+        what ``describe`` says has changed (the engine, and so the VRAM).
+    """
+    stores = Gio.ListStore(item_type=Gio.ListModel)
+    headers = {}            # first key of a section -> that section's header
+    for header, keys in sections:
+        stores.append(Gtk.StringList.new(keys))
+        if header and keys:
+            headers[keys[0]] = header
+    # A flattened list of lists is a section model: one section per list.
+    model = Gtk.FlattenListModel.new(stores)
+
+    def setup_value(_factory, item):
+        # The row may ellipsize; the open list shows the whole name.
+        item.set_child(Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END))
+
+    def bind_value(_factory, item):
+        item.get_child().set_label(describe(item.get_item().get_string())[0])
+
+    def setup_entry(_factory, item):
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        text.append(Gtk.Label(xalign=0))
+        sub = Gtk.Label(xalign=0)
+        sub.add_css_class("dim-label")
+        sub.add_css_class("caption")
+        text.append(sub)
+        # A custom list factory drops libadwaita's checkmark, so draw our own.
+        check = Gtk.Image(icon_name="object-select-symbolic")
+        entry = Gtk.Box(spacing=12)
+        entry.append(text)
+        entry.append(check)
+        item.set_child(entry)
+        item.connect("notify::selected",
+                     lambda it, _pspec: check.set_opacity(1 if it.get_selected() else 0))
+
+    def bind_entry(_factory, item):
+        _short, name, subtitle = describe(item.get_item().get_string())
+        text = item.get_child().get_first_child()
+        text.get_first_child().set_label(name)
+        text.get_last_child().set_label(subtitle)
+        text.get_next_sibling().set_opacity(1 if item.get_selected() else 0)
+
+    def setup_header(_factory, header):
+        # Indented to line up with the entries' text: list headers get no row padding.
+        label = Gtk.Label(xalign=0, margin_start=16, margin_top=6, margin_bottom=2)
+        label.add_css_class("caption-heading")
+        label.add_css_class("dim-label")
+        header.set_child(label)
+
+    header_labels = set()   # every header label made, to find a section's on screen
+
+    def bind_header(_factory, header):
+        label = header.get_child()
+        label.set_label(headers.get(header.get_item().get_string(), ""))
+        header_labels.add(label)
+
+    def factory(setup, bind):
+        f = Gtk.SignalListItemFactory()
+        f.connect("setup", setup)
+        f.connect("bind", bind)
+        return f
+
+    row = Adw.ComboRow(title=title, model=model)
+
+    def refresh():
+        # New factories rebind every entry, and the row's own value.
+        row.set_factory(factory(setup_value, bind_value))
+        row.set_list_factory(factory(setup_entry, bind_entry))
+    refresh()
+    # Section headers need libadwaita 1.6; older ones list the same models unheaded.
+    if not headers or not hasattr(row, "set_header_factory"):
+        return row, refresh
+    row.set_header_factory(factory(setup_header, bind_header))
+
+    # The section each position is in: (its first position, its header).
+    section_of, at = [], 0
+    for header, keys in sections:
+        section_of += [(at, header)] * len(keys)
+        at += len(keys)
+
+    # The list opens on the selected model with its section's header above it.
+    # libadwaita keeps the list where it was, and GTK, scrolling to a row,
+    # stops with the row at the edge and its header out of sight.
+    def scroll_to_selected(listview, scrolled):
+        selected = max(row.get_selected(), 0)
+        listview.scroll_to(selected, Gtk.ListScrollFlags.NONE, None)
+        _after_next_frame(scrolled, show_header, listview, scrolled, selected, 1)
+
+    def show_header(listview, scrolled, selected, retries):
+        start, header = section_of[selected]
+        label = next((w for w in header_labels
+                      if w.get_mapped() and w.get_label() == header), None)
+        if label is None:
+            # Too far up to have a widget: bring the section's first row in, then look again.
+            if retries:
+                listview.scroll_to(start, Gtk.ListScrollFlags.NONE, None)
+                _after_next_frame(scrolled, show_header, listview, scrolled, selected,
+                                  retries - 1)
+            return
+        ok, at = label.get_parent().compute_point(scrolled, Graphene.Point())
+        if ok and at.y < 0:
+            # Sections are shorter than the list, so the selection stays in view.
+            adj = scrolled.get_vadjustment()
+            adj.set_value(0.0 if start == 0 else max(0.0, adj.get_value() + at.y))
+
+    popover = next((w for w in _descendants(row) if isinstance(w, Gtk.Popover)), None)
+    inside = list(_descendants(popover)) if popover is not None else []
+    listview = next((w for w in inside if isinstance(w, Gtk.ListView)), None)
+    scrolled = next((w for w in inside if isinstance(w, Gtk.ScrolledWindow)), None)
+    if listview is not None and scrolled is not None:
+        popover.connect("map", lambda *_: _after_next_frame(
+            scrolled, scroll_to_selected, listview, scrolled))
+    return row, refresh
+
+
+def _after_next_frame(widget, callback, *args):
+    """Call `callback(*args)` once, after `widget`'s next frame is laid out and drawn.
+
+    An idle callback can run before the frame it waits for: the frame clock
+    paces frames to the display, and idles run whenever the loop is free.
+    """
+    clock = widget.get_frame_clock()
+    if clock is None:
+        return
+    handler = None
+
+    def run(_clock):
+        clock.disconnect(handler)
+        callback(*args)
+    handler = clock.connect("after-paint", run)
+    clock.request_phase(Gdk.FrameClockPhase.AFTER_PAINT)
+
+
+def _descendants(widget):
+    """Every widget under `widget`, depth first."""
+    child = widget.get_first_child()
+    while child is not None:
+        yield child
+        yield from _descendants(child)
+        child = child.get_next_sibling()
 
 
 def primary_button(label, icon=None):
@@ -721,7 +885,10 @@ class Window(Adw.ApplicationWindow):
         self._seg_models = []          # [{"rung","label"}] from the worker
         self.seg_loaded_for = None     # (source path, model asked for) the worker holds
         self.seg_pending = None        # callback to run once seg_ready arrives
-        self._seg_active_model = None  # label of the SAM model last loaded
+        self._seg_in_use = None        # the seg_ready that loaded Segment's model, or None
+        # The engine that runs BiRefNet, from the worker's "ready": the model
+        # rows show its download size and VRAM.
+        self._bg_engine = selection.Engine.ORT
         self.seg_busy = False
         self.seg_objects = []
         self.seg_points = []           # accumulated [x, y, label] in point mode
@@ -856,7 +1023,7 @@ class Window(Adw.ApplicationWindow):
             self.subject_row.set_selected(subjects.index(s["subject"]))
         elif s.get("subject") == "custom":
             self.subject_row.set_selected(len(SUBJECTS))
-        models = [v for _, v in MODELS]
+        models = list(modelinfo.BG_MODELS)
         if s.get("model") in models:
             self.model_row.set_selected(models.index(s["model"]))
         backgrounds = [v for _, v in BGS]
@@ -879,7 +1046,7 @@ class Window(Adw.ApplicationWindow):
             subject=("custom" if self.subject_row.get_selected() >= len(SUBJECTS)
                      else SUBJECTS[self.subject_row.get_selected()][1])))
         self.model_row.connect("notify::selected", lambda *_: self._remember(
-            model=MODELS[self.model_row.get_selected()][1]))
+            model=self.model_row.get_selected_item().get_string()))
         self.bg_row.connect("notify::selected", lambda *_: self._remember(
             background=BGS[self.bg_row.get_selected()][1]))
         self.color_btn.connect("notify::rgba", lambda *_: self._remember(
@@ -928,19 +1095,20 @@ class Window(Adw.ApplicationWindow):
         # entry that reveals the exact-model list (same pattern as the Background
         # "Custom…" colour reveal). No hidden mode flag.
         model_grp = Adw.PreferencesGroup(title="Model")
-        self.subject_row = Adw.ComboRow(
-            title="Subject",
-            model=Gtk.StringList.new([s[0] for s in SUBJECTS] + ["Custom model…"]))
-        self.subject_row.set_subtitle("What the image mainly contains")
+        self.subject_row, self._refresh_subject_entries = model_picker(
+            "Subject", [(None, [s[1] for s in SUBJECTS] + [CUSTOM_SUBJECT])],
+            self._describe_subject)
         self.subject_row.connect("notify::selected", self._on_subject_changed)
         model_grp.add(self.subject_row)
 
-        self.model_row = Adw.ComboRow(
-            title="Model", model=Gtk.StringList.new([m[0] for m in MODELS]))
-        self.model_row.set_subtitle("Exact rembg model")
+        self.model_row, self._refresh_model_entries = model_picker(
+            "Model",
+            [(family.value, keys) for family, keys in modelinfo.by_family(modelinfo.BG_MODELS)],
+            self._describe_bg_model)
         self.model_row.set_visible(False)
-        self.model_row.connect("notify::selected", lambda *_: self._mark_stale())
+        self.model_row.connect("notify::selected", self._on_bg_model_changed)
         model_grp.add(self.model_row)
+        self._refresh_bg_subtitles()
 
         # Shown only when the worker says it can run PyTorch, so an install
         # without it looks as it always did.
@@ -1087,14 +1255,13 @@ class Window(Adw.ApplicationWindow):
         if page == "segment":
             # The model actually loaded, once there is one: Auto, or a step-down
             # after a failure, may differ from the row's choice.
-            it = self.seg_model_row.get_selected_item()
-            model = self._seg_active_model or (it.get_string() if it is not None else "")
+            model = self._seg_model_name()
             mode = "Click" if self._seg_mode() == "point" else "Everything"
             return "Segment · %s · %s" % (mode, model) if model else "Segment · %s" % mode
         if page == "batch":
             return "Batch"
         i = self.subject_row.get_selected()
-        name = (MODELS[self.model_row.get_selected()][0] if i >= len(SUBJECTS)
+        name = (modelinfo.BG_MODELS[self._bg_model_key()].short if i >= len(SUBJECTS)
                 else SUBJECTS[i][0])
         return "Single · %s" % name
 
@@ -1186,9 +1353,51 @@ class Window(Adw.ApplicationWindow):
         # The exact-model picker only appears for the "Custom model…" entry.
         custom = self.subject_row.get_selected() >= len(SUBJECTS)
         self.model_row.set_visible(custom)
+        self._on_bg_model_changed()
+
+    def _on_bg_model_changed(self, *_):
+        self._refresh_bg_subtitles()
         self._mark_stale()
         if getattr(self, "footer_context", None) is not None:
             self._update_footer()
+
+    def _bg_model_key(self):
+        """The background-removal model the Model group picks."""
+        i = self.subject_row.get_selected()
+        if i >= len(SUBJECTS):                      # "Custom model…"
+            return self.model_row.get_selected_item().get_string()
+        return SUBJECTS[i][1]
+
+    def _describe_subject(self, key):
+        if key == CUSTOM_SUBJECT:
+            return "Custom model…", "Custom model…", "any model, by name"
+        label = next(s[0] for s in SUBJECTS if s[1] == key)
+        info = modelinfo.BG_MODELS[key]
+        return label, label, modelinfo.row_subtitle(Pick.PRESET, info, self._bg_engine)
+
+    def _describe_bg_model(self, key):
+        info = modelinfo.BG_MODELS[key]
+        return info.short, info.name, modelinfo.entry_subtitle(info, self._bg_engine)
+
+    def _set_bg_engine(self, engine):
+        """Show the download size and VRAM of `engine`, the one that runs BiRefNet."""
+        if engine is self._bg_engine:
+            return
+        self._bg_engine = engine
+        self._refresh_subject_entries()
+        self._refresh_model_entries()
+        self._refresh_bg_subtitles()
+
+    def _refresh_bg_subtitles(self):
+        """Name the model in use and what it costs, under the Model group's rows."""
+        info = modelinfo.BG_MODELS[self._bg_model_key()]
+        if self.subject_row.get_selected() >= len(SUBJECTS):
+            self.subject_row.set_subtitle("The model chosen below")
+            self.model_row.set_subtitle(
+                modelinfo.row_subtitle(Pick.MANUAL, info, self._bg_engine))
+        else:
+            self.subject_row.set_subtitle(
+                modelinfo.row_subtitle(Pick.PRESET, info, self._bg_engine))
 
     def _sync_color(self):
         bg = BGS[self.bg_row.get_selected()][1]
@@ -1203,11 +1412,7 @@ class Window(Adw.ApplicationWindow):
             self._update_seg_preview()
 
     def get_settings(self):
-        i = self.subject_row.get_selected()
-        if i >= len(SUBJECTS):                      # "Custom model…"
-            model = MODELS[self.model_row.get_selected()][1]
-        else:
-            model = SUBJECTS[i][1]
+        model = self._bg_model_key()
         bg = BGS[self.bg_row.get_selected()][1]
         if bg == "custom":
             c = self.color_btn.get_rgba()
@@ -1234,9 +1439,8 @@ class Window(Adw.ApplicationWindow):
         # (Device is shown once, in the sidebar footer — not duplicated here.)
         self.seg_adv = Adw.ExpanderRow(title="Advanced",
                                        subtitle="Model and detail")
-        self.seg_model_row = Adw.ComboRow(
-            title="Model", model=Gtk.StringList.new(["Auto"]))
-        self.seg_model_row.set_subtitle("Auto — by GPU / VRAM")
+        self.seg_model_row, _ = model_picker("Model", [(None, [SEG_AUTO])],
+                                             self._describe_seg_model)
         self.seg_model_row.connect("notify::selected", self._on_seg_model_changed)
         self.seg_adv.add_row(self.seg_model_row)
 
@@ -1247,27 +1451,73 @@ class Window(Adw.ApplicationWindow):
         self.seg_adv.add_row(self.seg_detail_row)
         grp.add(self.seg_adv)
         grp.set_visible(False)
+        self._refresh_seg_subtitles()
         return grp
 
-    def _vram_str(self, mb):
-        if not mb:
-            return "CPU · low VRAM"
-        return ("~%.1f GB" % (mb / 1000)).replace(".0", "")
-
     def _apply_seg_models(self):
-        names = ["Auto — best for your GPU"]
-        for m in self._seg_models:
-            names.append("%s · %s" % (m["label"], self._vram_str(m.get("vram", 0))))
+        rungs = [m["rung"] for m in self._seg_models]
         self._syncing_seg = True
-        self.seg_model_row.set_model(Gtk.StringList.new(names))
+        self.seg_model_row.set_model(Gtk.StringList.new([SEG_AUTO] + rungs))
         self.seg_model_row.set_selected(0)
         self._syncing_seg = False
+        self._refresh_seg_subtitles()
 
     def _seg_model_choice(self):
-        i = self.seg_model_row.get_selected()
-        if i <= 0 or i > len(self._seg_models):
-            return "auto"
-        return self._seg_models[i - 1]["rung"]
+        """The rung the row asks for, or "auto"."""
+        item = self.seg_model_row.get_selected_item()
+        return item.get_string() if item is not None else SEG_AUTO
+
+    def _seg_label(self, rung):
+        """A rung's name: ours, else the worker's, else the rung itself."""
+        info = modelinfo.SEG_MODELS.get(rung)
+        if info is not None:
+            return info.name
+        return next((m["label"] for m in self._seg_models if m["rung"] == rung), rung)
+
+    def _describe_seg_model(self, key):
+        if key == SEG_AUTO:
+            return "Auto", "Automatic", "the best model your free VRAM fits"
+        info = modelinfo.SEG_MODELS.get(key)
+        if info is None:
+            label = self._seg_label(key)
+            return label, label, ""
+        return info.short, info.name, modelinfo.entry_subtitle(info, selection.Engine.ORT)
+
+    def _seg_model_name(self):
+        """The model Segment uses, for the footer and the Advanced row."""
+        loaded = self._seg_in_use
+        if loaded is not None:
+            fallback = " (fallback)" if loaded.get("mode") == Pick.FALLBACK.value else ""
+            return self._seg_label(loaded["rung"]) + fallback
+        choice = self._seg_model_choice()
+        return "Auto" if choice == SEG_AUTO else self._seg_label(choice)
+
+    def _refresh_seg_subtitles(self):
+        """Name Segment's model, the one loaded or else the one asked for, and its cost.
+
+        On Auto before the first load, the pick isn't known yet: the worker
+        chooses it from the free VRAM at load time, and seg_ready names it.
+        """
+        loaded = self._seg_in_use
+        choice = self._seg_model_choice()
+        if loaded is not None:
+            pick = SEG_PICKS.get(loaded.get("mode"), Pick.MANUAL)
+            text = modelinfo.row_subtitle(
+                pick, modelinfo.SEG_MODELS.get(loaded["rung"]), selection.Engine.ORT,
+                why=_seg_reason(loaded), name=loaded.get("model"),
+                device=Device.GPU if loaded.get("gpu") else Device.CPU)
+            adv = "Model: %s" % self._seg_model_name()
+            if pick is Pick.AUTO:
+                adv += " (Auto)"
+        elif choice == SEG_AUTO:
+            text = "Auto · picks by free VRAM when you segment"
+            adv = "Model: Auto"
+        else:
+            text = modelinfo.row_subtitle(Pick.MANUAL, modelinfo.SEG_MODELS.get(choice),
+                                          selection.Engine.ORT)
+            adv = "Model: %s" % self._seg_model_name()
+        self.seg_model_row.set_subtitle(text)
+        self.seg_adv.set_subtitle(adv)
 
     def _seg_detail(self):
         return SEG_DETAIL[self.seg_detail_row.get_selected()][1] or None
@@ -1909,8 +2159,9 @@ class Window(Adw.ApplicationWindow):
         if getattr(self, "_syncing_seg", False):
             return
         self.seg_loaded_for = None  # force re-encode with the new model
-        self._seg_active_model = None
-        self.seg_adv.set_subtitle("Reloads on next segment")
+        self._seg_in_use = None
+        self._refresh_seg_subtitles()
+        self.seg_adv.set_subtitle(self.seg_adv.get_subtitle() + " · loads on next segment")
         self._update_footer()
 
     def _on_seg_focus_changed(self, *_):
@@ -2652,6 +2903,7 @@ class Window(Adw.ApplicationWindow):
             if self._worker_state is WorkerState.DOWN:
                 self._show_worker_up()      # whatever started it, a worker is up
             self._offer_engines(msg.get("engines") or ["ort"], msg.get("settings"))
+            self._set_bg_engine(selection.Engine(msg.get("engine", "ort")))
             provs = msg.get("providers") or []
             if provs:
                 # Installed is not proven: the first run says where it really ran.
@@ -2748,16 +3000,10 @@ class Window(Adw.ApplicationWindow):
         elif t == "seg_ready":
             self._seg_set_busy(False)
             self.seg_loaded_for = req.loads
-            note = {"auto": " · auto", "fallback": " · fallback"}.get(
-                msg.get("mode"), "")
-            self.seg_model_row.set_subtitle(msg["model"] + note)
-            self._seg_active_model = msg["model"] + (
-                " (fallback)" if msg.get("mode") == "fallback" else "")
+            # The row names what loaded, so Auto's pick is on screen.
+            self._seg_in_use = msg
+            self._refresh_seg_subtitles()
             self._update_footer()
-            # When on "Auto", tell the user which model that resolved to.
-            if self.seg_model_row.get_selected() <= 0:
-                self.seg_model_row.set_tooltip_text(
-                    "Auto selected: %s on %s" % (msg["model"], msg["label"]))
             self._set_device(msg["provider"], msg["label"])
             cb, self.seg_pending = self.seg_pending, None
             if cb:
@@ -2770,7 +3016,8 @@ class Window(Adw.ApplicationWindow):
                                      % self._download_text(msg))
             self._footer_download(msg)
         elif t == "download":
-            name = dict((m[1], m[0]) for m in MODELS).get(msg["model"], msg["model"])
+            info = modelinfo.BG_MODELS.get(msg["model"])
+            name = info.name if info else msg["model"]
             text = "Downloading %s: %s. It's needed once." % (name, self._download_text(msg))
             (self.batch_status if job is Job.BATCH else self.status).set_text(text)
             self._footer_download(msg)
