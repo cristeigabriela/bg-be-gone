@@ -20,8 +20,12 @@
 
 .PARAMETER Variant
   Worker ML stack: directml (default; any DirectX 12 GPU, with the CPU to
-  fall back on), cpu, cuda (NVIDIA before the RTX 50 series), or seg
-  (Segment Anything only).
+  fall back on), rocm (directml plus AMD's PyTorch for BiRefNet, on an RX
+  6700/6750 XT; about 4 GB more), cpu, cuda (NVIDIA before the RTX 50
+  series), or seg (Segment Anything only).
+
+.PARAMETER GfxArch
+  rocm only: the AMD GPU's gfx target (e.g. gfx1031), instead of detecting it.
 
 .PARAMETER SegmentOnly
   Shortcut for -Variant seg.
@@ -52,8 +56,10 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('directml', 'cpu', 'cuda', 'seg')]
+    [ValidateSet('directml', 'rocm', 'cpu', 'cuda', 'seg')]
     [string]$Variant = 'directml',
+    [ValidatePattern('^gfx[0-9a-f]+$')]
+    [string]$GfxArch,
     [switch]$SegmentOnly,
     [string]$Msys2Root,
     [string]$Prefix = (Join-Path $env:LOCALAPPDATA 'bg-be-gone'),
@@ -202,7 +208,20 @@ $GtkRoot = Join-Path $Msys2Root 'ucrt64'
 Add-Owned 'worker'
 Save-Manifest $gtk
 # A failed build throws here, and the previous worker (if any) stays in place.
-& (Join-Path $Packaging 'build-windows-worker.ps1') -Variant $Variant -Dest $WorkerDir
+# rocm is the directml worker with AMD's PyTorch on top.
+$workerVariant = if ($Variant -eq 'rocm') { 'directml' } else { $Variant }
+& (Join-Path $Packaging 'build-windows-worker.ps1') -Variant $workerVariant -Dest $WorkerDir
+if ($Variant -eq 'rocm') {
+    $rocmArgs = @{ WorkerDir = $WorkerDir }
+    if ($GfxArch) { $rocmArgs.GfxArch = $GfxArch }
+    try {
+        & (Join-Path $Packaging 'Enable-AmdRocm.ps1') @rocmArgs
+    } catch {
+        Write-Warning "ROCm could not be enabled: $_"
+        Write-Warning "The directml worker is installed and uses the GPU through DirectML."
+        $Variant = 'directml'
+    }
+}
 
 # --- 3. Icon and shortcut -------------------------------------------------------
 # The app icon goes in a hicolor theme dir, as install.sh does on Linux; the
@@ -252,7 +271,12 @@ if ($Variant -eq 'seg') {
     Msg "The first background removal downloads BiRefNet (about 1 GB) to $ModelData."
 } else {
     Msg "Downloading the default model, BiRefNet General (about 1 GB). Ctrl+C skips it; the app fetches it on first use."
-    $fetch = @((Join-Path $AppDir 'prefetch.py'), 'onnx', 'birefnet-general', (Join-Path $ModelData 'u2net'))
+    # The PyTorch engine loads BiRefNet's own checkpoint, not rembg's ONNX file.
+    $fetch = if ($Variant -eq 'rocm') {
+        @((Join-Path $AppDir 'prefetch.py'), 'torch', 'birefnet-general', (Join-Path $ModelData 'models\birefnet'))
+    } else {
+        @((Join-Path $AppDir 'prefetch.py'), 'onnx', 'birefnet-general', (Join-Path $ModelData 'u2net'))
+    }
     $code = Invoke-WorkerPython -WorkerDir $WorkerDir -AppDir $AppDir -Arguments $fetch
     if ($code -ne 0) { Write-Warning "The model download failed; the app will download it on first use." }
 }

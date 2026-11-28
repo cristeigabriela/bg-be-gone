@@ -4,10 +4,12 @@ Installers run this on the worker's interpreter, so the model is fetched by
 the same code the worker loads it with, into the folder the worker reads:
 
     python prefetch.py onnx birefnet-general <U2NET_HOME>
+    python prefetch.py torch birefnet-general <BiRefNet checkpoint folder>
 
-"onnx" is rembg's own ONNX download, which verifies the file's hash and
-prints progress. Exit status 0 means the model is in place; anything else is
-safe to ignore, since the app downloads on first use.
+"onnx" is rembg's own ONNX download (any ONNX Runtime worker); "torch" is
+BiRefNet's original checkpoint, which the PyTorch engine loads. Both verify
+the file's hash and print progress. Exit status 0 means the model is in
+place; anything else is safe to ignore, since the app downloads on first use.
 """
 import enum
 import os
@@ -16,6 +18,7 @@ import sys
 
 class Engine(enum.Enum):
     ONNX = "onnx"
+    TORCH = "torch"
 
 
 def _fetch_onnx(model, dest):
@@ -29,7 +32,19 @@ def _fetch_onnx(model, dest):
     raise SystemExit(f"rembg has no model named {model}")
 
 
-_FETCHERS = {Engine.ONNX: _fetch_onnx}
+def _fetch_torch(model, dest):
+    from engines import torch_birefnet   # needs no torch to download
+
+    def progress(done, total):
+        if total:
+            print(f"\r{done >> 20} / {total >> 20} MB", end="", flush=True)
+
+    path = torch_birefnet.ensure_checkpoint(model, dest, progress)
+    print()
+    return path
+
+
+_FETCHERS = {Engine.ONNX: _fetch_onnx, Engine.TORCH: _fetch_torch}
 
 
 def main(argv):
