@@ -37,6 +37,9 @@ UNMEASURED = ModelInfo("new", "New Model", "New", Family.SAM2, "test",
         # A fallback says so, not "Auto"; on the CPU, VRAM doesn't apply.
         (Pick.FALLBACK, UNMEASURED, Engine.ORT, None, None, Device.CPU,
          "Fallback · New Model · on the CPU"),
+        # The free VRAM Auto picked by still shows after the model fell back to the CPU.
+        (Pick.FALLBACK, UNMEASURED, Engine.ORT, "2.0 GB free", None, Device.CPU,
+         "Fallback · New Model · on the CPU (2.0 GB free)"),
         # Picked by name: the row's value already names it, so only the cost.
         (Pick.MANUAL, BOTH_ENGINES, Engine.ORT, None, None, Device.GPU,
          "928 MB download · ~3.1 GB VRAM"),
@@ -54,7 +57,8 @@ UNMEASURED = ModelInfo("new", "New Model", "New", Family.SAM2, "test",
          "928 MB download · ~512 MB VRAM"),
     ],
     ids=["auto measured", "auto unmeasured", "auto unknown model", "fallback on cpu",
-         "manual", "preset", "torch", "runs on cpu", "torch asked, ort runs it"],
+         "fallback on cpu, free vram known", "manual", "preset", "torch", "runs on cpu",
+         "torch asked, ort runs it"],
 )
 def test_a_model_row_names_the_pick_and_its_cost(pick, info, engine, why, name, device,
                                                  expected):

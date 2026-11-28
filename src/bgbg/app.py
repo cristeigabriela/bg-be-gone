@@ -299,15 +299,14 @@ SEG_PICKS = {p.value: p for p in (Pick.AUTO, Pick.MANUAL, Pick.FALLBACK)}
 
 
 def _seg_reason(seg_ready):
-    """Why Auto's pick fits, in a few words: "11.2 GB free", or None.
+    """What Auto picked by, in a few words: "11.2 GB free", or None.
 
     ``vram_free`` (MiB) in seg_ready is the free VRAM the worker measured when
-    Auto picked; it's null when nothing was probed. It only matters on the GPU.
+    Auto picked; it's null when nothing was probed. It stays true when the
+    model then fell back to the CPU, which ``gpu`` says separately.
     """
     free = seg_ready.get("vram_free")
-    if not seg_ready.get("gpu") or free is None:
-        return None
-    return modelinfo.free_text(free)
+    return modelinfo.free_text(free) if free is not None else None
 
 
 SEG_MODES = [
