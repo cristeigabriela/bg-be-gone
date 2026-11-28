@@ -949,6 +949,7 @@ class Window(Adw.ApplicationWindow):
             title="Engine", model=Gtk.StringList.new([e[0] for e in ENGINES]))
         self.engine_row.set_subtitle("What runs BiRefNet")
         self._engine_handler = self.engine_row.connect("notify::selected", self._on_engine_changed)
+        self._engine_saved = self.engine_row.get_selected()   # the row's last saved choice
         self.model_adv.add_row(self.engine_row)
         self.model_adv.set_visible(False)
         model_grp.add(self.model_adv)
@@ -1131,15 +1132,22 @@ class Window(Adw.ApplicationWindow):
             index = next(i for i, e in enumerate(ENGINES) if e[1] is current)
             with self.engine_row.handler_block(self._engine_handler):
                 self.engine_row.set_selected(index)
+        self._engine_saved = self.engine_row.get_selected()
         self.model_adv.set_visible(shown)
 
     def _on_engine_changed(self, *_):
+        if self.engine_row.get_selected() == self._engine_saved:
+            return          # nothing new to save: e.g. the row put back below
         label, engine = ENGINES[self.engine_row.get_selected()]
         try:
             selection.save_setting(engine, self._settings_path)
         except settings.SettingsError as err:
             self._toast("Couldn't save the engine setting: %s" % err.reason)
+            # Back to what is saved and running: the row mustn't claim a choice
+            # that neither the file nor the worker has.
+            self.engine_row.set_selected(self._engine_saved)
             return
+        self._engine_saved = self.engine_row.get_selected()
         # A new worker reads the setting at start-up, so nothing of the old
         # engine (a PyTorch start-up in flight, its GPU context) carries over.
         self._engine_switch = label
