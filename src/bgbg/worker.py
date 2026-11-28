@@ -17,6 +17,9 @@ Requests (one JSON object per line on stdin):
    "pattern":"{name}_nobg","id":N}
       # optional "format":"png|webp|jpeg": what each result is written as,
       #   png by default; jpeg only with a background to flatten onto
+      # optional "files":[P,...]: exactly these, in order, not input_dir's images
+      # optional "thumbs":D: a folder for each result's small preview, named
+      #   in its batch_file reply
   {"op":"gif","input":P,"output":P,"model":M,"alpha":bool,"bg":BG,"blur":S,
    "rot":0..3,"fh":bool,"fv":bool,"keep_dir":D?,"id":N}   # per-frame removal;
                                              # GIF or WebP (animated) by output
@@ -58,6 +61,10 @@ Responses (one JSON object per line on stdout):
   {"type":"done_single","output":P,"preview":P,"seconds":f,"device":D,"id":N}
       # D: {"provider","label","gpu"} it last ran on; done_batch and gif_done
       # carry it too, so every finished job says where it ran
+  {"type":"batch_file","input":P,"name":str,"state":S,"output":P,"thumb":P,
+   "message":str,"id":N}
+      # one image of a batch: S is "working", "done" (with output, and thumb
+      # when asked for), "failed" or "skipped" (both with message)
   {"type":"done_batch","count":n,"total":n,"failed":[{"name","message"}],
    "skipped":[{"name","message"}],"renamed":n,"seconds":f,"outdir":P,"id":N}
   {"type":"gif_progress","done":i,"total":n,"id":N}
@@ -92,6 +99,7 @@ import gc  # noqa: E402
 import json  # noqa: E402
 import contextlib  # noqa: E402
 import enum  # noqa: E402
+import functools  # noqa: E402
 import errno  # noqa: E402
 import time  # noqa: E402
 import queue  # noqa: E402
@@ -664,6 +672,16 @@ def _batch_skip_reason(path):
     return None
 
 
+def _batch_sources(req):
+    """The images a batch runs on, in order: the request's own list of files,
+    or every image in its input folder."""
+    if req.get("files") is not None:
+        return list(req["files"])
+    indir = req["input_dir"]
+    return sorted(f for f in glob.glob(os.path.join(indir, "*"))
+                  if f.lower().endswith(formats.READ_SUFFIXES) and os.path.isfile(f))
+
+
 def _batch_format(req, bg):
     """The format a batch writes, checked against its background before any work.
 
@@ -726,35 +744,74 @@ def _publish_result(image, outdir, stem, fmt, taken):
         return published
 
 
+# The longest side of a result's thumbnail: a gallery tile, at 2x scale.
+_BATCH_THUMB_SIDE = 320
+# The checkerboard's squares behind a transparent thumbnail, in pixels:
+# about the size of Single's on screen, once the tile scales it down.
+_THUMB_CHECKER = 10
+
+
+def _write_batch_thumb(image, folder, n, bg):
+    """A small PNG of result `n` for the gallery, over a checkerboard when
+    transparent, like Single's preview; its path, or None if it couldn't be
+    written (the result itself is fine)."""
+    small = image.copy()
+    small.thumbnail((_BATCH_THUMB_SIDE, _BATCH_THUMB_SIDE))
+    if bg == "transparent":
+        board = _board(small.size, _THUMB_CHECKER)
+        board.alpha_composite(small)
+        small = board
+    path = os.path.join(folder, "result-%d.png" % n)
+    try:
+        small.convert("RGB").save(path)
+    except OSError as err:
+        print(f"batch: could not write the thumbnail {path}: {err}", file=sys.stderr, flush=True)
+        return None
+    return path
+
+
+@functools.lru_cache(maxsize=8)
+def _cached_board(size, cell):
+    return _checkerboard(size, cell).convert("RGBA")
+
+
+def _board(size, cell):
+    """A checkerboard to composite onto: _checkerboard, drawn once per size."""
+    return _cached_board(size, cell).copy()
+
+
 def handle_batch(req):
     rid = req.get("id")
-    indir = req["input_dir"]
     outdir = req["output_dir"]
     pattern = req.get("pattern") or "{name}_nobg"
     batchnames.check_pattern(pattern)      # before any work, so nothing half-runs
     bg = req.get("bg", "transparent")
     fmt = _batch_format(req, bg)
-    images = sorted(f for f in glob.glob(os.path.join(indir, "*"))
-                    if f.lower().endswith(formats.READ_SUFFIXES) and os.path.isfile(f))
     files, skipped = [], []                # skipped: [{"name", "message"}], in order
-    for f in images:
+    for f in _batch_sources(req):
         reason = _batch_skip_reason(f)
         if reason is None:
             files.append(f)
         else:
             skipped.append({"name": os.path.basename(f), "message": reason})
+            out({"type": "batch_file", "input": f, "name": os.path.basename(f),
+                 "state": "skipped", "message": reason, "id": rid})
     if skipped:
         out({"type": "notice", "id": rid, "message":
              "Skipped %d GIF or animated WebP (%s): open them on the Single page."
              % (len(skipped), ", ".join(s["name"] for s in skipped))})
     total = len(files)
     if total == 0:
-        found = "No images found in the input folder."
+        listed = req.get("files") is not None
+        found = "No images are selected." if listed else "No images found in the input folder."
         if skipped:
             found += " Skipped %d GIF or animated WebP: open them on the Single page." \
                 % len(skipped)
-        raise NoImagesError(indir, found)
+        raise NoImagesError(req.get("input_dir") or outdir, found)
     os.makedirs(outdir, exist_ok=True)
+    thumbs = req.get("thumbs")
+    if thumbs:
+        os.makedirs(thumbs, exist_ok=True)
     get_session(req["model"], rid)         # load + emit the device message
     alpha = req.get("alpha", False)
     blur = req.get("blur", background.STRENGTH_DEFAULT)
@@ -769,6 +826,7 @@ def handle_batch(req):
             return
         name = os.path.basename(f)
         out({"type": "progress", "done": i - 1, "total": total, "name": name, "id": rid})
+        out({"type": "batch_file", "input": f, "name": name, "state": "working", "id": rid})
         # One file that can't be read must not cost the rest of the run.
         try:
             stem = batchnames.stem_for(pattern, f, i)
@@ -782,9 +840,16 @@ def handle_batch(req):
             sys.stderr.flush()
             message = describe_error(e, {"input": f})
             failed.append({"name": name, "message": message})
+            out({"type": "batch_file", "input": f, "name": name, "state": "failed",
+                 "message": message, "id": rid})
             continue
         if os.path.basename(dst) != stem + fmt.suffix:
             renamed += 1
+        done = {"type": "batch_file", "input": f, "name": name, "state": "done",
+                "output": dst, "id": rid}
+        if thumbs:
+            done["thumb"] = _write_batch_thumb(result, thumbs, i, bg)
+        out(done)
     out({"type": "progress", "done": total, "total": total, "name": "",
          "id": rid})
     out({"type": "done_batch", "count": total - len(failed), "total": total,

@@ -231,6 +231,50 @@ def test_a_file_that_appears_during_the_run_is_not_overwritten(worker, folders):
         "b's result takes the next free number instead"
 
 
+# --- The files a batch is given ------------------------------------------------
+
+def test_only_the_files_left_selected_are_processed(worker, folders):
+    """The gallery sends the images still selected; the rest of the folder is left alone."""
+    indir, outdir = folders
+    a, b, c = (add_image(indir, name) for name in ("a.png", "b.png", "c.png"))
+    original = b.read_bytes()
+    reply, _ = run_request(worker, batch_request(indir, outdir, files=[str(a), str(c)]))
+    assert names(outdir) == ["a_nobg.png", "c_nobg.png"], "only the selected images get a result"
+    assert reply["total"] == 2, "the summary counts the selected images, not the folder"
+    assert b.read_bytes() == original, "an unselected image is never touched"
+
+
+def test_every_image_reports_how_it_ended(worker, folders):
+    """Each gallery tile shows its own image's state, from these replies."""
+    indir, outdir = folders
+    files = [add_image(indir, "a.png"), add_image(indir, "b.png", fixture="not_an_image.webp"),
+             add_image(indir, "moving.gif", fixture="subject.gif"), add_image(indir, "c.png")]
+    _, seen = run_request(worker, batch_request(indir, outdir, files=[str(f) for f in files]))
+    states = {}
+    for reply in seen:
+        if reply.get("type") == "batch_file":
+            states.setdefault(reply["name"], []).append(reply["state"])
+    assert states == {
+        "moving.gif": ["skipped"],
+        "a.png": ["working", "done"],
+        "b.png": ["working", "failed"],
+        "c.png": ["working", "done"],
+    }, "every image starts, if it can run, and ends exactly once"
+    done = [r for r in seen if r.get("type") == "batch_file" and r["state"] == "done"]
+    want = [str(outdir / "a_nobg.png"), str(outdir / "c_nobg.png")]
+    assert [r["output"] for r in done] == want, "a finished image names the file its result went to"
+
+
+def test_a_finished_image_gets_a_small_thumbnail_to_flip_to(worker, folders, tmp_path):
+    indir, outdir = folders
+    add_image(indir, "a.png")
+    _, seen = run_request(worker, batch_request(indir, outdir, thumbs=str(tmp_path / "thumbs")))
+    (done,) = [r for r in seen if r.get("type") == "batch_file" and r["state"] == "done"]
+    thumb = Image.open(done["thumb"])
+    assert thumb.format == "PNG" and max(thumb.size) <= 320, "a thumbnail is a small PNG"
+    assert thumb.mode == "RGB", "a transparent result is shown over a checkerboard, as in Single"
+
+
 # --- What a batch writes --------------------------------------------------------
 
 @pytest.mark.parametrize("key, bg, written_as, alpha, background_colour", [
