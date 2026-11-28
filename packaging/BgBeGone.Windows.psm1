@@ -508,6 +508,81 @@ function Remove-OwnedData {
     $files.Count
 }
 
+# How long a helper program of ours may take to exit on its own once the app
+# has closed (GLib's gdbus.exe lingers for a moment), before it is ended.
+$script:HelperGraceSeconds = 10
+
+function Get-InventoryProcess {
+    <# Running processes whose program is a file listed in one of $Roots' inventories. #>
+    param([Parameter(Mandatory)][string[]]$Roots)
+    $owned = @{}
+    foreach ($root in $Roots) {
+        if (-not (Test-Inventory $root)) { continue }
+        $full = [IO.Path]::GetFullPath($root).TrimEnd('\')
+        foreach ($rel in Read-Inventory $root) {
+            if ($rel -match '\.exe$') { $owned[[IO.Path]::Combine($full, $rel).ToLowerInvariant()] = $true }
+        }
+    }
+    @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $owned.ContainsKey($_.ExecutablePath.ToLowerInvariant()) })
+}
+
+function Assert-InstallIdle {
+    <#
+    .SYNOPSIS
+      Before an install's files go: nothing of it runs, and none of its
+      programs or libraries is open. Throws, with nothing deleted, otherwise.
+
+    .DESCRIPTION
+      Only processes whose program is listed in one of $Roots' inventories
+      are looked at; no other process is ever touched.
+
+      - python.exe or pythonw.exe from there is bg-be-gone itself (its
+        frontend or its worker): that throws, asking to close it.
+      - Any other program of ours, like gdbus.exe, which GLib starts and
+        which outlives the app for a moment, gets $HelperGraceSeconds to
+        exit, then is ended, with a warning.
+
+      Then every .exe, .dll and .pyd the inventories list is opened without
+      sharing, so a file some other program holds open stops the removal
+      before it starts instead of halfway through.
+    #>
+    param([Parameter(Mandatory)][string[]]$Roots)
+    $running = @(Get-InventoryProcess $Roots)
+    $app = @($running | Where-Object { $_.Name -match '^pythonw?\.exe$' })
+    if ($app.Count) {
+        throw ("bg-be-gone is still running; close it first, then run this again:`n  " +
+               (($app | ForEach-Object { "$($_.Name) (pid $($_.ProcessId)): $($_.ExecutablePath)" }) -join "`n  "))
+    }
+    foreach ($p in $running) {
+        $proc = Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue   # it may have exited already
+        if ($proc -and -not $proc.WaitForExit($script:HelperGraceSeconds * 1000)) {
+            Write-Warning "Ending $($p.Name) (pid $($p.ProcessId)), which bg-be-gone left running: $($p.ExecutablePath)"
+            Stop-Process -Id $p.ProcessId -Force
+            $null = $proc.WaitForExit(5000)
+        }
+    }
+
+    $busy = New-Object System.Collections.Generic.List[string]
+    foreach ($root in $Roots) {
+        if (-not (Test-Inventory $root)) { continue }
+        $full = [IO.Path]::GetFullPath($root).TrimEnd('\')
+        foreach ($rel in Read-Inventory $root) {
+            if ($rel -notmatch '\.(exe|dll|pyd)$') { continue }
+            $path = [IO.Path]::Combine($full, $rel)
+            if (-not [IO.File]::Exists($path)) { continue }
+            try {
+                [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None).Dispose()
+            } catch [IO.IOException] {
+                $busy.Add($path)
+            }
+        }
+    }
+    if ($busy.Count) {
+        throw ("$($busy.Count) of bg-be-gone's files are open in another program, so nothing was removed. " +
+               "Close it, then run this again:`n  " + (($busy | Select-Object -First 5) -join "`n  "))
+    }
+}
+
 function Get-WorkerPython {
     <# The interpreter inside a worker folder. #>
     param([Parameter(Mandatory)][string]$WorkerDir)
@@ -925,7 +1000,7 @@ function New-AppIcon {
 Export-ModuleMember -Function Write-Utf8File, Invoke-NativeShown, New-UniqueName, New-PrivateTempDir,
     Test-ReparsePoint, Assert-NoReparseBelow, Get-TreeFiles, Write-Inventory, Test-Inventory,
     Read-Inventory, Update-Inventory, Test-LegacyInstall,
-    Remove-Inventory, Write-LegacyInventory, Get-OwnedDataFile, Remove-OwnedData, Register-DataUser, Unregister-DataUser, Test-InstallAt, Get-OtherDataUser,
+    Remove-Inventory, Assert-InstallIdle, Write-LegacyInventory, Get-OwnedDataFile, Remove-OwnedData, Register-DataUser, Unregister-DataUser, Test-InstallAt, Get-OtherDataUser,
     Get-WorkerPython, New-WorkerPython,
     Install-LockedPackage, New-WorkerStartInfo, Invoke-WorkerPython, Test-Worker,
     Write-WorkerRecord, Complete-Worker, Switch-Worker, Get-LaunchCommand, Install-LaunchModule,
