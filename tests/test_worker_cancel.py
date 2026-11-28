@@ -42,6 +42,11 @@ def test_a_cancel_for_a_request_that_already_ended_is_dropped(worker, tmp_path):
     only grow, so no later request ever took it back out."""
     rid = worker.send(single(tmp_path, "out.png"))
     assert replies_for(worker, [rid])[rid]["type"] == "done_single"
+    # A request's reply goes out just before it stops counting as running, so a
+    # cancel sent on that reply alone could still find it running. Another
+    # request starting proves `rid` was let go.
+    between = worker.send(single(tmp_path, "between.png"))
+    assert replies_for(worker, [between])[between]["type"] == "done_single"
     worker.write({"op": "cancel", "id": rid})
     later = worker.send(single(tmp_path, "later.png"))   # read after the cancel
     assert replies_for(worker, [later])[later]["type"] == "done_single", \

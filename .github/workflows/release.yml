@@ -211,8 +211,9 @@ jobs:
   # every asset and its size.
   assets:
     needs: [version, appimage, windows]
-    # NOTE: a failed Windows build does not hold back the Linux release until
-    # Windows is declared supported; then add needs.windows.result here.
+    # Linux and Windows ship together: a missing Windows asset fails this job,
+    # and with it the publish. It still runs after a failed Windows build, to
+    # list what was built and name what is missing.
     if: always() && needs.appimage.result == 'success'
     runs-on: ubuntu-latest
     env:
@@ -224,7 +225,8 @@ jobs:
           path: linux
           merge-multiple: true
 
-      # Optional: whatever goes wrong here, the Linux release still ships.
+      # Allowed to fail (no Windows artifacts after a failed build), so the
+      # check below can name every missing file.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         continue-on-error: true
         with:
@@ -238,7 +240,8 @@ jobs:
           shopt -s nullglob
           mkdir release
           mv linux/*.AppImage release/
-          # Windows ships only as a full set: every variant's zip and installer.
+          # Windows ships as a full set: every variant's zip and installer.
+          bad=0
           missing=()
           for v in cpu directml cuda seg; do
             for f in "bg-be-gone-$VERSION-$v-win64.zip" "bg-be-gone-$VERSION-$v-win64-setup.exe"; do
@@ -250,7 +253,8 @@ jobs:
               mv "windows/bg-be-gone-$VERSION-$v-win64.zip" "windows/bg-be-gone-$VERSION-$v-win64-setup.exe" release/
             done
           else
-            echo "::warning::No Windows assets this release; missing or empty: ${missing[*]}"
+            echo "::error::Not releasing without every Windows asset; missing or empty: ${missing[*]}"
+            bad=1
           fi
 
           cd release
@@ -258,7 +262,6 @@ jobs:
           limit=$((2 * 1024 * 1024 * 1024))   # GitHub rejects release assets of 2 GiB and up
           echo "| Asset | MiB |" >> "$GITHUB_STEP_SUMMARY"
           echo "| --- | ---: |" >> "$GITHUB_STEP_SUMMARY"
-          bad=0
           for f in "${files[@]}"; do
             size=$(stat -c %s "$f")
             echo "| $f | $((size / 1024 / 1024)) |" >> "$GITHUB_STEP_SUMMARY"

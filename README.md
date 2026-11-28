@@ -8,10 +8,12 @@ A local image background remover *and object segmenter* with a GTK interface. It
 runs [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) and other
 [rembg](https://github.com/danielgatis/rembg) models for **background removal**
 (stills, animated GIFs, or a whole folder), or,
-Meta's [Segment Anything](https://github.com/facebookresearch/sam2) (SAM 2.1) for **image segmentation**, through ONNX Runtime, with GPU acceleration on NVIDIA (CUDA) and AMD (ROCm), and
-a CPU fallback.
+Meta's [Segment Anything](https://github.com/facebookresearch/sam2) (SAM 2.1) for **image segmentation**, through ONNX Runtime, with GPU acceleration on NVIDIA (CUDA) and AMD (ROCm), on
+any DirectX 12 GPU on Windows (DirectML), and a CPU fallback.
 
 Everything runs on your machine. No images are uploaded.
+
+Linux and Windows 11; tested on an RX 6750 XT. Windows 10 and other GPUs are untested.
 
 <table>
 <tr>
@@ -104,7 +106,7 @@ Uninstall with `./uninstall.sh` (add `--purge` to also remove the environment).
 
 ## Windows
 
-bg-be-gone runs on Windows 11. Windows 10 should work but is untested. The
+Windows 11 is supported; Windows 10 is untested. The
 GTK frontend runs on MSYS2's UCRT64 GTK4/libadwaita; the ML worker runs on
 its own standalone CPython 3.12. GPU acceleration uses **DirectML** (any
 DirectX 12 GPU: NVIDIA, AMD or Intel), with a CPU fallback.
@@ -135,8 +137,9 @@ The files are not code-signed yet, so SmartScreen warns when you run them
   failed ROCm setup leaves the DirectML build working.
 - **Upgrades** install beside the old version and switch over only once
   the new one starts; if it doesn't, the old one stays.
-- **Uninstall** removes only the files Setup installed. Models and settings
-  in `%LOCALAPPDATA%\bg-be-gone` stay.
+- **Uninstall** removes only the files Setup installed, and stops while
+  bg-be-gone is still running. Models and settings in
+  `%LOCALAPPDATA%\bg-be-gone` stay.
 - **The zip** runs from any folder: start `BgBeGone.cmd`, which keeps a
   console open with the app's output, or point a shortcut at
   `bin\pythonw.exe -m bg_be_gone_launch`. Its `tools\Enable-AmdRocm.ps1`
@@ -186,7 +189,8 @@ must not hold a `%`: the shortcut then names it on its command line.
 `.\uninstall.ps1` removes what `install.ps1` created, as recorded in
 `<Prefix>\bg-be-gone-install.json`: in each folder it built, exactly the files
 that folder's inventory lists. Files anyone else put there stay, and nothing
-is removed through a junction or symbolic link. Add `-Purge` to also remove
+is removed through a junction or symbolic link. It stops, removing nothing,
+while bg-be-gone is still running. Add `-Purge` to also remove
 the downloaded models (BiRefNet about 1 GB; SAM 110-770 MB), settings, and the
 log. Every install of a user shares those, in `%LOCALAPPDATA%\bg-be-gone`, so
 `-Purge` keeps them while another install still uses them, and says which.
@@ -249,9 +253,12 @@ without the download size — and see
 
 ## GPU support
 
-The worker picks the first available ONNX Runtime provider: CUDA (NVIDIA), ROCm
-(AMD), then CPU. The active device is shown in the status bar — including when a
-run falls back, so a CPU result is never reported as a GPU one.
+On Linux, the worker picks the first available ONNX Runtime provider: CUDA
+(NVIDIA), ROCm (AMD), then CPU. Windows uses DirectML instead, with ROCm for
+BiRefNet on an RX 6700/6750 XT (see [Windows](#windows)).
+
+The active device is shown in the status bar — including when a run falls
+back, so a CPU result is never reported as a GPU one.
 
 - NVIDIA: `install.sh` installs `onnxruntime-gpu` and the required CUDA runtime.
 - AMD: `install.sh` installs `onnxruntime-rocm`, checks the provider actually
