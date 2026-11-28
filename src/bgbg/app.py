@@ -194,6 +194,14 @@ def _existing_folder(value):
         return None
 
 
+class PasteWriteError(OSError):
+    """The pasted image couldn't be written to the temp folder."""
+
+    def __init__(self, path):
+        super().__init__(f"could not write the pasted image to {path}")
+        self.path = path
+
+
 def plain_reason(exc):
     """The OS's own words for an OSError, else the exception's first line."""
     if isinstance(exc, OSError) and exc.strerror:
@@ -665,6 +673,8 @@ class Window(Adw.ApplicationWindow):
         os.makedirs(self.tmpdir, exist_ok=True)
         self.source_path = None
         self._source_animation = formats.Animation.STILL
+        self._pasted = 0               # images pasted so far, to name their files
+        self._open_gen = 0             # bumped by every open, drop or paste (_new_open)
         self.result_output = None
         # Whether the shown result's pixels are transparent, which decides if
         # JPEG is offered. Recorded per request (_InFlight.alpha) and adopted
@@ -771,15 +781,22 @@ class Window(Adw.ApplicationWindow):
         drop.connect("drop", self._on_drop)
         self.add_controller(drop)
 
-        # keyboard shortcuts (Ctrl+S save, Ctrl+Return primary action)
+        # Keyboard shortcuts; the help dialog lists the same ones. A focused text
+        # field gets Ctrl+V first, so pasting into the rename pattern still works.
         sc = Gtk.ShortcutController()
         sc.set_scope(Gtk.ShortcutScope.MANAGED)
-        sc.add_shortcut(Gtk.Shortcut.new(
-            Gtk.ShortcutTrigger.parse_string("<Control>s"),
-            Gtk.CallbackAction.new(lambda *_: self._accel_save())))
-        sc.add_shortcut(Gtk.Shortcut.new(
-            Gtk.ShortcutTrigger.parse_string("<Control>Return"),
-            Gtk.CallbackAction.new(lambda *_: self._accel_primary())))
+        for trigger, action in (
+                ("<Control>o", lambda: self._on_open_image()),
+                ("<Control>v", lambda: self._on_paste()),
+                ("<Control>s", self._accel_save),
+                ("<Control>Return", self._accel_primary),
+                ("Escape", self._accel_cancel),
+                ("<Control>q", lambda: self.close()),
+                ("<Control>w", lambda: self.close())):
+            # An action that returns False hands the key on to whatever else wants it.
+            sc.add_shortcut(Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string(trigger),
+                Gtk.CallbackAction.new(lambda *_, act=action: act() is not False)))
         self.add_controller(sc)
 
         self.connect("close-request", self._on_close)
@@ -1322,10 +1339,84 @@ class Window(Adw.ApplicationWindow):
         if p == "single":
             self._on_generate()
         elif p == "segment":
-            self._on_seg_everything()
+            # "Click to select" hides Segment everything, so Ctrl+Return must
+            # not start that minutes-long pass behind the user's back.
+            if self._seg_mode() == "everything":
+                self._on_seg_everything()
         elif p == "batch":
             self._on_run_batch()
         return True
+
+    def _accel_cancel(self):
+        """Esc: cancel what the current page is running. False when nothing
+        runs, so the key goes on to whatever else wants it."""
+        p = self.stack.get_visible_child_name()
+        if p == "segment" and self.seg_busy and self.seg_cancel_btn.get_sensitive():
+            self._on_seg_cancel()
+            return True
+        if p in ("single", "batch") and self.busy and self.gen_cancel_btn.get_sensitive():
+            self._on_bg_cancel()
+            return True
+        return False
+
+    def _on_paste(self):
+        """Ctrl+V: open the clipboard's image, or the image file copied in a file manager."""
+        clip = self.get_clipboard()
+        offered = clip.get_formats()
+        # The clipboard answers later: an image opened, dropped or pasted
+        # meanwhile is newer, and this paste must not replace it.
+        gen = self._new_open()
+        if offered.contain_gtype(Gdk.FileList.__gtype__):
+            def got_files(c, res):
+                try:
+                    files = c.read_value_finish(res).get_files()
+                except GLib.Error as e:
+                    self._report_failure("reading copied files", e,
+                                         "Could not paste: %s." % e.message)
+                    return
+                if gen == self._open_gen and files and files[0].get_path():
+                    self._load_source(files[0].get_path())
+            clip.read_value_async(Gdk.FileList.__gtype__, GLib.PRIORITY_DEFAULT, None,
+                                  got_files)
+        elif offered.contain_gtype(Gdk.Texture.__gtype__):
+            clip.read_texture_async(None, lambda c, res: self._on_pasted_texture(c, res, gen))
+        else:
+            self._toast("The clipboard has no image to paste.")
+
+    def _new_open(self):
+        """Start opening an image; return its generation, which a newer one bumps."""
+        self._open_gen += 1
+        return self._open_gen
+
+    def _on_pasted_texture(self, clip, res, gen):
+        try:
+            texture = clip.read_texture_finish(res)
+        except GLib.Error as e:
+            self._report_failure("reading the clipboard image", e,
+                                 "Could not paste: %s." % e.message)
+            return
+        if texture is None:
+            self._toast("The clipboard has no image to paste.")
+            return
+        # A file in the temp folder, so every step that wants a path works; its
+        # name is what Save suggests ("Pasted image 1_nobg.png").
+        self._pasted += 1
+        path = os.path.join(self.tmpdir, "Pasted image %d.png" % self._pasted)
+
+        def encode():
+            if not texture.save_to_png(path):
+                raise PasteWriteError(path)
+            return path
+
+        def done(result):
+            if isinstance(result, Exception):
+                self._report_failure("saving the pasted image", result,
+                                     "Could not paste: %s." % plain_reason(result))
+            elif gen != self._open_gen:
+                _remove_quietly(result)      # a newer image won; this file is ours
+            else:
+                self._load_source(result)
+        offmain.run(encode, done)
 
     def _build_segment(self):
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -1938,6 +2029,7 @@ class Window(Adw.ApplicationWindow):
         """
         if not path:
             return
+        self._new_open()                    # a paste still on its way is now stale
         if self._has_job(Job.OPEN):         # this open wins over one in flight
             self._abandon_jobs({Job.OPEN})
             self._release_source_actions()
@@ -2707,6 +2799,14 @@ class Window(Adw.ApplicationWindow):
              "Your picks composite live on the right; Save exports a PNG or WebP."),
         ])
         group("Keyboard &amp; mouse", None, [
+            ("document-open-symbolic", "Ctrl+O", "Open an image."),
+            ("edit-paste-symbolic", "Ctrl+V",
+             "Paste an image, or an image file copied in a file manager."),
+            ("media-playback-start-symbolic", "Ctrl+Return",
+             "Generate · Segment everything · Run batch, on the page you're on."),
+            ("process-stop-symbolic", "Esc", "Cancel what the page is running."),
+            ("document-save-symbolic", "Ctrl+S", "Save the result or the selection."),
+            ("window-close-symbolic", "Ctrl+Q · Ctrl+W", "Quit."),
             ("input-keyboard-symbolic", "Space", "Hold to pan the canvas."),
             ("input-mouse-symbolic", "Scroll · drag · double-click",
              "Zoom · pan · fit/100%."),
