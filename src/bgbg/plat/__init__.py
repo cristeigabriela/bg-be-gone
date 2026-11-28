@@ -6,6 +6,7 @@ never checks ``os.name`` itself. Each platform module provides, for the worker:
 - ``prepare_process()``: start-up work that must happen before onnxruntime is
   imported. It may re-exec the process.
 - ``unusable_providers()``: onnxruntime providers this machine must not use.
+- ``provider_options()``: options per provider name, e.g. DirectML's adapter.
 - ``probe_vram()``: total and free VRAM of the GPU, or None.
 - ``models_dir()`` and ``config_dir()``: where downloaded models and settings
   live. Read them after ``prepare_process()``, which can change them.
@@ -28,6 +29,7 @@ if os.name == "nt":
         models_dir,
         prepare_process,
         probe_vram,
+        provider_options,
         subprocess_flags,
         unusable_providers,
         worker_env,
@@ -41,6 +43,7 @@ else:
         models_dir,
         prepare_process,
         probe_vram,
+        provider_options,
         subprocess_flags,
         unusable_providers,
         worker_env,
@@ -48,5 +51,6 @@ else:
     )
 
 __all__ = ["config_dir", "default_worker_python", "frontend_started", "models_dir",
-           "prepare_process", "probe_vram", "subprocess_flags", "unusable_providers",
+           "prepare_process", "probe_vram", "provider_options", "subprocess_flags",
+           "unusable_providers",
            "worker_env", "worker_log_path"]

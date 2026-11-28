@@ -36,3 +36,24 @@ def test_providers_follow_the_preference_order_with_the_cpu_last(available, unus
     chosen = ort_engine.choose_providers(available, unusable)
     assert chosen == expected, \
         "the best usable provider comes first, and the CPU is always there to fall back to"
+
+
+def test_directml_runs_on_the_adapter_the_machine_names():
+    """plat.provider_options names the adapter the VRAM probe measured, so
+    SAM is sized for the GPU it then runs on."""
+    chosen = ort_engine.choose_providers([DML, CPU], set(), {DML: {"device_id": "1"}})
+    assert chosen == [(DML, {"device_id": "1"}), CPU], "the adapter reaches DirectML's options"
+
+
+def test_machine_options_add_to_a_providers_own():
+    chosen = ort_engine.choose_providers([CUDA, CPU], set(), {CUDA: {"device_id": "0"}})
+    assert chosen == [(CUDA, {"cudnn_conv_algo_search": "HEURISTIC", "device_id": "0"}), CPU], \
+        "the HEURISTIC search stays when the machine adds its own option"
+
+
+def test_directml_sessions_get_the_options_directml_requires():
+    so = ort_engine.session_options([(DML, {"device_id": "0"}), CPU])
+    assert not so.enable_mem_pattern, "DirectML needs memory patterns off"
+    assert so.execution_mode == ort_engine.ort.ExecutionMode.ORT_SEQUENTIAL, \
+        "DirectML needs sequential execution"
+    assert ort_engine.session_options([CPU]).enable_mem_pattern, "other providers keep the default"

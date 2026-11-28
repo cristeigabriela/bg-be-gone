@@ -8,7 +8,9 @@ processes. DXGI's own per-process budget is not used for "free": on an RX
 """
 import ctypes
 import ctypes.wintypes as wt
+import functools
 import uuid
+from typing import NamedTuple
 
 
 class _GUID(ctypes.Structure):
@@ -59,9 +61,22 @@ def _release(obj):
     ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[_SLOT_RELEASE])(obj)
 
 
-def _main_adapter():
-    """(description, dedicated bytes, luid low, luid high) of the hardware
-    adapter with the most dedicated memory, or None."""
+class Adapter(NamedTuple):
+    index: int           # its place in DXGI's adapter list, as DirectML's device_id counts
+    name: str
+    dedicated: int       # bytes of dedicated video memory
+    luid_low: int
+    luid_high: int
+
+
+@functools.lru_cache(maxsize=1)
+def main_adapter():
+    """The hardware adapter with the most dedicated memory, or None.
+
+    The one choice of GPU on Windows: the VRAM probe measures it, and the
+    DirectML sessions run on it, so on a laptop with two GPUs both name the
+    same one. Cached, since the adapters don't change while the app runs.
+    """
     factory = ctypes.c_void_p()
     if ctypes.windll.dxgi.CreateDXGIFactory1(ctypes.byref(_IID_IDXGIFactory1),
                                              ctypes.byref(factory)) != 0:
@@ -83,8 +98,8 @@ def _main_adapter():
             finally:
                 _release(adapter)
             if not d.Flags & _DXGI_ADAPTER_FLAG_SOFTWARE and (
-                    best is None or d.DedicatedVideoMemory > best[1]):
-                best = (d.Description, d.DedicatedVideoMemory, d.LuidLow, d.LuidHigh)
+                    best is None or d.DedicatedVideoMemory > best.dedicated):
+                best = Adapter(i, d.Description, d.DedicatedVideoMemory, d.LuidLow, d.LuidHigh)
             i += 1
     finally:
         _release(factory)
@@ -117,12 +132,13 @@ def _used_bytes(luid_low, luid_high):
 
 
 def probe():
-    """``{"total": MiB, "free": MiB, "gpu": True, "name": str}`` or None."""
-    adapter = _main_adapter()
-    if adapter is None or not adapter[1]:
+    """``{"total": MiB, "free": MiB, "gpu": True, "name": str}`` for
+    :func:`main_adapter`, or None."""
+    adapter = main_adapter()
+    if adapter is None or not adapter.dedicated:
         return None
-    name, total, luid_low, luid_high = adapter
-    used = _used_bytes(luid_low, luid_high)
+    name, total = adapter.name, adapter.dedicated
+    used = _used_bytes(adapter.luid_low, adapter.luid_high)
     # Unknown usage is no answer, not "all free". On DirectML an oversized
     # model raises no out-of-memory error, it spills into system RAM, so the
     # caller's step-down never fires and this number is the only guard.

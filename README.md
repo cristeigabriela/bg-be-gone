@@ -97,7 +97,8 @@ Uninstall with `./uninstall.sh` (add `--purge` to also remove the environment).
 
 bg-be-gone runs on Windows 11. Windows 10 should work but is untested. The
 GTK frontend runs on MSYS2's UCRT64 GTK4/libadwaita; the ML worker runs on
-its own standalone CPython 3.12, on the CPU.
+its own standalone CPython 3.12. GPU acceleration uses **DirectML** (any
+DirectX 12 GPU: NVIDIA, AMD or Intel), with a CPU fallback.
 
 ### From source
 
@@ -120,7 +121,9 @@ a failed worker build keeps the previous one. It never overwrites a file it
 didn't create: if one is in the way, it stops before changing anything.
 Options:
 
-- `-Variant cpu|seg`: `seg` is the lean, segmentation-only build.
+- `-Variant directml|cpu|cuda|seg`: `directml` is the default; `cuda` is for
+  NVIDIA cards before the RTX 50 series (on RTX 50, use `directml`); `seg` is
+  the lean, segmentation-only build.
 - `-Msys2Root C:\msys64`: use an MSYS2 you already have. bg-be-gone never
   changes it; the install checks it has the GTK packages and version needed,
   and prints the `pacman` command to run if not.

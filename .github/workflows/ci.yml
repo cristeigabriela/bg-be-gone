@@ -132,7 +132,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [cpu, seg]
+        # directml lists the DirectML provider without touching a GPU.
+        variant: [cpu, directml, seg]
     env:
       U2NET_HOME: ${{ github.workspace }}\.u2net
     steps:

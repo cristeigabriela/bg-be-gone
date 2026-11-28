@@ -14,8 +14,10 @@
   which is what a later upgrade or uninstall removes.
 
 .PARAMETER Variant
-  cpu - rembg + CPU onnxruntime (+ numba/llvmlite for alpha matting)
-  seg - Segment Anything only (onnxruntime + numpy + pillow, no rembg)
+  cpu      - rembg + CPU onnxruntime (+ numba/llvmlite for alpha matting)
+  directml - rembg + onnxruntime-directml (any DirectX 12 GPU)
+  cuda     - rembg + onnxruntime-gpu + NVIDIA's CUDA 12 runtime wheels
+  seg      - Segment Anything only (onnxruntime + numpy + pillow, no rembg)
 
 .PARAMETER Dest
   The worker folder to create or replace. An existing one must carry the
@@ -23,8 +25,8 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('cpu', 'seg')]
-    [string]$Variant = 'cpu',
+    [ValidateSet('cpu', 'directml', 'cuda', 'seg')]
+    [string]$Variant = 'directml',
     [Parameter(Mandatory = $true)]
     [string]$Dest
 )

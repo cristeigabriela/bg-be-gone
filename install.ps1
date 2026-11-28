@@ -19,7 +19,9 @@
   those.
 
 .PARAMETER Variant
-  Worker ML stack: cpu (default), or seg (Segment Anything only).
+  Worker ML stack: directml (default; any DirectX 12 GPU, with the CPU to
+  fall back on), cpu, cuda (NVIDIA before the RTX 50 series), or seg
+  (Segment Anything only).
 
 .PARAMETER SegmentOnly
   Shortcut for -Variant seg.
@@ -50,8 +52,8 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('cpu', 'seg')]
-    [string]$Variant = 'cpu',
+    [ValidateSet('directml', 'cpu', 'cuda', 'seg')]
+    [string]$Variant = 'directml',
     [switch]$SegmentOnly,
     [string]$Msys2Root,
     [string]$Prefix = (Join-Path $env:LOCALAPPDATA 'bg-be-gone'),

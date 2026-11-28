@@ -173,6 +173,11 @@ def unusable_providers():
     return set()
 
 
+def provider_options():
+    """Per-provider options for this machine: none on Linux."""
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------

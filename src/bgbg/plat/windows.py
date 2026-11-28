@@ -98,10 +98,28 @@ def unusable_providers():
     return set()
 
 
+def provider_options():
+    """Per-provider options for this machine: DirectML runs on the adapter
+    the VRAM probe measures (see winvram.main_adapter).
+
+    NOTE: DirectML's device_id is taken to count adapters in DXGI's own
+    order. A one-GPU PC can't tell; a laptop with two GPUs is untested.
+    """
+    try:
+        from . import winvram
+        adapter = winvram.main_adapter()
+    except Exception:  # noqa: BLE001
+        adapter = None
+    if adapter is None:
+        return {}
+    return {"DmlExecutionProvider": {"device_id": str(adapter.index)}}
+
+
 def probe_vram():
     """Return ``{"total":MiB, "free":MiB, "gpu":True}`` or ``None``.
 
-    Any vendor through DXGI and the GPU memory counters, then ``nvidia-smi``.
+    Any vendor through DXGI and the GPU memory counters, then ``nvidia-smi``,
+    both for the adapter DirectML runs on (``winvram.main_adapter()``).
     Best effort: any failure returns ``None`` and the caller treats the host
     as CPU.
     """
@@ -112,14 +130,24 @@ def probe_vram():
             return {k: info[k] for k in ("total", "free", "gpu")}
     except Exception:  # noqa: BLE001
         pass
+    # nvidia-smi's numbers count only for the adapter DirectML runs on, found
+    # by name; an AMD main adapter, or two NVIDIA cards of one name, is unknown.
     try:
+        from . import winvram
+        adapter = winvram.main_adapter()
+        if adapter is None:
+            return None
         r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total,memory.free",
+            ["nvidia-smi", "--query-gpu=name,memory.total,memory.free",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=6, creationflags=subprocess_flags())
-        if r.returncode == 0 and r.stdout.strip():
-            total, free = (int(x) for x in r.stdout.strip().splitlines()[0].split(","))
-            return {"total": total, "free": free, "gpu": True}
+        if r.returncode != 0:
+            return None
+        rows = [line.rsplit(",", 2) for line in r.stdout.strip().splitlines()]
+        matches = [row for row in rows if len(row) == 3 and row[0].strip() == adapter.name.strip()]
+        if len(matches) == 1:
+            _, total, free = matches[0]
+            return {"total": int(total), "free": int(free), "gpu": True}
     except Exception:  # noqa: BLE001
         pass
     return None
