@@ -140,6 +140,25 @@ def test_a_birefnet_job_without_a_gpu_runs_on_onnx_runtime_and_says_why(
         "the user hears why PyTorch wasn't used"
 
 
+def test_a_session_that_falls_back_says_which_engine_really_runs_it(
+        start_worker, torch_env, tmp_path):
+    """ready names PyTorch, the start-up choice; this model then fell back.
+
+    The device reply names the model and its engine, so the pickers show the
+    cost of what runs (u2netp stands in for BiRefNet, as above).
+    """
+    command = [sys.executable, str(TESTDATA / "torch_fallback_worker.py"), str(WORKER.parent)]
+    w = start_worker(dict(torch_env, BGBG_ENGINE="torch"), command=command)
+    assert w.ready["engine"] == "torch", "PyTorch is the start-up choice"
+    _, seen = w.ask(
+        {"op": "single", "model": "u2netp", "id": 3,
+         "input": str(TESTDATA / "subject.png"), "output": str(tmp_path / "cutout.png")},
+        until={"done_single", "error"})
+    devices = [(r.get("model"), r.get("engine")) for r in seen if r.get("type") == "device"]
+    assert devices == [("u2netp", "ort")], \
+        "the session that was made runs on ONNX Runtime, and the reply says so"
+
+
 def test_a_loader_thread_that_cannot_start_leaves_onnx_runtime_in_charge(monkeypatch):
     """Thread.start() can raise (out of threads); requests waiting on the
     engine must still get an answer, so they fall back to ONNX Runtime."""

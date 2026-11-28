@@ -42,7 +42,8 @@ Responses (one JSON object per line on stdout):
    "reason":str|null,"device":str|null,"id":N}
   {"type":"loading","model":M,"id":N}
   {"type":"download","model":M,"done":bytes,"total":bytes,"id":N}   # first use
-  {"type":"device","provider":P,"label":L,"gpu":bool,"id":N}
+  {"type":"device","provider":P,"label":L,"gpu":bool,"model":M,"engine":"ort"|"torch",
+   "id":N}                                  # a session made: what runs it, for that model
   {"type":"progress","done":i,"total":n,"name":str,"id":N}
   {"type":"done_single","output":P,"preview":P,"seconds":f,"device":D,"id":N}
       # D: {"provider","label","gpu"} it last ran on; done_batch and gif_done
@@ -156,7 +157,7 @@ def _torch_session(model, req_id):
             reason = f"{model} didn't load ({type(err).__name__}: {err})"
         else:
             out({"type": "device", "provider": "PyTorch", "label": _torch.device,
-                 "gpu": True, "id": req_id})
+                 "gpu": True, "model": model, "engine": "torch", "id": req_id})
             return session
     else:
         reason = _torch.reason
@@ -244,7 +245,8 @@ def get_session(model, req_id):
         with _rembg_download_progress(_download_reporter(model, req_id)):
             sess = ort_engine.new_session(model, ort_engine.preferred_providers())
         _sessions[model] = sess
-        out({"type": "device", **_device(model, sess), "id": req_id})
+        out({"type": "device", **_device(model, sess), "model": model, "engine": "ort",
+             "id": req_id})
     return _sessions[model]
 
 
@@ -275,7 +277,7 @@ def get_cpu_session(model, req_id):
     # correct-but-slow one look identical from the outside.
     out({"type": "device", "provider": "CPUExecutionProvider",
          "label": ort_engine.PROVIDER_LABELS["CPUExecutionProvider"],
-         "gpu": False, "id": req_id})
+         "gpu": False, "model": model, "engine": "ort", "id": req_id})
     return _cpu_sessions[model]
 
 

@@ -1007,6 +1007,7 @@ class Window(Adw.ApplicationWindow):
         # The engine that runs BiRefNet, from the worker's "ready": the model
         # rows show its download size and VRAM.
         self._bg_engine = selection.Engine.ORT
+        self._engine_used = {}         # model -> the engine its session was made on
         self.seg_busy = False
         self.seg_objects = []
         self.seg_points = []           # accumulated [x, y, label] in point mode
@@ -1491,17 +1492,33 @@ class Window(Adw.ApplicationWindow):
             return "Custom model…", "Custom model…", "any model, by name"
         label = next(s[0] for s in SUBJECTS if s[1] == key)
         info = modelinfo.BG_MODELS[key]
-        return label, label, modelinfo.row_subtitle(Pick.PRESET, info, self._bg_engine)
+        return label, label, modelinfo.row_subtitle(Pick.PRESET, info, self._engine_of(key))
 
     def _describe_bg_model(self, key):
         info = modelinfo.BG_MODELS[key]
-        return info.short, info.name, modelinfo.entry_subtitle(info, self._bg_engine)
+        return info.short, info.name, modelinfo.entry_subtitle(info, self._engine_of(key))
+
+    def _engine_of(self, key):
+        """The engine that runs model `key`: the one its session was made on,
+        else the one the worker chose at start-up."""
+        return self._engine_used.get(key, self._bg_engine)
 
     def _set_bg_engine(self, engine):
-        """Show the download size and VRAM of `engine`, the one that runs BiRefNet."""
-        if engine is self._bg_engine:
-            return
+        """A worker is ready: BiRefNet runs on `engine`, and no model has a session yet."""
         self._bg_engine = engine
+        self._engine_used.clear()
+        self._refresh_bg_costs()
+
+    def _note_engine_used(self, model, engine):
+        """A session for `model` was made on `engine`, which can differ from the
+        start-up choice: PyTorch failed for it, say, and ONNX Runtime took over."""
+        if self._engine_used.get(model) is engine:
+            return
+        self._engine_used[model] = engine
+        self._refresh_bg_costs()
+
+    def _refresh_bg_costs(self):
+        """Show every model's cost on the engine that runs it."""
         self._refresh_subject_entries()
         self._refresh_model_entries()
         self._refresh_bg_subtitles()
@@ -1512,10 +1529,10 @@ class Window(Adw.ApplicationWindow):
         if self.subject_row.get_selected() >= len(SUBJECTS):
             self.subject_row.set_subtitle("The model chosen below")
             self.model_row.set_subtitle(
-                modelinfo.row_subtitle(Pick.MANUAL, info, self._bg_engine))
+                modelinfo.row_subtitle(Pick.MANUAL, info, self._engine_of(info.key)))
         else:
             self.subject_row.set_subtitle(
-                modelinfo.row_subtitle(Pick.PRESET, info, self._bg_engine))
+                modelinfo.row_subtitle(Pick.PRESET, info, self._engine_of(info.key)))
 
     def _sync_color(self):
         bg = BGS[self.bg_row.get_selected()][1]
@@ -3052,6 +3069,8 @@ class Window(Adw.ApplicationWindow):
             # Stays: it explains a slow run, or why files were left out.
             self.toasts.add_toast(Adw.Toast(title=msg["message"], timeout=0))
         elif t == "device":
+            if msg.get("model") in modelinfo.BG_MODELS and msg.get("engine"):
+                self._note_engine_used(msg["model"], selection.Engine(msg["engine"]))
             self._set_device(msg["provider"], msg["label"])
             if msg.get("gpu") and not self._gpu_notified:
                 self._gpu_notified = True
