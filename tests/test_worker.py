@@ -5,83 +5,15 @@ U2NET_HOME; CI caches it.
 """
 import json
 import os
-import queue
 import shutil
 import subprocess
 import sys
-import threading
-from pathlib import Path
 
 import numpy as np
 import pytest
 from PIL import Image
 
-REPO = Path(__file__).resolve().parent.parent
-WORKER = REPO / "src" / "bgbg" / "worker.py"
-TESTDATA = Path(__file__).parent / "testdata"
-
-# subject.png: a dark disc centred at (128, 128), radius >= 64, on light grey.
-SUBJECT_PIXEL = (128, 128)
-BACKGROUND_PIXEL = (8, 8)
-# Generous: the first request may download the model.
-REPLY_TIMEOUT_S = 180
-
-
-class Worker:
-    """The worker process, spoken to the way the frontend does."""
-
-    def __init__(self, log_path, env=None, command=None):
-        self._log = open(log_path, "w")
-        self.proc = subprocess.Popen(
-            command or [sys.executable, str(WORKER)], stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=self._log, text=True, bufsize=1, env=env)
-        # A reader thread, so a worker that stalls fails the test at the
-        # deadline instead of blocking readline() forever.
-        self._replies = queue.Queue()
-        threading.Thread(target=self._read, daemon=True).start()
-        self.ready = self.next_reply()
-
-    def _read(self):
-        for line in self.proc.stdout:
-            if line.startswith("{"):
-                self._replies.put(json.loads(line))
-        self._replies.put(None)
-
-    def next_reply(self):
-        try:
-            reply = self._replies.get(timeout=REPLY_TIMEOUT_S)
-        except queue.Empty:
-            raise AssertionError(f"no reply from the worker in {REPLY_TIMEOUT_S} s") from None
-        assert reply is not None, "the worker exited (see its log)"
-        return reply
-
-    def ask(self, request, until):
-        """Send a request; return (the reply whose type is in `until`, all replies)."""
-        self.proc.stdin.write(json.dumps(request) + "\n")
-        self.proc.stdin.flush()
-        seen = []
-        while True:
-            reply = self.next_reply()
-            seen.append(reply)
-            if reply.get("type") in until:
-                return reply, seen
-
-    def close(self):
-        try:
-            self.proc.stdin.write('{"op": "shutdown"}\n')
-            self.proc.stdin.flush()
-            self.proc.wait(timeout=30)
-        except (OSError, subprocess.TimeoutExpired):
-            self.proc.kill()
-            self.proc.wait()
-        self._log.close()
-
-
-@pytest.fixture
-def worker(tmp_path):
-    w = Worker(tmp_path / "worker.log")
-    yield w
-    w.close()
+from workerpipe import BACKGROUND_PIXEL, REPLY_TIMEOUT_S, SUBJECT_PIXEL, TESTDATA, WORKER
 
 
 @pytest.fixture
@@ -96,21 +28,6 @@ def engine_env(tmp_path):
     env["BGBG_PROFILE"] = str(tmp_path / "no-profile.json")
     env["BGBG_GPU_ENV"] = str(TESTDATA / "gpu-env" / "empty.env")
     return env
-
-
-@pytest.fixture
-def start_worker(tmp_path):
-    """Start workers with a given environment; every one is shut down after the test."""
-    started = []
-
-    def start(env, command=None):
-        w = Worker(tmp_path / f"worker-{len(started)}.log", env=env, command=command)
-        started.append(w)
-        return w
-
-    yield start
-    for w in started:
-        w.close()
 
 
 def test_a_single_cutout_succeeds(worker, tmp_path):
@@ -345,8 +262,8 @@ def test_an_unreadable_image_is_named_in_the_error_and_the_log(worker, tmp_path)
          "input": str(bad), "output": str(tmp_path / "x.png")},
         until={"done_single", "error"})
     assert reply["type"] == "error", "a text file can't be decoded"
-    assert reply["message"].startswith("can't read not_an_image.webp: "), \
-        "the error's first line, which the frontend shows, names the file"
+    assert reply["message"] == "not_an_image.webp isn't an image bg-be-gone can read.", \
+        "the error, which the frontend shows, names the file in plain words"
     assert str(bad) in (tmp_path / "worker.log").read_text(), \
         "the worker log has the file's full path"
 

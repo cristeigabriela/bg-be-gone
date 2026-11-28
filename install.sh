@@ -17,15 +17,24 @@ PYVER="3.12"
 # --segment-only builds a lean venv with just the Segment Anything stack
 # (onnxruntime + numpy + pillow) and no rembg/BiRefNet.
 SEGMENT_ONLY="${BGBG_SEGMENT_ONLY:-0}"
+# Whether to fetch the default background-removal model now, so the first run
+# works offline: "ask" on a terminal (the answer defaults to yes), "no".
+FETCH_MODEL=ask
+[ -n "${BGBG_NO_MODEL_DOWNLOAD:-}" ] && FETCH_MODEL=no
 for arg in "$@"; do
   case "$arg" in
     --segment-only) SEGMENT_ONLY=1 ;;
+    --no-model-download) FETCH_MODEL=no ;;
     -h|--help)
-      echo "Usage: ./install.sh [--segment-only]"
+      echo "Usage: ./install.sh [--segment-only] [--no-model-download]"
+      echo
+      echo "  --no-model-download  don't fetch BiRefNet General (~970 MB) now;"
+      echo "                       the first background removal downloads it"
       echo
       echo "Environment:"
       echo "  BGBG_VENDOR=nvidia|amd|cpu    skip GPU autodetection"
       echo "  BGBG_NO_ROCM=1                make the worker ignore the AMD GPU"
+      echo "  BGBG_NO_MODEL_DOWNLOAD=1      same as --no-model-download"
       exit 0 ;;
     *) echo "Unknown option: $arg" >&2; exit 1 ;;
   esac
@@ -34,6 +43,83 @@ done
 msg()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
+
+# ---------------------------------------------------------------------------
+# Frontend: the window runs on the system Python, with the distro's GTK
+# ---------------------------------------------------------------------------
+
+gtk_packages_hint() {
+  local id="" like=""
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    id="$(. /etc/os-release; echo "${ID:-}")"
+    # shellcheck disable=SC1091
+    like="$(. /etc/os-release; echo "${ID_LIKE:-}")"
+  fi
+  case "$id $like" in
+    *arch*|*cachyos*|*manjaro*|*endeavouros*) echo "sudo pacman -S gtk4 libadwaita python-gobject" ;;
+    *fedora*|*rhel*|*centos*) echo "sudo dnf install gtk4 libadwaita python3-gobject" ;;
+    *debian*|*ubuntu*) echo "sudo apt install gir1.2-gtk-4.0 gir1.2-adw-1 python3-gi" ;;
+    *) echo "install GTK 4, libadwaita and PyGObject for your distro" ;;
+  esac
+}
+
+# Without these, launching the app shows nothing at all, so say so up front.
+FRONTEND_OK=1
+check_frontend() {
+  local out
+  if out="$(python3 -c "import gi; gi.require_version('Gtk', '4.0'); \
+gi.require_version('Adw', '1'); from gi.repository import Gtk, Adw" 2>&1)"; then
+    ok "GTK 4 and libadwaita load in $(command -v python3)"
+    return
+  fi
+  FRONTEND_OK=0
+  warn "The window can't start: python3 can't load GTK 4 and libadwaita."
+  printf '%s\n' "$out" | tail -n 2 | sed 's/^/     /' >&2
+  warn "Install them with:"
+  warn "  $(gtk_packages_hint)"
+}
+
+# ---------------------------------------------------------------------------
+# Default model, fetched now so the first background removal works offline
+# ---------------------------------------------------------------------------
+
+DEFAULT_MODEL="birefnet-general"
+
+# Where the worker's rembg keeps its models, asked of that rembg: the default
+# moved from ~/.u2net (2.0.76) to ~/.rembg (2.0.88); U2NET_HOME still wins.
+rembg_home() {
+  "$VENV/bin/python" -I -c \
+    'from rembg.sessions.base import BaseSession; print(BaseSession.u2net_home())'
+}
+
+# rembg 2.0.88 keeps a model in <home>/models/<name>/; 2.0.76, in <home>.
+model_downloaded() {
+  [ -f "$U2NET_DIR/$DEFAULT_MODEL.onnx" ] ||
+    [ -f "$U2NET_DIR/models/$DEFAULT_MODEL/$DEFAULT_MODEL.onnx" ]
+}
+
+fetch_default_model() {
+  [ "$SEGMENT_ONLY" = 1 ] && return
+  if [ "$FETCH_MODEL" = no ]; then
+    msg "Not downloading $DEFAULT_MODEL now; the first background removal will."
+    return
+  fi
+  if [ -t 0 ]; then
+    local answer=""
+    read -r -p "Download the background-removal model now (BiRefNet General, ~970 MB), so the first run works offline? [Y/n] " answer || true
+    case "$answer" in
+      n|N|no|No|NO) msg "Skipped; the first background removal downloads it."; return ;;
+    esac
+  fi
+  msg "Downloading $DEFAULT_MODEL (~970 MB)"
+  # With the worker's own interpreter and rembg, into the folder it reads.
+  if "$VENV/bin/python" "$ROOT/src/bgbg/prefetch.py" onnx "$DEFAULT_MODEL" "$U2NET_DIR"; then
+    ok "Model ready; background removal works offline"
+  else
+    warn "The download failed; the first background removal will try again."
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # GPU detection
@@ -382,16 +468,34 @@ install_desktop() {
   fi
 }
 
+check_frontend
 make_venv
 # Runs on every install, not just a fresh venv: a driver, ROCm or wheel upgrade
 # can change which arch actually works.
 if [ "$VENDOR" = amd ]; then configure_rocm; else rm -f "$GPU_ENV"; fi
+# A segmentation-only build has no rembg, and no model of its to fetch.
+U2NET_DIR=""
+if [ "$SEGMENT_ONLY" != 1 ] && ! U2NET_DIR="$(rembg_home)"; then
+  warn "Couldn't ask rembg where it keeps its models."
+  U2NET_DIR="${U2NET_HOME:-$HOME/.rembg}"
+fi
+if [ "$SEGMENT_ONLY" != 1 ] && model_downloaded; then
+  ok "$DEFAULT_MODEL is already downloaded"
+else
+  fetch_default_model
+fi
 install_desktop
 msg "Installed. Launch 'bg-be-gone' or find it in your app menu."
+msg "The app runs from this folder ($ROOT): keep it here. After moving it, run ./install.sh again."
 if [ "$SEGMENT_ONLY" = 1 ]; then
   msg "Segmentation-only build. First segment downloads a SAM model to"
   msg "  ~/.cache/bg-be-gone/models/ (~110-770 MB depending on your GPU/VRAM)."
-else
-  msg "First background removal downloads the model (~1 GB) to ~/.u2net/."
+elif ! model_downloaded; then
+  msg "First background removal downloads the model (~1 GB) to $U2NET_DIR/."
   msg "First segmentation downloads a SAM model to ~/.cache/bg-be-gone/models/."
+else
+  msg "First segmentation downloads a SAM model to ~/.cache/bg-be-gone/models/."
+fi
+if [ "$FRONTEND_OK" = 0 ]; then
+  warn "Before launching, install GTK 4 and libadwaita: $(gtk_packages_hint)"
 fi

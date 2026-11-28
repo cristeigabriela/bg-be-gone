@@ -7,8 +7,8 @@ background-removal worker (onnxruntime + numpy + pillow, no torch). Provides:
   auto-selection and step-down on OOM/failure.
 - ``SamSession`` — encode-once, then interactive point decoding or a numpy
   "segment everything" automatic mask generator (grid sampling + NMS).
-- Weight download-on-demand into ``~/.cache/bg-be-gone/models`` and last-good rung
-  persistence in ``~/.config/bg-be-gone/seg.json``.
+- Weight download-on-demand into ``~/.cache/bg-be-gone/models``. The model is
+  picked anew on every load; nothing about it is remembered.
 
 Runs inside the worker's venv. The GTK frontend never imports this (it has no
 numpy); masks are exchanged as PNG files on disk.
@@ -18,8 +18,12 @@ import zlib
 import json
 import colorsys
 import zipfile
+import tempfile
+import urllib.error
 import urllib.request
 from collections import deque
+from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 from PIL import Image, ImageFilter
@@ -43,25 +47,36 @@ _STD = np.array([0.229, 0.224, 0.225], np.float32)
 # ---------------------------------------------------------------------------
 # Model registry / ladder
 # ---------------------------------------------------------------------------
+# Peak dedicated VRAM (MiB) each SAM 2.1 model used to segment everything on a
+# 1600x1598 photo, measured on DirectML on 2026-11-27.
+_MEASURED_PEAK_MIB = {"large": 3041, "base_plus": 2591, "small": 2392, "tiny": 2347}
+# Headroom over the measured peak: a bigger photo, another provider, the driver.
+_GATE_FACTOR = 1.25
+_GATE_SLACK_MIB = 512
+
+
+def _gate(rung):
+    """The free VRAM (MiB) Auto wants before it picks `rung`."""
+    return round(_MEASURED_PEAK_MIB[rung] * _GATE_FACTOR) + _GATE_SLACK_MIB
+
+
 # ``vram_gate`` is the minimum *free* VRAM (MiB) for auto-selection to pick this
-# rung. ``large`` is intentionally never auto-selected (manual override only) —
-# the auto default aims "high but not the highest", the SAM analogue of the
-# app's BiRefNet-General default.
+# rung: about 4.3 GB for Large, down to about 3.4 GB for Tiny.
 MODELS = {
     "large": dict(
-        family="sam2", label="SAM 2.1 Large", vram_gate=8000,
+        family="sam2", label="SAM 2.1 Large", vram_gate=_gate("large"),
         repo="vietanhdev/segment-anything-2.1-onnx-models",
         zip="sam2.1_hiera_large_20260221.zip", stem="sam2.1_hiera_large"),
     "base_plus": dict(
-        family="sam2", label="SAM 2.1 Base+", vram_gate=6000,
+        family="sam2", label="SAM 2.1 Base+", vram_gate=_gate("base_plus"),
         repo="vietanhdev/segment-anything-2.1-onnx-models",
         zip="sam2.1_hiera_base_plus_20260221.zip", stem="sam2.1_hiera_base_plus"),
     "small": dict(
-        family="sam2", label="SAM 2.1 Small", vram_gate=4000,
+        family="sam2", label="SAM 2.1 Small", vram_gate=_gate("small"),
         repo="vietanhdev/segment-anything-2.1-onnx-models",
         zip="sam2.1_hiera_small_20260221.zip", stem="sam2.1_hiera_small"),
     "tiny": dict(
-        family="sam2", label="SAM 2.1 Tiny", vram_gate=2500,
+        family="sam2", label="SAM 2.1 Tiny", vram_gate=_gate("tiny"),
         repo="vietanhdev/segment-anything-2.1-onnx-models",
         zip="sam2.1_hiera_tiny_20260221.zip", stem="sam2.1_hiera_tiny"),
     "mobile": dict(
@@ -72,8 +87,8 @@ MODELS = {
 
 # Order used when stepping DOWN after a failure (best → cheapest).
 LADDER = ["large", "base_plus", "small", "tiny", "mobile"]
-# Rungs auto-selection is allowed to choose (excludes ``large``).
-_AUTO_ORDER = ["base_plus", "small", "tiny"]
+# Rungs auto-selection may choose, best first; MobileSAM is the fallback.
+_AUTO_ORDER = ["large", "base_plus", "small", "tiny"]
 
 
 class SegError(Exception):
@@ -83,6 +98,60 @@ class SegError(Exception):
 class ComputeError(SegError):
     """A model ran but produced garbage (e.g. NaN from a broken GPU kernel).
     Retry the same model on CPU rather than dropping to a smaller one."""
+
+
+class SegCanceled(SegError):
+    """The caller's cancel event was set while the work was running."""
+
+    def __init__(self, stage):
+        super().__init__(f"canceled while {stage}")
+        self.stage = stage
+
+
+class SegAcquireError(SegError):
+    """Getting a model's files failed, as opposed to loading or running them.
+
+    It says nothing about whether the model fits, so it is never a reason to
+    step down to a smaller one. `user_message` is the text the window shows.
+    """
+
+
+class SegDownloadError(SegAcquireError):
+    """No SAM model could be loaded because its download failed (usually offline)."""
+
+    def __init__(self, rung):
+        super().__init__(f"could not download the {rung} model")
+        self.rung = rung
+        self.user_message = ("No internet connection. The Segment model is downloaded "
+                             "once, on its first use: connect and try again.")
+
+
+class SegDownloadIncompleteError(SegAcquireError):
+    """A download ended before the size the server announced."""
+
+    def __init__(self, url, done, total):
+        super().__init__(f"download of {url} ended at {done} of {total} bytes")
+        self.url = url
+        self.done = done
+        self.total = total
+        self.user_message = ("The Segment model's download stopped early (%d of %d MB). "
+                             "Try again." % (done >> 20, total >> 20))
+
+
+class SegModelArchiveError(SegAcquireError):
+    """A downloaded model archive can't be read; it has been removed."""
+
+    def __init__(self, path, reason):
+        super().__init__(f"bad model archive {path}: {reason}")
+        self.path = path
+        self.reason = reason
+        self.user_message = ("The downloaded Segment model was damaged, so it was removed. "
+                             "Try again to download it afresh.")
+
+
+def _is_download_error(exc):
+    """True when `exc` is a download that couldn't reach the server."""
+    return isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError))
 
 
 def _provider_name(p):
@@ -101,8 +170,10 @@ def load_config():
 
 
 def save_config(**kw):
+    """Merge `kw` into the config; a value of None removes that key."""
     cfg = load_config()
     cfg.update(kw)
+    cfg = {k: v for k, v in cfg.items() if v is not None}
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         tmp = CONFIG_PATH + ".tmp"
@@ -114,7 +185,7 @@ def save_config(**kw):
 
 
 def rung_for_vram(free_mb, gpu):
-    """Auto-select rung from free VRAM, capped at ``base_plus``."""
+    """Auto-select rung from free VRAM: the best one whose gate it clears."""
     if not gpu:
         return "mobile"
     for name in _AUTO_ORDER:
@@ -127,21 +198,34 @@ def rung_for_vram(free_mb, gpu):
 # Weight download
 # ---------------------------------------------------------------------------
 def _download(url, dst, progress=None):
+    """Fetch `url` into `dst`, through a partial file of its own.
+
+    ``progress(done, total)`` runs after every chunk, with total 0 when the
+    server sends no size; it may raise to stop the download (the worker's
+    cancel does). Whatever stops it, the partial file is removed.
+    """
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    tmp = dst + ".part"
-    with urllib.request.urlopen(url, timeout=60) as r:
-        total = int(r.headers.get("Content-Length", 0))
-        done = 0
-        with open(tmp, "wb") as f:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dst),
+                               prefix=os.path.basename(dst) + ".", suffix=".part")
+    try:
+        with os.fdopen(fd, "wb") as f, urllib.request.urlopen(url, timeout=60) as r:
+            total = int(r.headers.get("Content-Length", 0))
+            done = 0
             while True:
                 chunk = r.read(1 << 20)
                 if not chunk:
                     break
                 f.write(chunk)
                 done += len(chunk)
-                if progress and total:
+                if progress:
                     progress(done, total)
-    os.replace(tmp, dst)
+        # A connection that drops can still end the read cleanly.
+        if total and done != total:
+            raise SegDownloadIncompleteError(url, done, total)
+        os.replace(tmp, dst)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def ensure_model(rung, progress=None):
@@ -166,13 +250,22 @@ def ensure_model(rung, progress=None):
     if not os.path.exists(zip_p):
         _download(f"{_HF}/{spec['repo']}/resolve/main/{spec['zip']}", zip_p, progress)
     os.makedirs(out_dir, exist_ok=True)
-    with zipfile.ZipFile(zip_p) as z:
-        for member in z.namelist():
-            if member.endswith(".onnx"):
-                data = z.read(member)
-                target = enc_p if "encoder" in member else dec_p
-                with open(target, "wb") as f:
-                    f.write(data)
+    try:
+        with zipfile.ZipFile(zip_p) as z:
+            bad = z.testzip()          # every member's CRC, before anything is kept
+            if bad is not None:
+                raise zipfile.BadZipFile(f"{bad} fails its CRC check")
+            for member in z.namelist():
+                if member.endswith(".onnx"):
+                    target = enc_p if "encoder" in member else dec_p
+                    # Through a part file: is_cached trusts any file at target.
+                    with open(target + ".part", "wb") as f:
+                        f.write(z.read(member))
+                    os.replace(target + ".part", target)
+    except zipfile.BadZipFile as e:
+        # Kept, it would fail every later load the same way.
+        os.remove(zip_p)
+        raise SegModelArchiveError(zip_p, str(e)) from e
     try:
         os.remove(zip_p)
     except OSError:
@@ -225,12 +318,16 @@ def _bbox_overlap(a, b):
     return not (ax + aw <= bx or bx + bw <= ax or ay + ah <= by or by + bh <= ay)
 
 
-def _nms(records, iou_thresh=0.7, max_objects=256):
-    """Greedy IoU-NMS. ``records`` = list of ``(score, mask_bool)``. Bbox
-    pre-filter then mask IoU; returns survivors sorted by score desc."""
+def _nms(records, iou_thresh=0.7, max_objects=256, cancel=None):
+    """Greedy IoU-NMS. ``records`` = list of ``(score, mask_bool, ...)``; any
+    further items ride along. Bbox pre-filter then mask IoU; returns the
+    surviving records sorted by score desc, or nothing once ``cancel`` is set."""
     records = sorted(records, key=lambda r: r[0], reverse=True)
     kept, kept_bb = [], []
-    for score, mask in records:
+    for rec in records:
+        if cancel is not None and cancel.is_set():
+            return []
+        mask = rec[1]
         bb = _bbox(mask)
         if bb[2] == 0:
             continue
@@ -240,7 +337,7 @@ def _nms(records, iou_thresh=0.7, max_objects=256):
                 drop = True
                 break
         if not drop:
-            kept.append((score, mask))
+            kept.append(rec)
             kept_bb.append(bb)
             if len(kept) >= max_objects:
                 break
@@ -387,13 +484,20 @@ class SamSession:
             **prompts})
         return out[0], out[1]
 
-    def _crop_upscale(self, low):
-        """256x256 logits over the padded 1024 input -> original-size bool mask."""
+    def _crop(self, low):
+        """The part of 256x256 logits over the padded 1024 input that covers the image."""
         vh = max(1, round(self._nh / 4.0))
         vw = max(1, round(self._nw / 4.0))
-        crop = np.ascontiguousarray(low[:vh, :vw])
+        return np.ascontiguousarray(low[:vh, :vw])
+
+    def _upscale(self, crop):
+        """Cropped low-res logits (see _crop) -> original-size bool mask."""
         im = Image.fromarray(crop, mode="F").resize(self._size, Image.BILINEAR)
         return np.asarray(im) > 0.0
+
+    def _crop_upscale(self, low):
+        """256x256 logits over the padded 1024 input -> original-size bool mask."""
+        return self._upscale(self._crop(low))
 
     # ---- interactive point prompt ----
     def decode_points(self, points, labels, prev_low=None):
@@ -448,42 +552,72 @@ class SamSession:
                    cancel=None, progress=None):
         """Grid-sampled automatic mask generation. Returns a list of bool masks
         (HxW) sorted largest-first. Cooperative-cancellable via ``cancel`` (a
-        threading.Event); ``progress(done, total)`` is called periodically."""
+        threading.Event); ``progress(done, total)`` is called after every grid
+        point, whether or not it found an object.
+
+        Candidates are filtered and de-duplicated on their low-resolution masks
+        (at most 256x256), and only the survivors are scaled to full size: at
+        4K a full-size candidate took 8.3 MB and one overlap test 11 ms.
+        """
         W, H = self._size
         xs = np.linspace(0, self._nw, points_per_side + 2)[1:-1]
         ys = np.linspace(0, self._nh, points_per_side + 2)[1:-1]
         grid = [(float(x), float(y)) for y in ys for x in xs]
         total = len(grid)
         min_area = max(64, int(min_area_frac * W * H))
-        records = []
+        records = []          # (score, low-res bool mask, low-res logits)
         for i, (x, y) in enumerate(grid):
             if cancel is not None and cancel.is_set():
                 break
             lg, score = self._grid_decode(x, y)
-            if score < pred_iou_thresh:
-                continue
-            if _stability(lg) < stability_thresh:
-                continue
-            mask = self._crop_upscale(lg)
-            if np.count_nonzero(mask) < min_area:
-                continue
-            records.append((score, mask))
-            if progress and (i % 8 == 0 or i == total - 1):
+            if score >= pred_iou_thresh and _stability(lg) >= stability_thresh:
+                crop = self._crop(lg)
+                low = crop > 0.0
+                # The low-res area, in full-size pixels.
+                if np.count_nonzero(low) * (W * H) / low.size >= min_area:
+                    records.append((score, low, crop))
+            if progress:
                 progress(i + 1, total)
 
-        kept = _nms(records, iou_thresh=0.7)
-        kept.sort(key=lambda r: np.count_nonzero(r[1]), reverse=True)
-        return [m for _, m in kept]
+        def canceled():
+            return cancel is not None and cancel.is_set()
+
+        # A cancel after the grid still stops here: de-duplicating and scaling
+        # up hundreds of candidates takes seconds of its own.
+        kept = [] if canceled() else _nms(records, iou_thresh=0.7, cancel=cancel)
+        masks = []
+        for _, _, crop in kept:
+            if canceled():
+                return []
+            masks.append(self._upscale(crop))
+        masks.sort(key=np.count_nonzero, reverse=True)
+        return masks
 
 
 # ---------------------------------------------------------------------------
 # Auto-selection with step-down
 # ---------------------------------------------------------------------------
+# Keys older versions kept in seg.json to remember a step-down. Nothing reads
+# them: a bad moment (another app holding VRAM, a driver hiccup) must not
+# lower the quality of later loads.
+_STALE_KEYS = ("rung", "stepped_down_at")
+
+
 def _looks_like_oom(exc):
     s = str(exc).lower()
     return any(k in s for k in ("out of memory", "oom", "cuda", "cublas",
                                 "cudnn", "failed to allocate", "hipmalloc",
                                 "rocm", "miopen"))
+
+
+@dataclass(frozen=True)
+class SamPick:
+    """The SAM session auto_select_session loaded, and how it was picked."""
+
+    session: "SamSession"
+    rung: str
+    mode: str                     # auto, manual or fallback
+    vram_free: Optional[int]      # MiB free when Auto picked; None when not probed
 
 
 def auto_select_session(providers, gpu, want="auto", probe_image=None,
@@ -497,46 +631,57 @@ def auto_select_session(providers, gpu, want="auto", probe_image=None,
                      actually reserves workspace and OOM/NaN surface).
     ``on_step``      called ``(rung, exc)`` each time an attempt is abandoned.
 
-    Failure handling differs by cause: an out-of-memory error steps down to a
-    smaller model (keeping the GPU), while a compute failure (NaN from a broken
-    GPU kernel, or any other error) retries the *same* model on CPU before
-    stepping down — so a too-new GPU degrades to CPU without needless downloads.
+    Auto picks from the VRAM free right now, on every load. Failure handling
+    differs by cause, and lasts for this load only; nothing is remembered:
 
-    Returns ``(session, rung, mode)`` where mode is auto|manual|fallback.
+    - out of memory: step down to a smaller model, keeping the GPU.
+    - a compute failure (NaN from a broken GPU kernel, or any other error):
+      retry the *same* model on CPU before stepping down, so a too-new GPU
+      degrades to CPU without needless downloads.
+    - a failed download, or a model file that arrived damaged: raise a
+      SegAcquireError. It says nothing about the model, so a smaller one that
+      happens to be cached must not stand in.
+
+    Returns a SamPick.
     """
     cpu_only = ["CPUExecutionProvider"]
     have_gpu = gpu and any(_provider_name(p) != "CPUExecutionProvider"
                            for p in providers)
 
-    cfg = load_config()
     if want == "auto":
         vram = probe_vram()
-        derived = rung_for_vram(vram["free"] if vram else 0, have_gpu and bool(vram))
-        # Only honour a *saved* rung when it is cheaper than what VRAM suggests
-        # — i.e. a remembered step-down from a prior failure — so we don't
-        # re-attempt a known-too-big model every launch. Never let it cap us
-        # below the VRAM pick (a manual choice is not persisted, see below).
-        saved = cfg.get("rung")
-        if saved in LADDER and LADDER.index(saved) > LADDER.index(derived):
-            start = saved
-        else:
-            start = derived
-        base_mode, persist = "auto", True
+        vram_free = vram["free"] if vram else None
+        start = rung_for_vram(vram_free or 0, have_gpu and bool(vram))
+        base_mode = "auto"
+        if any(k in load_config() for k in _STALE_KEYS):
+            save_config(**{k: None for k in _STALE_KEYS})
     else:
         start = want if want in LADDER else "base_plus"
-        base_mode, persist = "manual", False
+        base_mode = "manual"
+        vram_free = None               # nothing was probed for a model the user chose
+
+    def load(name, prov):
+        try:
+            sess = SamSession.load(name, prov, progress=on_progress)
+        except SegAcquireError:
+            raise
+        except Exception as e:
+            if _is_download_error(e):
+                raise SegDownloadError(name) from e
+            raise
+        if probe_image is not None:
+            sess.encode(probe_image)
+        return sess
 
     for name in LADDER[LADDER.index(start):]:
         attempts = ([providers, cpu_only] if have_gpu else [cpu_only])
         for prov in attempts:
             try:
-                sess = SamSession.load(name, prov, progress=on_progress)
-                if probe_image is not None:
-                    sess.encode(probe_image)
-                if persist:
-                    save_config(rung=name)
-                first = (name == start and prov is attempts[0])
-                return sess, name, (base_mode if first else "fallback")
+                sess = load(name, prov)
+                first = name == start and prov is attempts[0]
+                return SamPick(sess, name, base_mode if first else "fallback", vram_free)
+            except SegAcquireError:
+                raise
             except Exception as e:  # noqa: BLE001
                 if type(e).__name__ == "_Canceled":
                     raise      # a cancel isn't a load failure — don't step down
@@ -548,12 +693,7 @@ def auto_select_session(providers, gpu, want="auto", probe_image=None,
                 continue
 
     # Ultimate fallback: MobileSAM forced onto CPU.
-    sess = SamSession.load("mobile", cpu_only, progress=on_progress)
-    if probe_image is not None:
-        sess.encode(probe_image)
-    if persist:
-        save_config(rung="mobile")
-    return sess, "mobile", "fallback"
+    return SamPick(load("mobile", cpu_only), "mobile", "fallback", vram_free)
 
 
 # ---------------------------------------------------------------------------
@@ -733,13 +873,17 @@ def _save_idmap(arr, path):
     return path
 
 
-def save_objects(masks, size, out_dir, prefix, feather=0.8):
+def save_objects(masks, size, out_dir, prefix, feather=0.8, cancel=None, progress=None):
     """Write soft per-object mask PNGs + three lookup maps for hit-testing
     (``masks`` is largest-first). Returns ``(maps, objects)`` where maps has:
       - ``label``   : the most *specific* object per pixel (smallest on top)
       - ``general`` : the most *general* object per pixel (largest on top)
       - ``depth``   : how many objects overlap each pixel (an ``L`` PNG)
-    ids are encoded ``R + G*256`` (0 = background)."""
+    ids are encoded ``R + G*256`` (0 = background).
+
+    Each object takes ~0.4 s at 4K (its PNG and outline), so ``progress(done,
+    total)`` is called after each one and ``cancel`` (a threading.Event) is
+    checked before each; a set cancel raises SegCanceled."""
     W, H = size
     os.makedirs(out_dir, exist_ok=True)
     label = np.zeros((H, W), np.uint16)      # specific: smallest painted last
@@ -747,6 +891,10 @@ def save_objects(masks, size, out_dir, prefix, feather=0.8):
     depth = np.zeros((H, W), np.uint16)
     objs = []
     for idx, mask in enumerate(masks):
+        if cancel is not None and cancel.is_set():
+            raise SegCanceled("building layers")
+        if progress and idx:
+            progress(idx, len(masks))
         oid = idx + 1
         label[mask] = oid
         depth += mask
@@ -760,6 +908,10 @@ def save_objects(masks, size, out_dir, prefix, feather=0.8):
         objs.append({"id": oid, "color": "#%02x%02x%02x" % _obj_color(cx, cy),
                      "bbox": [x, y, w, h], "area": int(xs.size), "mask": mp,
                      "contour": contour(mask)})
+    # The lookup maps take a while too: check once more, and count the run as
+    # done only once they are written.
+    if cancel is not None and cancel.is_set():
+        raise SegCanceled("building layers")
     for idx in range(len(masks) - 1, -1, -1):   # largest painted last -> on top
         general[masks[idx]] = idx + 1
     maps = {
@@ -768,6 +920,8 @@ def save_objects(masks, size, out_dir, prefix, feather=0.8):
         "depth": os.path.join(out_dir, f"{prefix}_depth.png"),
     }
     Image.fromarray(np.minimum(depth, 255).astype(np.uint8), "L").save(maps["depth"])
+    if progress and masks:
+        progress(len(masks), len(masks))
     return maps, objs
 
 

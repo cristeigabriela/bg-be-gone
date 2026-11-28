@@ -19,13 +19,15 @@ Requests (one JSON object per line on stdin):
                                              # GIF or WebP (animated) by output
   {"op":"convert","input":P,"output":P,"id":N}   # re-encode as output's format
   {"op":"frames","input":P,"id":N}           # count an image's frames
-  {"op":"cancel"}                            # stop single/batch/gif in progress
+  {"op":"cancel","id":N}     # stop request N: running, or skipped once it's due
   {"op":"models"}
-  {"op":"seg_load","input":P,"model":"auto|large|base_plus|small|tiny|mobile","id":N}
+  {"op":"seg_load","input":P,"model":"auto|large|base_plus|small|tiny|mobile",
+   "maskdir":D,"id":N}
   {"op":"seg_everything","points_per_side":int?,"id":N}
   {"op":"seg_point","points":[[x,y,label],...],"use_prev":bool,"id":N}
-  {"op":"seg_extract","ids":[...]|"mask":P,"bg":BG,"blur":int,"output":P,"id":N}
-  {"op":"seg_cancel"}
+  {"op":"seg_extract","masks":[P,...]|"mask":P|"ids":[...],"input":P,"bg":BG,
+   "blur":int,"output":P,"id":N}             # needs no model loaded
+  {"op":"seg_cancel","id":N}                 # the same as cancel
   {"op":"engine_status","id":N}              # waits for PyTorch's start-up, if any
   {"op":"shutdown"}
 
@@ -38,20 +40,25 @@ Responses (one JSON object per line on stdout):
   {"type":"engine_status","engine":"ort"|"torch","state":"ready"|"failed"|...,
    "reason":str|null,"device":str|null,"id":N}
   {"type":"loading","model":M,"id":N}
+  {"type":"download","model":M,"done":bytes,"total":bytes,"id":N}   # first use
   {"type":"device","provider":P,"label":L,"gpu":bool,"id":N}
   {"type":"progress","done":i,"total":n,"name":str,"id":N}
-  {"type":"done_single","output":P,"preview":P,"seconds":f,"id":N}
-  {"type":"done_batch","count":n,"seconds":f,"outdir":P,"id":N}
+  {"type":"done_single","output":P,"preview":P,"seconds":f,"device":D,"id":N}
+      # D: {"provider","label","gpu"} it last ran on; done_batch and gif_done
+      # carry it too, so every finished job says where it ran
+  {"type":"done_batch","count":n,"total":n,"failed":[{"name","message"}],
+   "skipped":[{"name","message"}],"renamed":n,"seconds":f,"outdir":P,"id":N}
   {"type":"gif_progress","done":i,"total":n,"id":N}
-  {"type":"gif_done","output":P,"preview":P,"frames":n,"seconds":f,"id":N}
+  {"type":"gif_done","output":P,"preview":P,"frames":n,"seconds":f,"device":D,"id":N}
   {"type":"converted","output":P,"frames":n,"id":N}
   {"type":"frames","frames":n,"id":N}
   {"type":"canceled","scope":"single|batch|gif","id":N}
   {"type":"seg_download","done":i,"total":n,"id":N}
   {"type":"seg_step","rung":R,"message":str,"id":N}
   {"type":"seg_ready","rung":R,"model":L,"provider":P,"label":L,"gpu":bool,
-   "mode":auto|manual|fallback,"family":str,"id":N}
-  {"type":"seg_progress","done":i,"total":n,"id":N}
+   "mode":auto|manual|fallback,"family":str,"vram_free":MiB|null,"id":N}
+      # vram_free: what Auto's pick was based on; null when nothing was probed
+  {"type":"seg_progress","phase":"points|layers","done":i,"total":n,"id":N}
   {"type":"seg_objects","label_map":P,"count":n,"objects":[...],"id":N}
   {"type":"seg_mask","mask":P,"score":f,"bbox":[x,y,w,h],"id":N}
   {"type":"seg_extracted","output":P,"seconds":f,"id":N}
@@ -71,6 +78,9 @@ plat.prepare_process()
 
 import gc  # noqa: E402
 import json  # noqa: E402
+import contextlib  # noqa: E402
+import enum  # noqa: E402
+import errno  # noqa: E402
 import time  # noqa: E402
 import queue  # noqa: E402
 import shutil  # noqa: E402
@@ -78,12 +88,14 @@ import tempfile  # noqa: E402
 import threading  # noqa: E402
 import traceback  # noqa: E402
 import warnings  # noqa: E402
+import urllib.error  # noqa: E402
 
 from PIL import Image, ImageFilter, UnidentifiedImageError  # noqa: E402
 # Imports onnxruntime, then rembg when it is installed.
 from engines import ort as ort_engine  # noqa: E402
 from engines import selection  # noqa: E402
 from engines import torch_birefnet  # noqa: E402  (imports no torch itself)
+import batchnames  # noqa: E402
 import formats  # noqa: E402
 
 # HEIC/HEIF (phone photos) needs libheif; pi-heif is its decode-only build.
@@ -135,7 +147,9 @@ def _torch_session(model, req_id):
     if _torch.wait() is torch_birefnet.EngineState.READY:
         try:
             out({"type": "loading", "model": model, "id": req_id})
-            session = _torch.new_session(model)
+            session = _torch.new_session(model, progress=_download_reporter(model, req_id))
+        except _Canceled:
+            raise                       # a cancel during its download: the job ends
         except Exception as err:  # noqa: BLE001  (out of VRAM, a bad download, ...)
             _torch.release_memory()
             reason = f"{model} didn't load ({type(err).__name__}: {err})"
@@ -151,6 +165,73 @@ def _torch_session(model, req_id):
     return None
 
 
+# How often download progress goes out, at most: often enough for a smooth
+# bar, rare enough not to flood the window (pooch updates per KB).
+_DOWNLOAD_REPORT_S = 0.25
+
+
+def _download_reporter(model, req_id):
+    """progress(done, total) in bytes for a model's first download.
+
+    Sends ``download`` replies, at most every _DOWNLOAD_REPORT_S and always the
+    last one, and raises _Canceled once a cancel arrives, which stops the download.
+    """
+    last = [0.0]
+
+    def progress(done, total):
+        if _cancel.is_set():
+            raise _Canceled()
+        now = time.monotonic()
+        if done < total and now - last[0] < _DOWNLOAD_REPORT_S:
+            return
+        last[0] = now
+        out({"type": "download", "model": model, "done": done, "total": total,
+             "id": req_id})
+    return progress
+
+
+class _PoochProgress:
+    """A pooch progress bar (total, update, reset, close) that reports to the window."""
+
+    def __init__(self, progress):
+        self._progress = progress
+        self.total = 0
+        self.n = 0
+
+    def update(self, n):
+        self.n += n
+        self._progress(min(self.n, self.total or self.n), self.total)
+
+    def reset(self):
+        self.n = 0
+
+    def close(self):
+        pass
+
+
+@contextlib.contextmanager
+def _rembg_download_progress(progress):
+    """Report rembg's model downloads through `progress` while the block runs.
+
+    HACK: rembg's sessions call ``pooch.retrieve(..., progressbar=True)``, which
+    draws a tqdm bar on stderr, the log, so the window saw nothing during a
+    ~1 GB download. This swaps in a progress object for that call. The real
+    fix is a progress hook in rembg's ``download_models``.
+    """
+    import pooch
+    real = pooch.retrieve
+
+    def retrieve(*args, **kwargs):
+        if kwargs.get("progressbar") is True:
+            kwargs["progressbar"] = _PoochProgress(progress)
+        return real(*args, **kwargs)
+    pooch.retrieve = retrieve
+    try:
+        yield
+    finally:
+        pooch.retrieve = real
+
+
 def get_session(model, req_id):
     if model not in _sessions:
         session = _torch_session(model, req_id)
@@ -159,14 +240,26 @@ def get_session(model, req_id):
             _torch_models.add(model)
             return session
         out({"type": "loading", "model": model, "id": req_id})
-        sess = ort_engine.new_session(model, ort_engine.preferred_providers())
-        active = sess.inner_session.get_providers()
-        prov = active[0] if active else "CPUExecutionProvider"
+        with _rembg_download_progress(_download_reporter(model, req_id)):
+            sess = ort_engine.new_session(model, ort_engine.preferred_providers())
         _sessions[model] = sess
-        out({"type": "device", "provider": prov,
-             "label": ort_engine.PROVIDER_LABELS.get(prov, prov),
-             "gpu": prov in ort_engine.GPU_PROVIDERS, "id": req_id})
+        out({"type": "device", **_device(model, sess), "id": req_id})
     return _sessions[model]
+
+
+def _device(model, session):
+    """Where `session`, running `model`, runs, as the frontend's device label wants it."""
+    if model in _torch_models and session is _sessions.get(model):
+        return {"provider": "PyTorch", "label": _torch.device, "gpu": True}
+    active = session.inner_session.get_providers()
+    prov = active[0] if active else "CPUExecutionProvider"
+    return {"provider": prov, "label": ort_engine.PROVIDER_LABELS.get(prov, prov),
+            "gpu": prov in ort_engine.GPU_PROVIDERS}
+
+
+# Where the last background removal actually ran. Finished jobs report it, so
+# the label goes back to the GPU after a one-off CPU fallback.
+_last_device = None
 
 
 def get_cpu_session(model, req_id):
@@ -174,7 +267,8 @@ def get_cpu_session(model, req_id):
     job when the GPU can't (e.g. not enough VRAM)."""
     if model not in _cpu_sessions:
         out({"type": "loading", "model": model, "id": req_id})
-        _cpu_sessions[model] = ort_engine.new_session(model, ["CPUExecutionProvider"])
+        with _rembg_download_progress(_download_reporter(model, req_id)):
+            _cpu_sessions[model] = ort_engine.new_session(model, ["CPUExecutionProvider"])
     # Tell the UI the run moved to the CPU. Without this the status bar keeps
     # claiming the GPU through every fallback, so a wrong-but-fast result and a
     # correct-but-slow one look identical from the outside.
@@ -188,6 +282,7 @@ def _remove_resilient(model, req_id, img, alpha):
     """Run rembg on the preferred (GPU) session; if it fails with a runtime error
     — typically low VRAM — retry on CPU so the user still gets a result. The GPU
     session is kept, so a later run recovers automatically once VRAM frees up."""
+    global _last_device
     session = get_session(model, req_id)
     try:
         with warnings.catch_warnings():
@@ -199,6 +294,7 @@ def _remove_resilient(model, req_id, img, alpha):
                                     message="invalid value encountered")
             res = ort_engine.remove(img, session=session, alpha_matting=alpha)
         _fallback_notified.discard(model)      # GPU healthy again
+        _last_device = _device(model, session)
         return res
     except Exception as e:
         # On PyTorch any RuntimeError is a run failure: out of VRAM, a HIP/CUDA
@@ -216,7 +312,9 @@ def _remove_resilient(model, req_id, img, alpha):
                             "to free memory, then try again.",
                  "id": req_id})
         session = get_cpu_session(model, req_id)
-        return ort_engine.remove(img, session=session, alpha_matting=alpha)
+        res = ort_engine.remove(img, session=session, alpha_matting=alpha)
+        _last_device = _device(model, session)
+        return res
 
 
 def _hex_to_rgb(s):
@@ -237,18 +335,94 @@ def _checkerboard(size, cell=24):
     return board
 
 
-class UnreadableImageError(OSError):
-    def __init__(self, path, reason):
+class WorkerError(Exception):
+    """Base for failures the worker can explain to the user itself.
+
+    Each carries `user_message`, the text the window shows, next to the usual
+    lowercase message that goes to the log.
+    """
+
+    user_message = "Something went wrong."
+
+
+class UnreadableImageError(WorkerError, OSError):
+    def __init__(self, path, reason, user_message):
         super().__init__(f"can't read {os.path.basename(path)}: {reason}")
         self.path = path
         self.reason = reason
+        self.user_message = user_message
 
 
-class UnsupportedOutputError(ValueError):
+class UnsupportedOutputError(WorkerError, ValueError):
     def __init__(self, path):
         super().__init__(f"can't save as {os.path.basename(path)}: "
                          "bg-be-gone writes PNG, WebP or JPEG")
         self.path = path
+        self.user_message = ("bg-be-gone can't save %s: it writes PNG, WebP or JPEG."
+                             % os.path.basename(path))
+
+
+class NoImagesError(WorkerError):
+    def __init__(self, folder, user_message):
+        super().__init__(f"no images to process in {folder}")
+        self.folder = folder
+        self.user_message = user_message
+
+
+def _causes(exc):
+    """`exc` and every exception it was raised from, outermost first."""
+    seen = []
+    while exc is not None and exc not in seen:
+        seen.append(exc)
+        exc = exc.__cause__ or exc.__context__
+    return seen
+
+
+def _is_network_error(exc):
+    """True when `exc` comes from a download that couldn't reach the server."""
+    network = (urllib.error.URLError, ConnectionError, TimeoutError)
+    try:
+        import requests      # what pooch, and so rembg's downloads, run on
+        network += (requests.ConnectionError, requests.Timeout)
+    except ImportError:
+        pass
+    return any(isinstance(e, network) for e in _causes(exc))
+
+
+def describe_error(exc, req):
+    """The text the window shows for `exc`, in words the user can act on.
+
+    The traceback goes to the log; this names the common failures plainly and
+    falls back to the exception's first line for the rest.
+    """
+    name = os.path.basename(req.get("input") or "") or "The file"
+    for e in _causes(exc):
+        if isinstance(e, WorkerError):
+            return e.user_message
+        if isinstance(e, batchnames.BatchPatternError):
+            return e.user_message
+        if _HAVE_SEG and isinstance(e, seg.SegAcquireError):
+            return e.user_message
+        if isinstance(e, UnidentifiedImageError):
+            return f"{name} isn't an image bg-be-gone can read."
+        if isinstance(e, FileNotFoundError):
+            return f"{os.path.basename(e.filename or '') or name} was not found."
+        if isinstance(e, PermissionError):
+            return f"No permission to use {e.filename or name}."
+        if isinstance(e, OSError) and e.errno == errno.ENOSPC:
+            return "Not enough disk space to write the result."
+        if isinstance(e, MemoryError):
+            return ("Not enough memory for this image. Close other apps, "
+                    "or try a smaller image.")
+    if _is_network_error(exc):
+        return ("No internet connection. The model is downloaded once, on its "
+                "first use: connect and try again.")
+    text = str(exc).lower()
+    if "out of memory" in text or "failed to allocate" in text:
+        return ("Not enough graphics memory (VRAM). Close other GPU apps, "
+                "or pick a smaller model.")
+    first = (str(exc).splitlines() or [""])[0] or type(exc).__name__
+    return "Something went wrong: " + first
 
 
 def open_image(path):
@@ -258,19 +432,30 @@ def open_image(path):
     file fail with its name, not later in the middle of a cut-out. Failures go
     to the worker log too, with the full path.
     """
+    name = os.path.basename(path)
     try:
         im = Image.open(path)
         im.load()
         return im
     except UnidentifiedImageError as e:
         if formats.format_of(path) is formats.HEIF and not _HAVE_HEIF:
-            reason = "HEIC/HEIF support (pi-heif) isn't installed; re-run the installer"
+            err = UnreadableImageError(
+                path, "HEIC/HEIF support (pi-heif) isn't installed; re-run the installer",
+                f"{name} is a HEIC/HEIF image, and HEIC support (pi-heif) isn't "
+                "installed. Run the installer again to add it.")
         else:
-            reason = "not an image format bg-be-gone reads"
-        err = UnreadableImageError(path, reason)
+            err = UnreadableImageError(path, "not an image format bg-be-gone reads",
+                                       f"{name} isn't an image bg-be-gone can read.")
+        cause = e
+    except FileNotFoundError as e:
+        err = UnreadableImageError(path, str(e), f"{name} was not found.")
+        cause = e
+    except PermissionError as e:
+        err = UnreadableImageError(path, str(e), f"No permission to read {name}.")
         cause = e
     except OSError as e:
-        err = UnreadableImageError(path, str(e))
+        # Typically a truncated or damaged file: Pillow's words say which.
+        err = UnreadableImageError(path, str(e), f"Can't read {name}: {e}.")
         cause = e
     print(f"decode failed: {path}: {cause}", file=sys.stderr, flush=True)
     raise err from cause
@@ -374,7 +559,7 @@ def handle_single(req):
         out({"type": "canceled", "scope": "single", "id": rid})   # mid-run; drop it
         return
     out({"type": "done_single", "output": req["output"],
-         "preview": preview or req["output"],
+         "preview": preview or req["output"], "device": _last_device,
          "seconds": round(time.time() - t, 2), "id": rid})
 
 
@@ -393,50 +578,98 @@ def _webp_frames(path):
         return 1
 
 
+def _batch_skip_reason(path):
+    """Why a batch leaves out an image it can read, or None to process it.
+
+    Batch keeps one frame per file, so animations go through the Single page,
+    which keeps them all. A GIF is left out even as a still, as before.
+    """
+    if not path.lower().endswith(formats.BATCH_SUFFIXES):
+        return "it's a GIF; open it on the Single page, which keeps every frame."
+    if _webp_frames(path) > 1:
+        return "it's an animated WebP; open it on the Single page, which keeps every frame."
+    return None
+
+
 def handle_batch(req):
     rid = req.get("id")
     indir = req["input_dir"]
     outdir = req["output_dir"]
-    os.makedirs(outdir, exist_ok=True)
-    files = sorted(f for f in glob.glob(os.path.join(indir, "*"))
-                   if f.lower().endswith(formats.BATCH_SUFFIXES)
-                   and os.path.isfile(f))
-    # Batch would keep only an animation's first frame, as with GIFs.
-    animated = [f for f in files if _webp_frames(f) > 1]
-    files = [f for f in files if f not in animated]
-    if animated:
+    pattern = req.get("pattern") or "{name}_nobg"
+    batchnames.check_pattern(pattern)      # before any work, so nothing half-runs
+    images = sorted(f for f in glob.glob(os.path.join(indir, "*"))
+                    if f.lower().endswith(formats.READ_SUFFIXES) and os.path.isfile(f))
+    files, skipped = [], []                # skipped: [{"name", "message"}], in order
+    for f in images:
+        reason = _batch_skip_reason(f)
+        if reason is None:
+            files.append(f)
+        else:
+            skipped.append({"name": os.path.basename(f), "message": reason})
+    if skipped:
         out({"type": "notice", "id": rid, "message":
-             "Skipped %d animated WebP (%s): open them on the Single page."
-             % (len(animated), ", ".join(os.path.basename(f) for f in animated))})
+             "Skipped %d GIF or animated WebP (%s): open them on the Single page."
+             % (len(skipped), ", ".join(s["name"] for s in skipped))})
     total = len(files)
     if total == 0:
-        out({"type": "error", "message": "No images found in input folder.",
-             "id": rid})
-        return
-    pattern = req.get("pattern") or "{name}_nobg"
+        found = "No images found in the input folder."
+        if skipped:
+            found += " Skipped %d GIF or animated WebP: open them on the Single page." \
+                % len(skipped)
+        raise NoImagesError(indir, found)
+    os.makedirs(outdir, exist_ok=True)
     get_session(req["model"], rid)         # load + emit the device message
     alpha = req.get("alpha", False)
     bg = req.get("bg", "transparent")
     blur = req.get("blur", 20)
+    taken = batchnames.taken_by(files)     # a source is never an output
+    renamed = 0                            # results written under a numbered name
+    failed = []                            # [{"name", "message"}], in order
     t = time.time()
     for i, f in enumerate(files, 1):
         if _cancel.is_set():               # stop before starting the next file
             out({"type": "canceled", "scope": "batch", "done": i - 1,
                  "total": total, "id": rid})
             return
-        name = os.path.splitext(os.path.basename(f))[0]
-        try:
-            stem = pattern.format(name=name, n=i)
-        except Exception:
-            stem = name + "_nobg"
-        dst = os.path.join(outdir, stem + ".png")
         out({"type": "progress", "done": i - 1, "total": total,
              "name": os.path.basename(f), "id": rid})
-        process_one(req["model"], rid, f, dst, alpha, bg, blur,
-                    want_preview=False)
+        # One file that can't be read must not cost the rest of the run.
+        part = None
+        try:
+            stem = batchnames.stem_for(pattern, f, i)
+            # The result is written into a file of the batch's own, and gets
+            # its name only once complete, from a call that never replaces a
+            # file: one that appears under that name meanwhile is kept.
+            part = batchnames.new_part(outdir, stem)
+            process_one(req["model"], rid, f, part, alpha, bg, blur,
+                        want_preview=False)
+            dst = batchnames.publish(part, outdir, stem, taken)
+            part = None
+        except _Canceled:
+            # A cancel that stopped a model download ends the run; its
+            # unfinished file must not stay behind.
+            if part is not None:
+                os.remove(part)
+            raise
+        except Exception as e:  # noqa: BLE001 - reported per file, run goes on
+            print(f"batch: {f} failed:", file=sys.stderr)
+            traceback.print_exc()
+            sys.stderr.flush()
+            if part is not None:           # only ever the batch's own file
+                try:
+                    os.remove(part)
+                except OSError as rm_err:
+                    print(f"batch: could not remove {part}: {rm_err}", file=sys.stderr)
+            failed.append({"name": os.path.basename(f),
+                           "message": describe_error(e, {"input": f})})
+            continue
+        if os.path.basename(dst) != stem + ".png":
+            renamed += 1
     out({"type": "progress", "done": total, "total": total, "name": "",
          "id": rid})
-    out({"type": "done_batch", "count": total,
+    out({"type": "done_batch", "count": total - len(failed), "total": total,
+         "failed": failed, "skipped": skipped, "renamed": renamed,
+         "device": _last_device,
          "seconds": round(time.time() - t, 1), "outdir": outdir, "id": rid})
 
 
@@ -554,7 +787,7 @@ def handle_gif(req):
         preview = dst + ".preview.png"
         shutil.copyfile(paths[0], preview)
         out({"type": "gif_done", "output": dst, "preview": preview, "frames": n,
-             "seconds": round(time.time() - t, 2), "id": rid})
+             "device": _last_device, "seconds": round(time.time() - t, 2), "id": rid})
     finally:
         shutil.rmtree(framedir, ignore_errors=True)
 
@@ -563,7 +796,11 @@ def handle_gif(req):
 # Segmentation
 # ---------------------------------------------------------------------------
 _cancel = threading.Event()
-_seg = None  # {session, image, rung, size, maskdir, objects, prev_low}
+# How often Segment everything's progress goes out, at most.
+_SEG_REPORT_S = 0.1
+# {session, image, input, rung, size, maskdir, objects, prev_low}; an unload
+# sets only session (and prev_low) to None.
+_seg = None
 
 
 class _Canceled(Exception):
@@ -581,7 +818,8 @@ def handle_seg_load(req):
     path = req["input"]
     want = req.get("model", "auto")
     pil = open_image(path).convert("RGB")
-    maskdir = os.path.join(os.path.dirname(os.path.abspath(path)), "segmasks")
+    # The input can be the user's own photo, so the masks never go next to it.
+    maskdir = req.get("maskdir") or tempfile.mkdtemp(prefix="bg-be-gone-masks-")
     os.makedirs(maskdir, exist_ok=True)
 
     def on_step(rung, exc):
@@ -593,24 +831,32 @@ def handle_seg_load(req):
             raise _Canceled()
         out({"type": "seg_download", "done": done, "total": total, "id": rid})
 
+    # The previous image's model goes first: free VRAM is probed next, and a
+    # session still holding its memory would make the pick smaller than it
+    # should be, or need room for two models at once. Its masks are files.
+    if _seg is not None and _seg["session"] is not None:
+        _seg["session"] = None
+        _seg["prev_low"] = None
+        gc.collect()
     try:
-        session, rung, mode = seg.auto_select_session(
+        pick = seg.auto_select_session(
             ort_engine.preferred_providers(), _gpu_hint(), want=want, probe_image=pil,
             on_step=on_step, on_progress=on_progress)
     except _Canceled:
         out({"type": "seg_canceled", "id": rid})
         return
+    session, rung = pick.session, pick.rung
     prov = session.provider()
-    _seg = {"session": session, "image": pil, "rung": rung, "size": pil.size,
-            "maskdir": maskdir, "objects": [], "prev_low": None}
+    _seg = {"session": session, "image": pil, "input": path, "rung": rung,
+            "size": pil.size, "maskdir": maskdir, "objects": [], "prev_low": None}
     out({"type": "seg_ready", "rung": rung, "model": seg.MODELS[rung]["label"],
          "provider": prov, "label": ort_engine.PROVIDER_LABELS.get(prov, prov),
-         "gpu": prov in ort_engine.GPU_PROVIDERS, "mode": mode, "family": session.family,
-         "id": rid})
+         "gpu": prov in ort_engine.GPU_PROVIDERS, "mode": pick.mode,
+         "family": session.family, "vram_free": pick.vram_free, "id": rid})
 
 
 def _require_seg(rid):
-    if _seg is None:
+    if _seg is None or _seg["session"] is None:
         out({"type": "error", "message": "Load an image to segment first.",
              "id": rid})
         return False
@@ -625,16 +871,35 @@ def handle_seg_everything(req):
     gpu = session.provider() in ort_engine.GPU_PROVIDERS
     pps = int(req.get("points_per_side") or (32 if gpu else 16))
 
-    def progress(done, total):
-        out({"type": "seg_progress", "done": done, "total": total, "id": rid})
+    def reporter(phase):
+        """progress(done, total) for `phase`, sent at most every _SEG_REPORT_S and
+        always at the end, so a 1,936-point grid doesn't flood the window."""
+        last = [0.0]
+
+        def progress(done, total):
+            now = time.monotonic()
+            if done < total and now - last[0] < _SEG_REPORT_S:
+                return
+            last[0] = now
+            out({"type": "seg_progress", "phase": phase, "done": done,
+                 "total": total, "id": rid})
+        return progress
 
     t = time.time()
     masks = session.everything(points_per_side=pps, cancel=_cancel,
-                               progress=progress)
+                               progress=reporter("points"))
     if _cancel.is_set():
         out({"type": "seg_canceled", "id": rid})
         return
-    maps, objs = seg.save_objects(masks, _seg["size"], _seg["maskdir"], f"e{rid}")
+    try:
+        maps, objs = seg.save_objects(masks, _seg["size"], _seg["maskdir"], f"e{rid}",
+                                      cancel=_cancel, progress=reporter("layers"))
+    except seg.SegCanceled:
+        out({"type": "seg_canceled", "id": rid})
+        return
+    if _cancel.is_set():         # a cancel at the last moment still keeps the old objects
+        out({"type": "seg_canceled", "id": rid})
+        return
     _seg["objects"] = objs
     out({"type": "seg_objects", "label_map": maps["label"],
          "general_map": maps["general"], "depth_map": maps["depth"],
@@ -663,24 +928,36 @@ def handle_seg_point(req):
 
 
 def handle_seg_extract(req):
+    """Composite the given masks of an image. Needs no model: after an unload,
+    or in a restarted worker, the window still has its masks and the image."""
     rid = req.get("id")
-    if not _require_seg(rid):
-        return
     dst = req["output"]
     bg = req.get("bg", "transparent")
     blur = int(req.get("blur", 20))
     if req.get("mask"):
         paths = [req["mask"]]
-    else:
+    elif "masks" in req:
+        paths = list(req["masks"])
+    elif _require_seg(rid):             # an older frontend names object ids
         ids = set(req.get("ids") or [])
         paths = [o["mask"] for o in _seg["objects"] if o["id"] in ids]
+    else:
+        return
     if not paths:
         out({"type": "error", "message": "Nothing selected to extract.",
              "id": rid})
         return
+    src = req.get("input")
+    if _seg is not None and (src is None or src == _seg["input"]):
+        image = _seg["image"]
+    elif src:
+        image = open_image(src).convert("RGB")
+    else:
+        _require_seg(rid)
+        return
     t = time.time()
     alpha = seg.load_union(paths)
-    seg.composite_extract(_seg["image"], alpha, bg, dst, blur=blur)
+    seg.composite_extract(image, alpha, bg, dst, blur=blur)
     out({"type": "seg_extracted", "output": dst,
          "seconds": round(time.time() - t, 2), "id": rid})
 
@@ -696,8 +973,11 @@ def handle_unload(req):
     if scope in ("bg", "all") and (_sessions or _cpu_sessions):
         _drop_bg_sessions()
         freed.append("bg")
-    if scope in ("seg", "all") and _seg is not None:
-        _seg = None
+    if scope in ("seg", "all") and _seg is not None and _seg["session"] is not None:
+        # Only the model: the image and masks stay, so Save still works from
+        # the objects the window kept.
+        _seg["session"] = None
+        _seg["prev_low"] = None
         freed.append("seg")
     if freed:
         gc.collect()
@@ -810,18 +1090,101 @@ def _dispatch(req):
         handler = _HANDLERS.get(op)
         if handler:
             handler(req)
+    except _Canceled:
+        # A cancel that stopped a model download (see _download_reporter).
+        if op in _SEG_OPS:
+            out({"type": "seg_canceled", "id": rid})
+        else:
+            out({"type": "canceled", "scope": op, "id": rid})
     except Exception as e:  # noqa: BLE001
-        out({"type": "error",
-             "message": f"{e}\n{traceback.format_exc()}", "id": rid})
+        # stderr is the frontend's log file: the traceback is what a bug
+        # report needs, the window gets the plain version.
+        print(f"request {op} (id {rid}) failed:", file=sys.stderr)
+        traceback.print_exc()
+        sys.stderr.flush()
+        out({"type": "error", "message": describe_error(e, req), "id": rid})
+
+
+class CancelOutcome(enum.Enum):
+    """What a cancel found when it arrived."""
+
+    STOPPING = "stopping"        # the request was running: its event is set
+    SKIPPED = "skipped"          # still queued: it is skipped when it comes up
+    DROPPED = "dropped"          # neither: it already ended, or never came
+
+
+class _Cancels:
+    """Which requests a cancel has reached, by request id.
+
+    The stdin thread hands requests and cancels in as they arrive; the worker
+    thread runs one request at a time. A cancel for the running request sets
+    that request's own event. One for a request still queued is kept, and the
+    request is skipped when it comes up. Any other cancel is dropped: request
+    ids only grow, so one kept for an ended request would stay for good.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._running = None        # (request id, its Event) while one runs
+        self._waiting = set()       # ids queued and not yet started
+        self._skipped = set()       # ids cancelled before they started
+
+    def queue(self, rid):
+        """`rid` is queued: a cancel for it is kept until it comes up."""
+        with self._lock:
+            self._waiting.add(rid)
+
+    def start(self, rid):
+        """Begin request `rid`: its cancel Event, or None if it was cancelled
+        while queued and must be skipped."""
+        with self._lock:
+            self._waiting.discard(rid)
+            if rid in self._skipped:
+                self._skipped.discard(rid)
+                return None
+            event = threading.Event()
+            self._running = (rid, event)
+            return event
+
+    def finish(self):
+        with self._lock:
+            self._running = None
+
+    def cancel(self, rid):
+        with self._lock:
+            if self._running is not None and self._running[0] == rid:
+                self._running[1].set()
+                return CancelOutcome.STOPPING
+            if rid in self._waiting:
+                self._skipped.add(rid)
+                return CancelOutcome.SKIPPED
+            return CancelOutcome.DROPPED
+
+
+_cancels = _Cancels()
 
 
 def _worker_loop(q):
+    global _cancel
     while True:
         req = q.get()
         if req is None:
             return
-        _cancel.clear()
-        _dispatch(req)
+        rid = req.get("id")
+        event = _cancels.start(rid)
+        if event is None:
+            # Cancelled while queued: it ends here, and says so.
+            if req.get("op") in _SEG_OPS:
+                out({"type": "seg_canceled", "id": rid})
+            else:
+                out({"type": "canceled", "scope": req.get("op"), "id": rid})
+            continue
+        # Handlers check the module's _cancel; for this request it is its own.
+        _cancel = event
+        try:
+            _dispatch(req)
+        finally:
+            _cancels.finish()
 
 
 def main():
@@ -842,10 +1205,16 @@ def main():
             break
         # Cancel is handled on the stdin thread so it can interrupt a running
         # task (segmentation checks _cancel between grid points; gif between
-        # frames). "seg_cancel" is kept for back-compat.
+        # frames). It names the request it is for; "seg_cancel" is kept for
+        # back-compat.
         if op in ("cancel", "seg_cancel"):
-            _cancel.set()
+            if req.get("id") is None:
+                sys.stderr.write("a cancel that names no request is ignored\n")
+            elif _cancels.cancel(req["id"]) is CancelOutcome.DROPPED:
+                sys.stderr.write(f"cancel for request {req['id']} dropped: "
+                                 "it isn't queued or running\n")
             continue
+        _cancels.queue(req.get("id"))
         q.put(req)
 
 
