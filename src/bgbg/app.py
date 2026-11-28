@@ -736,6 +736,11 @@ def _exit_code_text(code):
     return str(code)
 
 
+# How long shutting the worker down waits for its "exiting" reply: past its
+# own wait for a batch result being written (5 s), with room to say so.
+_WORKER_EXIT_WAIT_S = 8
+
+
 class Worker:
     """Owns the venv subprocess and dispatches replies to the main loop.
 
@@ -750,6 +755,8 @@ class Worker:
         # a request still tracked from before can never match a new request.
         self._next_id = first_id
         self._closing = False
+        self._exiting = threading.Event()   # set by the worker's "exiting" reply
+        self._exit_reply = None
         self.ok = False
         self.error = None
         # Requests sent before the worker's "ready", in order; None once it came.
@@ -775,6 +782,11 @@ class Worker:
                 msg = json.loads(line)
             except ValueError:
                 continue             # a stray print from a library, not a reply
+            if msg.get("type") == "exiting":
+                # Its last reply, which shutdown() waits for, off the main loop.
+                self._exit_reply = msg
+                self._exiting.set()
+                continue
             # Above redraw priority: at the default idle priority, a reply could
             # wait for as long as the Segment outlines kept animating, which on
             # Windows starved it until the next input event.
@@ -834,18 +846,24 @@ class Worker:
             self._write(req)
 
     def shutdown(self):
+        """Ask the worker to exit, and wait for its "exiting": a batch result
+        being written gets its name first, or its part file is deleted."""
         if not self.ok:
             return
         self._closing = True
         try:
             self.proc.stdin.write('{"op":"shutdown"}\n')
             self.proc.stdin.flush()
+        except (OSError, ValueError):   # ValueError: the pipe is already closed
+            pass
+        if not self._exiting.wait(_WORKER_EXIT_WAIT_S):
+            _log.warning("the worker didn't say it was exiting in %d s", _WORKER_EXIT_WAIT_S)
+        elif self._exit_reply.get("part_left"):
+            _log.warning("the worker exited mid-write; its log names the part file left")
+        try:
             self.proc.wait(timeout=2)
-        except Exception:
-            try:
-                self.proc.terminate()
-            except Exception:
-                pass
+        except subprocess.TimeoutExpired:
+            self.proc.terminate()
 
 
 class Panel:

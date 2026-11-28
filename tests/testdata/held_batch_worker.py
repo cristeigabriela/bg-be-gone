@@ -7,6 +7,8 @@ first, so the test knows where it is. The steps:
 
 - "model": the cut-out never finishes, as with a slow model on a big photo.
 - "write": encoding a result takes half a second, then completes.
+- "write-slow": encoding takes 3 s, as to a slow network share, then completes.
+- "write-stuck": encoding never finishes, as on a share that stopped answering.
 - "write-fails": encoding a result fails, as on a full disk.
 """
 import errno
@@ -18,8 +20,8 @@ sys.path.insert(0, sys.argv[1])
 import worker  # noqa: E402  (prepares the process first, as the worker does)
 
 STEP = sys.argv[2]
-# Long enough for a test to act while the write runs, well inside the exit wait.
-WRITE_S = 0.5
+# How long each write step takes, well inside the worker's 5 s exit wait.
+WRITE_S = {"write": 0.5, "write-slow": 3.0}
 
 
 def reached():
@@ -36,8 +38,13 @@ real_save = worker.save_image
 
 def slow_save(im, dst):
     reached()
-    time.sleep(WRITE_S)
+    time.sleep(WRITE_S[STEP])
     real_save(im, dst)
+
+
+def stuck_save(_im, _dst):
+    reached()
+    threading.Event().wait()
 
 
 def failing_save(_im, dst):
@@ -47,8 +54,10 @@ def failing_save(_im, dst):
 
 if STEP == "model":
     worker._remove_resilient = model_never_finishes
-elif STEP == "write":
+elif STEP in WRITE_S:
     worker.save_image = slow_save
+elif STEP == "write-stuck":
+    worker.save_image = stuck_save
 elif STEP == "write-fails":
     worker.save_image = failing_save
 else:

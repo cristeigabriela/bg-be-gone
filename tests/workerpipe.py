@@ -59,6 +59,15 @@ class Worker:
         assert reply is not None, "the worker exited (see %s)" % self.log_path
         return reply
 
+    def last_replies(self):
+        """Every reply left once the worker has exited, its last one included."""
+        replies = []
+        while True:
+            reply = self._replies.get(timeout=REPLY_TIMEOUT_S)
+            if reply is None:
+                return replies
+            replies.append(reply)
+
     def send(self, request):
         """Send a request as is, giving it the next id if it has none; return its id."""
         request.setdefault("id", self._next_id)

@@ -15,8 +15,10 @@ from workerpipe import BACKGROUND_PIXEL, SUBJECT_PIXEL, TESTDATA, WORKER
 
 _ONLY_BARE_TOKENS = ("The rename pattern can only use {name} and {n}, with nothing else in "
                      "the braces.")
-# How long a worker may take to exit: the frontend kills one after 2 s.
+# How long a worker may take to exit when no write holds it up.
 _EXIT_S = 5
+# ... and with a write stuck: the worker waits 5 s for it, then deletes its part.
+_STUCK_EXIT_S = 10
 
 
 def batch_request(indir, outdir, pattern="{name}_nobg", **options):
@@ -438,16 +440,40 @@ def test_a_shutdown_during_the_cut_out_exits_at_once_and_leaves_nothing(held_wor
     assert hidden(outdir) == [], "no file exists until the result does"
 
 
-def test_a_shutdown_during_a_write_lets_the_result_get_its_name(held_worker, folders):
+@pytest.mark.parametrize("step", [
+    # Five times over: exiting while the worker thread still sent its last
+    # replies aborted at shutdown in a third of the runs (stdout's lock).
+    "write", "write", "write", "write", "write",
+    # Longer than the 1.5 s the exit used to wait.
+    "write-slow",
+], ids=["write-1", "write-2", "write-3", "write-4", "write-5", "write-slow"])
+def test_a_shutdown_during_a_write_lets_the_result_get_its_name(held_worker, folders, step):
     """The worker thread dies wherever it is at exit; mid-write, that was its part file."""
     indir, outdir = folders
     add_image(indir, "a.png")
-    w = held_worker("write")
+    w = held_worker(step)
     run_until_held(w, batch_request(indir, outdir))
     w.write({"op": "shutdown"})
-    w.proc.wait(timeout=_EXIT_S)
+    code = w.proc.wait(timeout=_EXIT_S)
     assert names(outdir) == ["a_nobg.png"], \
         "the result being written is finished and named before the worker exits"
+    assert w.last_replies()[-1] == {"type": "exiting", "part_left": False}, \
+        "the worker says it's exiting, with nothing left behind, for the frontend to wait on"
+    assert (code, "Fatal Python error" in w.log_text()) == (0, False), \
+        "the worker exits cleanly, not by an abort at interpreter shutdown"
+
+
+def test_a_write_stuck_past_the_exit_wait_has_its_part_deleted(held_worker, folders):
+    """A write that never ends (a share that stopped answering) can't hold the exit."""
+    indir, outdir = folders
+    add_image(indir, "a.png")
+    w = held_worker("write-stuck")
+    run_until_held(w, batch_request(indir, outdir))
+    w.write({"op": "shutdown"})
+    w.proc.wait(timeout=_STUCK_EXIT_S)
+    assert names(outdir) == [], "the part file is deleted, and nothing was published"
+    assert w.last_replies()[-1] == {"type": "exiting", "part_left": False}, \
+        "the worker says nothing was left behind"
 
 
 def test_a_write_that_fails_leaves_no_unfinished_file(held_worker, folders):

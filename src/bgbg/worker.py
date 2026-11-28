@@ -37,7 +37,8 @@ Requests (one JSON object per line on stdin):
    "blur":int,"output":P,"id":N}             # needs no model loaded
   {"op":"seg_cancel","id":N}                 # the same as cancel
   {"op":"engine_status","id":N}              # waits for PyTorch's start-up, if any
-  {"op":"shutdown"}
+  {"op":"shutdown"}       # stops what runs; a batch result being written gets its
+                          # name first (up to 5 s), then "exiting" goes out
 
 BG is "transparent", "blur" or "#rrggbb" to flatten onto. S is the blur
 strength, 1-100, relative to the picture's size (background.py).
@@ -86,6 +87,8 @@ Responses (one JSON object per line on stdout):
   {"type":"seg_canceled","id":N}
   {"type":"notice","message":str,"id":N|null}   # shown to the user; null at start-up
   {"type":"error","message":str,"id":N}
+  {"type":"exiting","part_left":bool}   # the last reply; part_left: a batch's
+                                        # part file couldn't be deleted
 """
 import os
 import sys
@@ -728,11 +731,20 @@ def _batch_render(model, req_id, src, alpha, bg, blur):
 
 
 # Held from a result's part file being made until the part has its real name
-# or is deleted. At exit main() takes it, so the process never ends with a
-# part half-written: the worker thread is a daemon and dies wherever it is.
+# or is deleted. At exit _exit_cleanly takes it, so an exit doesn't cut a
+# write short, and no new one starts.
 _writing = threading.Lock()
-# How long an exit waits for that. The frontend gives a worker 2 s to exit.
-_EXIT_WRITE_WAIT_S = 1.5
+# How long an exit waits for a write in progress; the frontend waits longer.
+_EXIT_WRITE_WAIT_S = 5.0
+# The part file being written, while one is: an exit past the wait deletes it.
+_part_in_progress = None
+
+
+class Part(enum.Enum):
+    """Whether a part file of the batch's own is still on disk."""
+
+    GONE = "gone"
+    LEFT = "left"
 
 
 def _remove_part(part):
@@ -743,6 +755,8 @@ def _remove_part(part):
         pass                    # Pillow deletes a file whose save failed itself
     except OSError as err:
         print(f"batch: could not remove {part}: {err}", file=sys.stderr, flush=True)
+        return Part.LEFT
+    return Part.GONE
 
 
 def _publish_result(image, outdir, stem, fmt, taken):
@@ -752,8 +766,9 @@ def _publish_result(image, outdir, stem, fmt, taken):
     It gets its name from a call that never replaces a file, so one that
     appears under that name meanwhile is kept. On any failure, the part goes.
     """
+    global _part_in_progress
     with _writing:
-        part = batchnames.new_part(outdir, stem, fmt.suffix)
+        part = _part_in_progress = batchnames.new_part(outdir, stem, fmt.suffix)
         published = None
         try:
             save_image(image, part)
@@ -761,6 +776,7 @@ def _publish_result(image, outdir, stem, fmt, taken):
         finally:
             if published is None:
                 _remove_part(part)
+            _part_in_progress = None
         return published
 
 
@@ -1461,6 +1477,13 @@ class _Cancels:
                 return CancelOutcome.SKIPPED
             return CancelOutcome.DROPPED
 
+    def cancel_all(self):
+        """The worker is exiting: stop the running request, skip the queued ones."""
+        with self._lock:
+            if self._running is not None:
+                self._running[1].set()
+            self._skipped |= self._waiting
+
 
 _cancels = _Cancels()
 
@@ -1493,7 +1516,8 @@ def main():
     _ready()
     _apply_engine_choice(refusal)
     q = queue.Queue()
-    threading.Thread(target=_worker_loop, args=(q,), daemon=True).start()
+    worker_thread = threading.Thread(target=_worker_loop, args=(q,), daemon=True)
+    worker_thread.start()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -1518,19 +1542,50 @@ def main():
             continue
         _cancels.queue(req.get("id"))
         q.put(req)
-    _let_a_write_finish()
+    _exit_cleanly(q, worker_thread)
 
 
-def _let_a_write_finish():
-    """At exit, wait for a batch result being written to get its name, and keep
-    the worker thread from starting another one.
+# How long an exit gives the worker thread to end its request once no write is
+# in progress: enough to send its last replies, not to finish a model's image.
+_EXIT_JOIN_S = 1.0
 
-    The worker thread is a daemon: it dies wherever it is once main() returns,
-    and mid-write it would leave its part file behind.
+
+def _exit_cleanly(q, worker_thread):
+    """Stop the worker thread, let a result being written get its name, say
+    so in an "exiting" reply, and end the process.
+
+    The frontend waits for that reply before it stops waiting for the exit.
     """
-    if not _writing.acquire(timeout=_EXIT_WRITE_WAIT_S):
-        sys.stderr.write("exit: a batch result was still being written after %.1f s; "
-                         "its part file may stay\n" % _EXIT_WRITE_WAIT_S)
+    _cancels.cancel_all()
+    q.put(None)                            # the thread's loop ends after its request
+    part = _wait_for_write()
+    worker_thread.join(_EXIT_JOIN_S)
+    out({"type": "exiting", "part_left": part is Part.LEFT})
+    if not worker_thread.is_alive():
+        return
+    # TRICK: os._exit skips the interpreter's finalization. That flushes stdout,
+    # which the still-running worker thread (a model can't be stopped midway)
+    # may hold the lock of; it then aborts: "could not acquire lock for
+    # <stdout> at interpreter shutdown, possibly due to daemon threads". No
+    # write is left to finish: _writing is held, or its part was deleted.
+    sys.stderr.flush()
+    os._exit(0)
+
+
+def _wait_for_write():
+    """Wait for a batch result being written to get its name, and keep the
+    worker thread from starting another. Past _EXIT_WRITE_WAIT_S, delete its
+    part file instead, where the system allows it."""
+    if _writing.acquire(timeout=_EXIT_WRITE_WAIT_S):
+        return Part.GONE
+    part = _part_in_progress
+    if part is None:
+        return Part.GONE
+    left = _remove_part(part)
+    if left is Part.LEFT:
+        sys.stderr.write("exit: a batch result was still being written after %.1f s, "
+                         "and its part file %s stays\n" % (_EXIT_WRITE_WAIT_S, part))
+    return left
 
 
 if __name__ == "__main__":
