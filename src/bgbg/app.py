@@ -26,6 +26,7 @@ from gi.repository import Gtk, Gdk, GdkPixbuf, Gio, GLib, Adw  # noqa: E402
 from viewer import ImageView  # noqa: E402
 import formats  # noqa: E402
 import plat  # noqa: E402
+from engines import selection  # noqa: E402  (standard library only)
 
 APP_ID = "io.github.cristeigabriela.BgBeGone"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -140,6 +141,13 @@ MODELS = [
     ("U2Net", "u2net"),
     ("U2Net — Human Seg", "u2net_human_seg"),
     ("Silueta", "silueta"),
+]
+# Model > Advanced > Engine: what runs BiRefNet. Automatic leaves it to the
+# install's profile, then ONNX Runtime (engines/selection.py).
+ENGINES = [
+    ("Automatic", selection.Engine.AUTO),
+    ("ONNX Runtime", selection.Engine.ORT),
+    ("PyTorch", selection.Engine.TORCH),
 ]
 BGS = [
     ("Transparent", "transparent"),
@@ -293,6 +301,8 @@ class Worker:
         self._next_id = 1
         self.ok = False
         self.error = None
+        # Requests sent before the worker's "ready", in order; None once it came.
+        self._queued = []
         try:
             self._logf = open(LOG, "a")
             self.proc = subprocess.Popen(
@@ -324,12 +334,24 @@ class Worker:
         rid = self._next_id
         self._next_id += 1
         req["id"] = rid
+        if self._queued is not None:
+            self._queued.append(req)
+        else:
+            self._write(req)
+        return rid
+
+    def _write(self, req):
         try:
             self.proc.stdin.write(json.dumps(req) + "\n")
             self.proc.stdin.flush()
         except Exception:
             pass
-        return rid
+
+    def started(self):
+        """The worker sent "ready": send what waited for it."""
+        queued, self._queued = self._queued or [], None
+        for req in queued:
+            self._write(req)
 
     def shutdown(self):
         if not self.ok:
@@ -505,7 +527,9 @@ class Window(Adw.ApplicationWindow):
         self.seg_point_mask = None     # last point-mode mask path
         self.seg_result_output = None
         self._seg_rows = {}            # object id -> layer-list row widgets
-        self.worker = Worker(self._on_worker_message)
+        self._settings_path = None     # the worker's settings.json, from its "ready"
+        self._engine_switch = None     # an Engine label waiting for a new worker, or None
+        self._start_worker()
 
         self.toasts = Adw.ToastOverlay()
         self.set_content(self.toasts)
@@ -608,6 +632,17 @@ class Window(Adw.ApplicationWindow):
         self.model_row.set_visible(False)
         self.model_row.connect("notify::selected", lambda *_: self._mark_stale())
         model_grp.add(self.model_row)
+
+        # Shown only when the worker says it can run PyTorch, so an install
+        # without it looks as it always did.
+        self.model_adv = Adw.ExpanderRow(title="Advanced")
+        self.engine_row = Adw.ComboRow(
+            title="Engine", model=Gtk.StringList.new([e[0] for e in ENGINES]))
+        self.engine_row.set_subtitle("What runs BiRefNet")
+        self._engine_handler = self.engine_row.connect("notify::selected", self._on_engine_changed)
+        self.model_adv.add_row(self.engine_row)
+        self.model_adv.set_visible(False)
+        model_grp.add(self.model_adv)
         self.model_grp = model_grp
         box.append(model_grp)
         box.append(self._build_seg_group())
@@ -743,6 +778,61 @@ class Window(Adw.ApplicationWindow):
             self.device_dot.remove_css_class(c)
         self.device_dot.add_css_class(cls)
         self.device_dot.set_tooltip_text(label)
+
+    def _start_worker(self):
+        """Start this window's worker; replies from one it replaced are dropped."""
+        def deliver(msg):
+            if self.worker is worker:
+                self._on_worker_message(msg)
+
+        worker = Worker(deliver)
+        self.worker = worker
+
+    def _offer_engines(self, on_offer, settings_path):
+        """Show Model > Advanced > Engine when the worker can run PyTorch,
+        set to what the worker's own settings file says."""
+        self._settings_path = settings_path
+        shown = "torch" in on_offer and bool(settings_path)
+        if shown:
+            current = selection.read_setting(settings_path)
+            index = next(i for i, e in enumerate(ENGINES) if e[1] is current)
+            with self.engine_row.handler_block(self._engine_handler):
+                self.engine_row.set_selected(index)
+        self.model_adv.set_visible(shown)
+
+    def _on_engine_changed(self, *_):
+        label, engine = ENGINES[self.engine_row.get_selected()]
+        try:
+            selection.save_setting(engine, self._settings_path)
+        except OSError as err:
+            self._toast("Couldn't save the engine setting: %s" % err)
+            return
+        # A new worker reads the setting at start-up, so nothing of the old
+        # engine (a PyTorch start-up in flight, its GPU context) carries over.
+        self._engine_switch = label
+        if self._job_in_flight():
+            self._toast("Engine: %s, once the current job is done." % label)
+        self._replace_worker_when_idle()
+        self._mark_stale()
+
+    def _job_in_flight(self):
+        return self.busy or self.seg_busy or self._open is not None or bool(self._pending_saves)
+
+    def _replace_worker_when_idle(self):
+        """Swap in a new worker for an Engine change once no job is in flight.
+
+        Called again whenever a job ends, so the active one finishes first.
+        """
+        if self._engine_switch is None:
+            return
+        if self._job_in_flight():
+            return
+        label, self._engine_switch = self._engine_switch, None
+        old = self.worker
+        self.seg_loaded_for = None     # the new worker holds no encoded image
+        self._start_worker()
+        threading.Thread(target=old.shutdown, daemon=True).start()
+        self._toast("Engine: %s." % label)
 
     def _on_subject_changed(self, *_):
         # The exact-model picker only appears for the "Custom model…" entry.
@@ -982,6 +1072,8 @@ class Window(Adw.ApplicationWindow):
         if not busy:                        # any terminal state stops the shimmer
             self.seg_panel.view.set_scanning(False)
             self._hide_footer_progress()
+            # An Engine change waits for this job; after this reply is handled.
+            GLib.idle_add(self._replace_worker_when_idle)
 
     def _extract_bg(self):
         bg = BGS[self.bg_row.get_selected()][1]
@@ -1398,6 +1490,7 @@ class Window(Adw.ApplicationWindow):
     def _on_open_reply(self, msg):
         """The worker's answer to the open in flight: frames, converted or error."""
         pending, self._open = self._open, None
+        GLib.idle_add(self._replace_worker_when_idle)   # an Engine change waits for this open
         self._release_source_actions()
         name = os.path.basename(pending.path)
         if msg["type"] == "error":
@@ -1556,6 +1649,7 @@ class Window(Adw.ApplicationWindow):
 
     def _on_save_reply(self, msg):
         pending = self._pending_saves.pop(msg["id"])
+        GLib.idle_add(self._replace_worker_when_idle)   # an Engine change waits for this save
         if pending.staging is not None:
             _remove_quietly(pending.staging)
         if msg["type"] == "error":
@@ -1607,6 +1701,7 @@ class Window(Adw.ApplicationWindow):
         if not busy:
             self.src_panel.view.set_scanning(False)   # end the scan shimmer
             self._hide_footer_progress()
+            GLib.idle_add(self._replace_worker_when_idle)   # an Engine change waits for this job
 
     def _on_source_change(self):
         if self.src_panel.view.has_image() and self.result_output:
@@ -1692,6 +1787,8 @@ class Window(Adw.ApplicationWindow):
             self._on_save_reply(msg)
             return False
         if t == "ready":
+            self.worker.started()
+            self._offer_engines(msg.get("engines") or ["ort"], msg.get("settings"))
             provs = msg.get("providers") or []
             if provs:
                 self._set_device(provs[0],
