@@ -183,6 +183,9 @@ class Thumbnails:
             # On the pool's thread: hand the result to the main loop, one
             # idle callback for however many results are waiting.
             if f.cancelled():
+                # Called by whoever cancelled it; the worker's PNG is ours to delete.
+                if source is not None:
+                    _remove_quietly(source)
                 return
             with self._lock:
                 self._results.append(_Decoded(generation, path, mtime, apply, fallback,
