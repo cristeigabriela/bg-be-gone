@@ -18,6 +18,7 @@ import zlib
 import json
 import colorsys
 import zipfile
+import tempfile
 import urllib.error
 import urllib.request
 from collections import deque
@@ -197,21 +198,34 @@ def rung_for_vram(free_mb, gpu):
 # Weight download
 # ---------------------------------------------------------------------------
 def _download(url, dst, progress=None):
+    """Fetch `url` into `dst`, through a partial file of its own.
+
+    ``progress(done, total)`` runs after every chunk, with total 0 when the
+    server sends no size; it may raise to stop the download (the worker's
+    cancel does). Whatever stops it, the partial file is removed.
+    """
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    tmp = dst + ".part"
-    with urllib.request.urlopen(url, timeout=60) as r:
-        total = int(r.headers.get("Content-Length", 0))
-        done = 0
-        with open(tmp, "wb") as f:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dst),
+                               prefix=os.path.basename(dst) + ".", suffix=".part")
+    try:
+        with os.fdopen(fd, "wb") as f, urllib.request.urlopen(url, timeout=60) as r:
+            total = int(r.headers.get("Content-Length", 0))
+            done = 0
             while True:
                 chunk = r.read(1 << 20)
                 if not chunk:
                     break
                 f.write(chunk)
                 done += len(chunk)
-                if progress and total:
+                if progress:
                     progress(done, total)
-    os.replace(tmp, dst)
+        # A connection that drops can still end the read cleanly.
+        if total and done != total:
+            raise SegDownloadIncompleteError(url, done, total)
+        os.replace(tmp, dst)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def ensure_model(rung, progress=None):

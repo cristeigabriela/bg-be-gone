@@ -79,6 +79,7 @@ _JOB_REPLIES = {
     "loading", "done_single", "gif_progress", "gif_done", "canceled", "progress",
     "done_batch", "converted", "frames", "seg_ready", "seg_download", "seg_step",
     "seg_progress", "seg_objects", "seg_mask", "seg_extracted", "seg_canceled", "error",
+    "download",
 }
 # Reply types that end their request.
 _JOB_ENDS = {
@@ -890,6 +891,24 @@ class Window(Adw.ApplicationWindow):
         self.footer_progress.set_fraction(min(1.0, done / total))
         self.footer_progress.set_text("%d / %d" % (done, total))
         self.footer_progress.set_visible(True)
+
+    @staticmethod
+    def _download_text(msg):
+        """A download reply as text, like "312 of 973 MB (32%)"; only the MB
+        when the server gave no size."""
+        mb = 1024 * 1024
+        if not msg.get("total"):
+            return "%d MB" % (msg["done"] // mb)
+        return "%d of %d MB (%d%%)" % (msg["done"] // mb, msg["total"] // mb,
+                                       100 * msg["done"] // msg["total"])
+
+    def _footer_download(self, msg):
+        mb = 1024 * 1024
+        if msg.get("total"):
+            self._footer_progress(msg["done"] // mb, msg["total"] // mb)
+            self.footer_progress.set_text("%d / %d MB" % (msg["done"] // mb, msg["total"] // mb))
+        if msg.get("total") and msg["done"] >= msg["total"]:
+            self._hide_footer_progress()       # loading the model comes next
 
     def _hide_footer_progress(self):
         if getattr(self, "footer_progress", None) is not None:
@@ -2347,8 +2366,9 @@ class Window(Adw.ApplicationWindow):
             if msg.get("scope") == "batch":
                 self.progress.set_text("cancelled")
                 self.batch_status.set_text(
-                    "Cancelled after %d / %d." % (msg.get("done", 0),
-                                                  msg.get("total", 0)))
+                    # No count when it stopped before the first file, say in a download.
+                    "Cancelled after %d / %d." % (msg["done"], msg["total"])
+                    if "total" in msg else "Cancelled.")
             else:
                 self.status.set_text("Cancelled.")
         elif t == "progress":
@@ -2384,9 +2404,14 @@ class Window(Adw.ApplicationWindow):
                 self.seg_status.set_text("Ready: %s on %s." %
                                          (msg["model"], msg["label"]))
         elif t == "seg_download":
-            total = max(msg.get("total", 0), 1)
-            self.seg_status.set_text("Downloading model… %d%%" %
-                                     (100 * msg["done"] // total))
+            self.seg_status.set_text("Downloading the Segment model: %s. It's needed once."
+                                     % self._download_text(msg))
+            self._footer_download(msg)
+        elif t == "download":
+            name = dict((m[1], m[0]) for m in MODELS).get(msg["model"], msg["model"])
+            text = "Downloading %s: %s. It's needed once." % (name, self._download_text(msg))
+            (self.batch_status if job is Job.BATCH else self.status).set_text(text)
+            self._footer_download(msg)
         elif t == "seg_step":
             self.seg_status.set_text(
                 "%s unavailable — trying a lighter model…" % msg["rung"])

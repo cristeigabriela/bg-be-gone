@@ -40,6 +40,7 @@ Responses (one JSON object per line on stdout):
   {"type":"engine_status","engine":"ort"|"torch","state":"ready"|"failed"|...,
    "reason":str|null,"device":str|null,"id":N}
   {"type":"loading","model":M,"id":N}
+  {"type":"download","model":M,"done":bytes,"total":bytes,"id":N}   # first use
   {"type":"device","provider":P,"label":L,"gpu":bool,"id":N}
   {"type":"progress","done":i,"total":n,"name":str,"id":N}
   {"type":"done_single","output":P,"preview":P,"seconds":f,"id":N}
@@ -75,6 +76,7 @@ plat.prepare_process()
 
 import gc  # noqa: E402
 import json  # noqa: E402
+import contextlib  # noqa: E402
 import errno  # noqa: E402
 import time  # noqa: E402
 import queue  # noqa: E402
@@ -142,7 +144,9 @@ def _torch_session(model, req_id):
     if _torch.wait() is torch_birefnet.EngineState.READY:
         try:
             out({"type": "loading", "model": model, "id": req_id})
-            session = _torch.new_session(model)
+            session = _torch.new_session(model, progress=_download_reporter(model, req_id))
+        except _Canceled:
+            raise                       # a cancel during its download: the job ends
         except Exception as err:  # noqa: BLE001  (out of VRAM, a bad download, ...)
             _torch.release_memory()
             reason = f"{model} didn't load ({type(err).__name__}: {err})"
@@ -158,6 +162,73 @@ def _torch_session(model, req_id):
     return None
 
 
+# How often download progress goes out, at most: often enough for a smooth
+# bar, rare enough not to flood the window (pooch updates per KB).
+_DOWNLOAD_REPORT_S = 0.25
+
+
+def _download_reporter(model, req_id):
+    """progress(done, total) in bytes for a model's first download.
+
+    Sends ``download`` replies, at most every _DOWNLOAD_REPORT_S and always the
+    last one, and raises _Canceled once a cancel arrives, which stops the download.
+    """
+    last = [0.0]
+
+    def progress(done, total):
+        if _cancel.is_set():
+            raise _Canceled()
+        now = time.monotonic()
+        if done < total and now - last[0] < _DOWNLOAD_REPORT_S:
+            return
+        last[0] = now
+        out({"type": "download", "model": model, "done": done, "total": total,
+             "id": req_id})
+    return progress
+
+
+class _PoochProgress:
+    """A pooch progress bar (total, update, reset, close) that reports to the window."""
+
+    def __init__(self, progress):
+        self._progress = progress
+        self.total = 0
+        self.n = 0
+
+    def update(self, n):
+        self.n += n
+        self._progress(min(self.n, self.total or self.n), self.total)
+
+    def reset(self):
+        self.n = 0
+
+    def close(self):
+        pass
+
+
+@contextlib.contextmanager
+def _rembg_download_progress(progress):
+    """Report rembg's model downloads through `progress` while the block runs.
+
+    HACK: rembg's sessions call ``pooch.retrieve(..., progressbar=True)``, which
+    draws a tqdm bar on stderr, the log, so the window saw nothing during a
+    ~1 GB download. This swaps in a progress object for that call. The real
+    fix is a progress hook in rembg's ``download_models``.
+    """
+    import pooch
+    real = pooch.retrieve
+
+    def retrieve(*args, **kwargs):
+        if kwargs.get("progressbar") is True:
+            kwargs["progressbar"] = _PoochProgress(progress)
+        return real(*args, **kwargs)
+    pooch.retrieve = retrieve
+    try:
+        yield
+    finally:
+        pooch.retrieve = real
+
+
 def get_session(model, req_id):
     if model not in _sessions:
         session = _torch_session(model, req_id)
@@ -166,7 +237,8 @@ def get_session(model, req_id):
             _torch_models.add(model)
             return session
         out({"type": "loading", "model": model, "id": req_id})
-        sess = ort_engine.new_session(model, ort_engine.preferred_providers())
+        with _rembg_download_progress(_download_reporter(model, req_id)):
+            sess = ort_engine.new_session(model, ort_engine.preferred_providers())
         active = sess.inner_session.get_providers()
         prov = active[0] if active else "CPUExecutionProvider"
         _sessions[model] = sess
@@ -181,7 +253,8 @@ def get_cpu_session(model, req_id):
     job when the GPU can't (e.g. not enough VRAM)."""
     if model not in _cpu_sessions:
         out({"type": "loading", "model": model, "id": req_id})
-        _cpu_sessions[model] = ort_engine.new_session(model, ["CPUExecutionProvider"])
+        with _rembg_download_progress(_download_reporter(model, req_id)):
+            _cpu_sessions[model] = ort_engine.new_session(model, ["CPUExecutionProvider"])
     # Tell the UI the run moved to the CPU. Without this the status bar keeps
     # claiming the GPU through every fallback, so a wrong-but-fast result and a
     # correct-but-slow one look identical from the outside.
@@ -554,6 +627,12 @@ def handle_batch(req):
                         want_preview=False)
             dst = batchnames.publish(part, outdir, stem, taken)
             part = None
+        except _Canceled:
+            # A cancel that stopped a model download ends the run; its
+            # unfinished file must not stay behind.
+            if part is not None:
+                os.remove(part)
+            raise
         except Exception as e:  # noqa: BLE001 - reported per file, run goes on
             print(f"batch: {f} failed:", file=sys.stderr)
             traceback.print_exc()
@@ -992,6 +1071,12 @@ def _dispatch(req):
         handler = _HANDLERS.get(op)
         if handler:
             handler(req)
+    except _Canceled:
+        # A cancel that stopped a model download (see _download_reporter).
+        if op in _SEG_OPS:
+            out({"type": "seg_canceled", "id": rid})
+        else:
+            out({"type": "canceled", "scope": op, "id": rid})
     except Exception as e:  # noqa: BLE001
         # stderr is the frontend's log file: the traceback is what a bug
         # report needs, the window gets the plain version.
